@@ -26,7 +26,8 @@ rm -rf "$T"
 # 3. 게이트웨이 생존
 systemctl --user is-active hermes-gateway > /dev/null || FAIL_MSGS="$FAIL_MSGS [게이트웨이 다운]"
 # 4. codex 인증
-PATH="$HOME/.hermes/node/bin:$HOME/.local/bin:$PATH" codex login status 2>/dev/null | grep -q "Logged in" \
+# codex는 상태를 stderr로 출력하므로 2>&1 필수 (오탐 이력 있음)
+PATH="$HOME/.hermes/node/bin:$HOME/.local/bin:$PATH" codex login status 2>&1 | grep -q "Logged in" \
   || FAIL_MSGS="$FAIL_MSGS [codex 미인증]"
 
 if [ -n "$FAIL_MSGS" ]; then
