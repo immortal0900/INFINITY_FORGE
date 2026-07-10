@@ -43,9 +43,12 @@ echo "[deploy] 프로필 home 인증 링크 보정 (codex·gh·git)..."
 for P in issuefinder executor reviewer critic; do
   PH=~/.hermes/profiles/$P/home
   mkdir -p "$PH/.config"
-  ln -sfn /home/ubuntu/.codex      "$PH/.codex"
-  ln -sfn /home/ubuntu/.config/gh  "$PH/.config/gh"
-  ln -sfn /home/ubuntu/.gitconfig  "$PH/.gitconfig"
+  # 주의: 대상이 이미 '실제 디렉토리'면 ln -sfn이 그 안에 링크를 만들어버린다 → 치우고 링크
+  for PAIR in ".codex:/home/ubuntu/.codex" ".config/gh:/home/ubuntu/.config/gh" ".gitconfig:/home/ubuntu/.gitconfig"; do
+    DST="$PH/${PAIR%%:*}"; SRC="${PAIR#*:}"
+    if [ -e "$DST" ] && [ ! -L "$DST" ]; then mv "$DST" "$DST.bak.$(date +%s)"; fi
+    ln -sfn "$SRC" "$DST"
+  done
 done
 
 echo "[deploy] hooks·scripts → ~/forge..."
