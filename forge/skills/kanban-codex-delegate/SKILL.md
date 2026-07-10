@@ -24,6 +24,7 @@ metadata:
    tmux new-session -d -s task-<카드ID> 'cd <워크스페이스> && env -u OPENAI_API_KEY -u OPENAI_BASE_URL -u OPENAI_ORG_ID -u CODEX_API_KEY codex exec --skip-git-repo-check "<지시문>" > ~/.hermes/kanban/logs/<카드ID>-codex.log 2>&1'
    ```
    스폰 전 `codex login status`가 "Logged in using ChatGPT"인지 확인하고, 401이 나면 로그의 인증 관련 줄을 comment로 남겨라.
+   참고: VPS의 ~/.codex/config.toml에 `sandbox_mode = "danger-full-access"`가 설정되어 있어(2026-07-10 결정) 1차 시도부터 파일 쓰기가 된다. 샌드박스 오류가 다시 보이면 bypass 재시도로 토큰을 태우지 말고 오류 줄을 comment로 보고하라.
 4. **하트비트 루프**: codex 실행 중 60~120초마다 `kanban_heartbeat` 호출 + tmux 세션 생존 확인.
    - codex가 60분 넘게 무출력이면: tmux 로그 확인 후 `kanban_comment`로 상황 기록.
 5. **결과 수확**: codex 종료 후 diff·테스트 결과·로그를 확인한다. Stop 훅 게이트(codex-stop-gate.sh)가 exit 2를 반환하면 stderr 사유를 읽고 codex에 재지시(같은 tmux 세션, L0 자기수정).
