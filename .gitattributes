@@ -1,0 +1,6 @@
+# 리눅스(VPS) 배포 파일은 항상 LF — Windows 체크아웃 CRLF로 인한 실행 실패 방지
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+SKILL.md text eol=lf
