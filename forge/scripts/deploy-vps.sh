@@ -37,6 +37,17 @@ done
 [ -d forge/skills/critic-adversarial ]   && cp -r forge/skills/critic-adversarial   ~/.hermes/profiles/critic/skills/
 [ -d forge/skills/issue-finder-sot ]     && cp -r forge/skills/issue-finder-sot     ~/.hermes/profiles/issuefinder/skills/
 
+echo "[deploy] 프로필 home 인증 링크 보정 (codex·gh·git)..."
+# hermes 프로필은 자체 HOME(~/.hermes/profiles/<P>/home)으로 실행되어
+# 실계정의 ~/.codex(코덱스 로그인)·~/.config/gh(gh 인증)·~/.gitconfig가 안 보인다 → symlink로 연결
+for P in issuefinder executor reviewer critic; do
+  PH=~/.hermes/profiles/$P/home
+  mkdir -p "$PH/.config"
+  ln -sfn /home/ubuntu/.codex      "$PH/.codex"
+  ln -sfn /home/ubuntu/.config/gh  "$PH/.config/gh"
+  ln -sfn /home/ubuntu/.gitconfig  "$PH/.gitconfig"
+done
+
 echo "[deploy] hooks·scripts → ~/forge..."
 mkdir -p ~/forge/hooks
 [ -f forge/hooks/codex-stop-gate.sh ] && install -m 755 forge/hooks/codex-stop-gate.sh ~/forge/hooks/
