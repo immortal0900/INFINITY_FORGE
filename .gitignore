@@ -8,3 +8,6 @@ scratchpad/
 # 도구 로컬 상태
 .serena/
 .claude/
+
+# 파이썬 실행 잔재
+__pycache__/
