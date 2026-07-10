@@ -8,8 +8,13 @@ main() {
 REPO_DIR="${FORGE_REPO_DIR:-$HOME/work/INFINITY_FORGE}"
 cd "$REPO_DIR"
 
-echo "[deploy] git pull..."
-git pull --rebase --autostash
+# pull이 이 스크립트 자신을 갱신할 수 있으므로, pull 후 새 버전으로 재실행(exec).
+# --post-pull 플래그가 있으면 이미 새 버전이므로 배포 단계로 직행.
+if [ "${1:-}" != "--post-pull" ]; then
+  echo "[deploy] git pull..."
+  git pull --rebase --autostash
+  exec bash "$REPO_DIR/forge/scripts/deploy-vps.sh" --post-pull
+fi
 
 echo "[deploy] skills → hermes 프로필..."
 # 공용 스킬: 게이트웨이(기본) + 워커 4프로필
