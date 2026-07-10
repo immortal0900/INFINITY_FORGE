@@ -56,6 +56,39 @@ mkdir -p ~/forge/hooks
 [ -f forge/hooks/codex-stop-gate.sh ] && install -m 755 forge/hooks/codex-stop-gate.sh ~/forge/hooks/
 [ -f forge/scripts/flush-outbox.py ] && install -m 755 forge/scripts/flush-outbox.py ~/forge/
 [ -f forge/scripts/nightly-backup.sh ] && install -m 755 forge/scripts/nightly-backup.sh ~/backups/
+for S in ledger-emit.py label-mirror.py canary.sh drift-audit.sh spec-coverage.sh morning-report.sh; do
+  [ -f "forge/scripts/$S" ] && install -m 755 "forge/scripts/$S" ~/forge/
+done
+
+echo "[deploy] systemd 타이머 설치..."
+UD=~/.config/systemd/user
+mkdir -p "$UD"
+mkunit() { # $1=이름 $2=ExecStart $3=OnCalendar/OnUnitActiveSec 지시어 전체
+  cat > "$UD/forge-$1.service" << UNIT
+[Unit]
+Description=INFINITY_FORGE $1
+[Service]
+Type=oneshot
+Environment=PATH=/home/ubuntu/.hermes/node/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=$2
+UNIT
+  cat > "$UD/forge-$1.timer" << UNIT
+[Unit]
+Description=INFINITY_FORGE $1 timer
+[Timer]
+$3
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+}
+mkunit ledger  "/usr/bin/python3 /home/ubuntu/forge/ledger-emit.py"   "OnCalendar=*:0/10"
+mkunit mirror  "/usr/bin/python3 /home/ubuntu/forge/label-mirror.py"  "OnCalendar=*:0/2"
+mkunit canary  "/bin/bash /home/ubuntu/forge/canary.sh"               "OnCalendar=*-*-* 21:00:00 Asia/Seoul"
+mkunit drift   "/bin/bash /home/ubuntu/forge/drift-audit.sh"          "OnCalendar=hourly"
+mkunit morning "/bin/bash /home/ubuntu/forge/morning-report.sh"       "OnCalendar=*-*-* 07:30:00 Asia/Seoul"
+systemctl --user daemon-reload
+for T in ledger mirror canary drift morning; do systemctl --user enable --now "forge-$T.timer" > /dev/null; done
 
 echo "[deploy] 게이트웨이 스킬 리로드..."
 systemctl --user restart hermes-gateway
