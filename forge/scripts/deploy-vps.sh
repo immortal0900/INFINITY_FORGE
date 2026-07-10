@@ -13,7 +13,7 @@ git pull --rebase --autostash
 
 echo "[deploy] skills → hermes 프로필..."
 # 공용 스킬: 게이트웨이(기본) + 워커 4프로필
-for S in forge-ops memex code-design-principles; do
+for S in forge-ops memex code-design-principles forge-labels; do
   [ -d "forge/skills/$S" ] || continue
   cp -r "forge/skills/$S" ~/.hermes/skills/
   for P in issuefinder executor reviewer critic; do
@@ -26,10 +26,11 @@ for S in easy-answer code-problem-doc; do
 done
 # reviewer 추가 (반려 리포트 문서화)
 [ -d forge/skills/code-problem-doc ] && cp -r forge/skills/code-problem-doc ~/.hermes/profiles/reviewer/skills/
-# executor 전용
-if [ -d forge/skills/kanban-codex-delegate ]; then
-  cp -r forge/skills/kanban-codex-delegate ~/.hermes/profiles/executor/skills/
-fi
+# 역할 전용 스킬
+[ -d forge/skills/kanban-codex-delegate ] && cp -r forge/skills/kanban-codex-delegate ~/.hermes/profiles/executor/skills/
+[ -d forge/skills/reviewer-verdict ]     && cp -r forge/skills/reviewer-verdict     ~/.hermes/profiles/reviewer/skills/
+[ -d forge/skills/critic-adversarial ]   && cp -r forge/skills/critic-adversarial   ~/.hermes/profiles/critic/skills/
+[ -d forge/skills/issue-finder-sot ]     && cp -r forge/skills/issue-finder-sot     ~/.hermes/profiles/issuefinder/skills/
 
 echo "[deploy] hooks·scripts → ~/forge..."
 mkdir -p ~/forge/hooks
