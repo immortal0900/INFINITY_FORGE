@@ -2,6 +2,9 @@
 # INFINITY_FORGE — VPS 쪽 배포 스크립트 (git pull → hermes 자산 반영)
 # 실행 위치: VPS의 레포 clone(~/work/INFINITY_FORGE). 크론/수동 모두 가능.
 set -euo pipefail
+# main 함수로 전체를 감싼다: git pull이 이 파일 자신을 덮어써도,
+# bash가 함수 정의를 먼저 통째로 파싱하므로 실행 중인 버전은 안 바뀐다(자기갱신 안전).
+main() {
 REPO_DIR="${FORGE_REPO_DIR:-$HOME/work/INFINITY_FORGE}"
 cd "$REPO_DIR"
 
@@ -37,3 +40,5 @@ mkdir -p ~/forge/hooks
 echo "[deploy] 게이트웨이 스킬 리로드..."
 systemctl --user restart hermes-gateway
 echo "[deploy] done: $(git rev-parse --short HEAD)"
+}
+main "$@"
