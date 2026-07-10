@@ -23,7 +23,7 @@ ssh ubuntu@51.222.27.48 "bash ~/work/INFINITY_FORGE/forge/scripts/deploy-vps.sh"
 
 Write-Host "[deploy] 로컬 hermes 반영..."
 $LocalSkills = "$env:LOCALAPPDATA\hermes\skills"
-foreach ($S in @("forge-ops", "memex")) {
+foreach ($S in @("forge-ops", "memex", "code-design-principles", "easy-answer", "code-problem-doc")) {
   if (Test-Path "$Repo\forge\skills\$S") {
     Copy-Item -Recurse -Force "$Repo\forge\skills\$S" $LocalSkills
   }

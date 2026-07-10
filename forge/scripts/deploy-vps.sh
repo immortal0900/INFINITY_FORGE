@@ -9,14 +9,20 @@ echo "[deploy] git pull..."
 git pull --rebase --autostash
 
 echo "[deploy] skills → hermes 프로필..."
-# forge-ops·memex 공용 스킬: 게이트웨이(기본) + 워커 4프로필
-for S in forge-ops memex; do
+# 공용 스킬: 게이트웨이(기본) + 워커 4프로필
+for S in forge-ops memex code-design-principles; do
   [ -d "forge/skills/$S" ] || continue
   cp -r "forge/skills/$S" ~/.hermes/skills/
   for P in issuefinder executor reviewer critic; do
     cp -r "forge/skills/$S" ~/.hermes/profiles/$P/skills/
   done
 done
+# 게이트웨이 전용 (사용자 대화 스타일·문서화)
+for S in easy-answer code-problem-doc; do
+  [ -d "forge/skills/$S" ] && cp -r "forge/skills/$S" ~/.hermes/skills/
+done
+# reviewer 추가 (반려 리포트 문서화)
+[ -d forge/skills/code-problem-doc ] && cp -r forge/skills/code-problem-doc ~/.hermes/profiles/reviewer/skills/
 # executor 전용
 if [ -d forge/skills/kanban-codex-delegate ]; then
   cp -r forge/skills/kanban-codex-delegate ~/.hermes/profiles/executor/skills/
