@@ -48,3 +48,38 @@ tags:: alpha, beta gamma,delta   epsilon
         "INFINITY_FORGE",
         ["alpha", "beta", "gamma", "delta", "epsilon"],
     )
+
+
+def test_parse_entry_trims_project_and_handles_spaced_header():
+    text = """##    [qa] Spaced heading
+project::   PROJECT WITH SPACES   
+tags:: memex
+"""
+
+    assert flush_outbox.parse_entry(text) == (
+        "qa",
+        "PROJECT WITH SPACES",
+        ["memex"],
+    )
+
+
+def test_parse_entry_ignores_indented_metadata_like_body_lines():
+    text = """# Body-only note
+    ## [decision] This is an indented example, not the entry heading
+    project:: NOT_A_PROJECT
+    tags:: not,tags
+"""
+
+    assert flush_outbox.parse_entry(text) == (None, "INFINITY_FORGE", None)
+
+
+def test_parse_entry_drops_empty_tag_tokens_and_preserves_unicode_tags():
+    text = """## [insight] Tag edge cases
+tags:: alpha,, beta,감마   delta,
+"""
+
+    assert flush_outbox.parse_entry(text) == (
+        "insight",
+        "INFINITY_FORGE",
+        ["alpha", "beta", "감마", "delta"],
+    )
