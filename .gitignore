@@ -1,0 +1,10 @@
+# Claude Code 로컬 설정 (개인 override, 키 경로 포함 — 커밋 제외)
+.claude/settings.local.json
+
+# 로그·임시
+*.log
+scratchpad/
+
+# 도구 로컬 상태
+.serena/
+.claude/
