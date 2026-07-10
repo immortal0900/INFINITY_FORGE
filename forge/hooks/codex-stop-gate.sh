@@ -23,10 +23,17 @@ fi
 
 # ── 2. 테스트 (레포별 명령은 워크스페이스 AGENTS.md 규약으로 오버라이드) ──
 # 우선순위: FORGE_TEST_CMD env > 레포 유형 자동 감지
+# 파이썬 인터프리터는 암묵 python3 금지 — pytest가 있는 인터프리터를 명시적으로 고른다
+# (실측: 시스템 python3엔 pytest 없음, hermes venv에 9.1.1 존재 → 워커·게이트 결과 불일치 방지)
+PY="${FORGE_PY:-}"
+if [ -z "$PY" ]; then
+  if [ -x "$HOME/.hermes/hermes-agent/venv/bin/python" ]; then PY="$HOME/.hermes/hermes-agent/venv/bin/python"
+  else PY="python3"; fi
+fi
 TEST_CMD="${FORGE_TEST_CMD:-}"
 if [ -z "$TEST_CMD" ]; then
   if   [ -f package.json ] && grep -q '"test"' package.json; then TEST_CMD="npm test --silent"
-  elif [ -f pyproject.toml ] || [ -f pytest.ini ];           then TEST_CMD="python3 -m pytest -q"
+  elif [ -f pyproject.toml ] || [ -f pytest.ini ] || [ -d tests ]; then TEST_CMD="$PY -m pytest tests/ -q"
   elif [ -f go.mod ];                                         then TEST_CMD="go test ./..."
   else TEST_CMD=""; fi
 fi

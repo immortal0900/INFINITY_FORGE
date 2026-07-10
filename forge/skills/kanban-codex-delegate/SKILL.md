@@ -38,7 +38,7 @@ metadata:
      "verified_by": {"<구현 항목>": "<테스트 파일 경로/검증 수단>"}
    }
    ```
-   - **not_implemented는 빈 배열이라도 반드시 명시**한다.
+   - **not_implemented는 빈 배열이라도 반드시 명시**한다. 타입은 반드시 JSON 배열 — 문자열("없음", "none" 등) 금지. 항목이 있으면 각각 `{"title": "...", "issue_id": "#N" 또는 "card_id": "t_..."}` 객체로.
    - not_implemented 항목이 있으면 각각에 후속 카드를 먼저 생성(`kanban_create`)하고 그 ID를 기입한다. ID 없는 잔여 항목으로는 종료 불가(D17).
 
 ## 금지
