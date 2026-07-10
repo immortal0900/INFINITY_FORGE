@@ -14,6 +14,23 @@ HOME = os.path.expanduser("~")
 DB = os.path.join(HOME, ".hermes", "kanban.db")
 HERMES = os.path.join(HOME, ".local", "bin", "hermes")
 GH = "/usr/bin/gh"
+MIRROR_STATE = os.path.join(HOME, "forge", "mirror-state.json")
+# D14 즉시 알림: 이 상태로 '전이'가 감지되면 Slack 직발송 (기계 전이 in-progress 등은 제외)
+NOTIFY_STATUS = {"done": "✅ 리뷰 대기(PR 확인)", "blocked": "⛔ 결정/조치 필요", "failed": "🔴 재시도 소진"}
+
+def slack(text):
+    try:
+        token = ""
+        for line in open(os.path.join(HOME, ".hermes", ".env")):
+            if line.startswith("SLACK_BOT_TOKEN="):
+                token = line.strip().split("=", 1)[1]; break
+        if not token: return
+        subprocess.run(["curl", "-s", "-m", "10", "-X", "POST", "https://slack.com/api/chat.postMessage",
+                        "-H", f"Authorization: Bearer {token}", "-H", "Content-Type: application/json",
+                        "-d", json.dumps({"channel": "#forge-cloud", "text": text})],
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass  # 알림 실패가 미러를 막지 않는다
 
 STATUS_TO_LABEL = {
     "triage": "forge:spec-draft",
@@ -33,12 +50,29 @@ def sh(args, timeout=30):
 
 def cards_by_key():
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-    rows = con.execute("SELECT idempotency_key, status FROM tasks WHERE idempotency_key LIKE 'github-issue:%'").fetchall()
+    rows = con.execute("SELECT idempotency_key, status, title, id FROM tasks WHERE idempotency_key LIKE 'github-issue:%'").fetchall()
     con.close()
-    return dict(rows)
+    return {r[0]: {"status": r[1], "title": r[2], "id": r[3]} for r in rows}
+
+def notify_transitions(cards):
+    """D14: 인간 액션 대상 전이(done/blocked/failed) 신규 발생 시 즉시 Slack (24/7)."""
+    prev = {}
+    if os.path.exists(MIRROR_STATE):
+        try: prev = json.load(open(MIRROR_STATE))
+        except Exception: prev = {}
+    for key, c in cards.items():
+        old = prev.get(key)
+        if c["status"] != old and c["status"] in NOTIFY_STATUS:
+            issue_ref = key.replace("github-issue:", "")
+            slack(f"{NOTIFY_STATUS[c['status']]} [{issue_ref}] {c['title']} (카드 {c['id']})")
+    tmp = MIRROR_STATE + ".tmp"
+    json.dump({k: v["status"] for k, v in cards.items()}, open(tmp, "w"))
+    os.replace(tmp, MIRROR_STATE)
 
 def main():
-    keys = cards_by_key()
+    cards = cards_by_key()
+    notify_transitions(cards)
+    keys = {k: v["status"] for k, v in cards.items()}
     for repo in REPOS:
         # ── 수입 ──
         rc, out, err = sh([GH, "api", f"repos/{repo}/issues?state=open&labels=forge:need-execution&per_page=50"])

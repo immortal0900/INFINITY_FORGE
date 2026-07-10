@@ -84,7 +84,7 @@ UNIT
 }
 mkunit ledger  "/usr/bin/python3 /home/ubuntu/forge/ledger-emit.py"   "OnCalendar=*:0/10"
 mkunit mirror  "/usr/bin/python3 /home/ubuntu/forge/label-mirror.py"  "OnCalendar=*:0/2"
-mkunit canary  "/bin/bash /home/ubuntu/forge/canary.sh"               "OnCalendar=*-*-* 21:00:00 Asia/Seoul"
+mkunit canary  "/bin/bash /home/ubuntu/forge/canary.sh"               "OnCalendar=*-*-* 00/6:00:00 Asia/Seoul"
 mkunit drift   "/bin/bash /home/ubuntu/forge/drift-audit.sh"          "OnCalendar=hourly"
 mkunit morning "/bin/bash /home/ubuntu/forge/morning-report.sh"       "OnCalendar=*-*-* 07:30:00 Asia/Seoul"
 systemctl --user daemon-reload
