@@ -1,0 +1,51 @@
+# plan.md 7절 ⑤ + 14절 Phase 3: Capability eval + 회귀 + 감시 — 주간 스케줄 잡.
+# 결정론 검사만 수행한다(7절: CI에 LLM을 올리지 않는다).
+# LLM 층의 능력 점검은 VPS canary(6시간 주기, 정답이 알려진 더미 태스크)가 담당한다.
+name: capability-eval
+
+on:
+  schedule:
+    - cron: "0 22 * * 0" # 매주 월요일 07:00 KST (일 22:00 UTC) — 아침 검수대에 결과 노출
+  workflow_dispatch:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 회귀 테스트 (pytest)
+        run: |
+          pip install --quiet pytest
+          pytest tests/ -q
+
+      - name: 게이트·운영 스크립트 무결성 (bash 문법)
+        run: |
+          set -e
+          for f in forge/scripts/*.sh forge/hooks/*.sh; do
+            bash -n "$f"
+            echo "ok: $f"
+          done
+
+      - name: python 스크립트 컴파일 검사
+        run: python -m py_compile forge/scripts/*.py
+
+      - name: 스킬 계약 검사 (SKILL.md 존재)
+        run: |
+          set -e
+          for d in forge/skills/*/; do
+            test -f "${d}SKILL.md" || { echo "SKILL.md 누락: $d"; exit 1; }
+          done
+
+      - name: spec-registry 형식 검사 (SPEC-NNN | 제목)
+        run: |
+          bad=$(grep -vE '^(#|[[:space:]]*$)' forge/spec-registry.md | grep -cvE '^SPEC-[0-9]{3} \| .+' || true)
+          if [ "$bad" -ne 0 ]; then
+            echo "spec-registry 형식 위반 ${bad}줄:"
+            grep -vE '^(#|[[:space:]]*$)' forge/spec-registry.md | grep -vE '^SPEC-[0-9]{3} \| .+'
+            exit 1
+          fi

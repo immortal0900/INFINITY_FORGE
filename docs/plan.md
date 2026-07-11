@@ -400,9 +400,14 @@ CI에 LLM을 올리지 않는다(컴플라이언스 + 결정론 순수성).
 - 검증: 중복 카드 0, 드리프트 0, 백업 integrity 통과, GitHub 차단 모의 시 밤 완주 + 아침 따라잡기, GATE_ERROR 0, 고아 잔여 0(모든 not_implemented 항목이 이슈 ID 보유), 커버리지 N/M 표기 정상
 
 ### Phase 3: 확장
-- [ ] Auto decompose 전환 (오케스트레이터 toolset 보드 연산 제한)
-- [ ] capability eval 주간 잡 (VM 이전은 D18로 Phase 0에 흡수, MEMEX 조회 개방은 D19로 조기 완료)
+- [x] Auto decompose 전환 (오케스트레이터 toolset 보드 연산 제한)
+- [x] capability eval 주간 잡 (VM 이전은 D18로 Phase 0에 흡수, MEMEX 조회 개방은 D19로 조기 완료)
 - [ ] (옵션) reviewer를 codex exec로 이관 (필요 시)
+
+> **판정 결과 (2026-07-12): Phase 3 필수 2건 반영.**
+> ① Auto decompose: hermes 기본값이 이미 True라 실질 가동 중이었음(Phase 1의 unblock 시 auto-specify 관찰이 그 증거) → 암묵 기본값을 명시 설정으로 고정: `kanban.auto_decompose=true`, `auto_decompose_per_tick=3` (VPS+로컬 양쪽 config.yaml, 게이트웨이는 틱마다 재독취라 재시작 불요). "오케스트레이터 toolset 보드 연산 제한"은 구조 충족 — 디컴포저는 도구 없는 보조 LLM 호출(chat.completions, JSON 산출만)이고 보드 쓰기는 결정론 코드가 수행(도구 0 = 요구보다 강한 제약). 16절 노브의 스테일 회수 2h 하향(`dispatch_stale_timeout_seconds=7200`)도 이때 함께 명시 적용.
+> ② capability eval 주간 잡: `.github/workflows/capability-eval.yml` — 매주 월 07:00 KST, 결정론만(pytest 회귀 + bash/python 문법 + 스킬 SKILL.md 계약 + spec-registry 형식). 7절 "CI에 LLM 금지" 준수, LLM 층 능력 점검은 VPS canary(6시간 주기)가 담당.
+> ③ reviewer→codex exec 이관은 옵션 조항으로 미실행(현 GPT-5.5 reviewer 정상 동작, 필요 발생 시 재검토).
 
 ---
 

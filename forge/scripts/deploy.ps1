@@ -11,7 +11,7 @@ Set-Location $Repo
 
 if (-not $SkipPush) {
   if ([string]::IsNullOrWhiteSpace($Message)) { $Message = "forge: 자산 업데이트" }
-  git add forge/ docs/
+  git add forge/ docs/ .github/
   git diff --cached --quiet
   if ($LASTEXITCODE -ne 0) { git commit -m $Message }
   git pull --rebase --autostash
