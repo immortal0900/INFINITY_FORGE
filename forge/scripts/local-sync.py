@@ -101,8 +101,24 @@ def cycle():
     json.dump(payload, open(tmp, "w"))
     os.replace(tmp, STATE)
 
+def acquire_singleton_lock():
+    """--loop 중복 실행 방지: 락 파일 배타 잠금(핸들 유지, 프로세스 종료 시 OS가 자동 해제)."""
+    import msvcrt
+    path = os.path.join(HOME, "forge-backups", "local-sync.lock")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    f = open(path, "w")
+    try:
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        print("local-sync: --loop 인스턴스가 이미 실행 중 — 이 인스턴스는 종료", file=sys.stderr)
+        sys.exit(0)
+    f.write(str(os.getpid()))
+    f.flush()
+    return f
+
 def main():
     if "--loop" in sys.argv:
+        _lock = acquire_singleton_lock()  # noqa: F841 — 핸들 유지가 곧 잠금 유지
         while True:
             try: cycle()
             except Exception as e:
