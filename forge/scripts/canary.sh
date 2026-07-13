@@ -12,15 +12,39 @@ slack() {
     -d "{\"channel\":\"#forge-cloud\",\"text\":\"$1\"}" > /dev/null
 }
 
+# 게이트 검문 fixture 공통: 유효 핸드오프 (v0.2부터 핸드오프 필수 — D16)
+HANDOFF_OK='{"pr_url":null,"changed_files":["file.txt"],"implemented":["AC1"],"not_implemented":[],"verified_by":{"AC1":"canary fixture"}}'
+
 # 1. 게이트: 빈 diff는 차단(exit 2)해야 정상
 T=$(mktemp -d); (cd "$T" && git init -q)
 if ~/forge/hooks/codex-stop-gate.sh "$T" 2>/dev/null; then
   FAIL_MSGS="$FAIL_MSGS [게이트가 빈 diff를 통과시킴]"
 fi
-# 2. 게이트: 정상 변경은 통과(exit 0)해야 정상
+# 2. 게이트: 정상 변경 + 유효 핸드오프는 통과(exit 0)해야 정상
 echo canary > "$T/file.txt"
+echo "$HANDOFF_OK" > "$T/handoff.json"
 if ! ~/forge/hooks/codex-stop-gate.sh "$T" 2>/dev/null; then
   FAIL_MSGS="$FAIL_MSGS [게이트가 정상 변경을 차단함]"
+fi
+# 3. 게이트: 핸드오프 없는 종료는 차단해야 정상 (D16 — 2026-07-12 실측 구멍 회귀 감시)
+rm "$T/handoff.json"
+if ~/forge/hooks/codex-stop-gate.sh "$T" 2>/dev/null; then
+  FAIL_MSGS="$FAIL_MSGS [게이트가 핸드오프 없는 종료를 통과시킴]"
+fi
+# 4. 게이트: implemented가 빈 핸드오프는 차단해야 정상 (D17)
+echo '{"implemented":[],"not_implemented":[],"verified_by":{}}' > "$T/handoff.json"
+if ~/forge/hooks/codex-stop-gate.sh "$T" 2>/dev/null; then
+  FAIL_MSGS="$FAIL_MSGS [게이트가 빈 implemented를 통과시킴]"
+fi
+rm -rf "$T"
+# 5. 게이트: 커밋해서 워크트리가 깨끗해도 base SHA 기준으로 통과해야 정상 (committed-clean 오판 회귀 감시)
+T=$(mktemp -d); (cd "$T" && git init -q \
+  && echo seed > seed.txt && git add . && git -c user.email=canary@forge -c user.name=canary commit -qm seed \
+  && git rev-parse HEAD > .forge-base-sha \
+  && echo work > file.txt && git add file.txt && git -c user.email=canary@forge -c user.name=canary commit -qm work)
+echo "$HANDOFF_OK" > "$T/handoff.json"
+if ! ~/forge/hooks/codex-stop-gate.sh "$T" 2>/dev/null; then
+  FAIL_MSGS="$FAIL_MSGS [게이트가 커밋된 정상 작업을 empty diff로 차단함]"
 fi
 rm -rf "$T"
 # 3. 게이트웨이 생존

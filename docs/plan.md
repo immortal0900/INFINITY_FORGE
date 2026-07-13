@@ -256,6 +256,7 @@ CI에 LLM을 올리지 않는다(컴플라이언스 + 결정론 순수성).
 | L3 | 디스패처는 나머지 ready 태스크 계속 배차. 실패 태스크의 자식만 의존 대기 |
 
 **신호 구분**: 게이트 stderr 접두사 `TESTS_FAILED:`(판정 실패, 재시도 카운트 O) vs `GATE_ERROR:`(장치 고장, 카운트 X, 즉시 알림 직행).
+**세션 수 정정 (2026-07-13 실측)**: hermes `--max-retries N`은 "재시도 허용 횟수"가 아니라 "N번째 연속 실패에서 차단"이다 — 즉 총 N회 세션. D13의 의도(최초 1 + 이어받기 3 = 총 4세션)를 만족하려면 카드 생성 시 `--max-retries 4`가 필요하다. 기존 label-mirror의 `--max-retries 3`은 총 3세션으로 D13보다 1회 적었고, 4로 수정했다. D13 자체는 소급 수정하지 않는다(문서 갱신 규칙).
 **카나리아**: 밤 시작 시 정답이 알려진 더미 태스크 1건을 게이트에 통과시켜 검문소 자체를 점검. 실패 시 배차 시작 전 중단 + 알림.
 **게이트 스크립트 규율**: 모든 에러 경로를 exit 2로 변환(bash `trap 'exit 2' ERR` / python 전체 try-except → sys.exit(2)). 게이트는 빠르고 단순하게.
 
@@ -448,6 +449,7 @@ CI에 LLM을 올리지 않는다(컴플라이언스 + 결정론 순수성).
 **Phase 1 최우선 제작물 2개** (이게 있어야 첫 e2e 왕복이 돈다):
 1. `kanban-codex-delegate` 스킬(executor 래퍼): kanban_show로 카드·이전 시도·코멘트 읽기 → tmux로 codex exec 스폰 → 주기적 kanban_heartbeat → 핸드오프 3필드(implemented / not_implemented+이슈 ID / verified_by) 작성 → kanban_complete. exit 0 단순 종료 금지(protocol_violation).
 2. Codex Stop 훅 게이트: 테스트·빈 diff·태스크 예산 캡·잔여 물질화(D17: not_implemented 항목별 이슈 ID를 gh api로 실존 확인). 모든 에러 경로를 exit 2로(bash: `trap 'exit 2' ERR`). stderr 접두사 규약: TESTS_FAILED:(재시도 카운트 O) / GATE_ERROR:(카운트 X, 즉시 알림).
+   - **v0.2 강화 (2026-07-13, 실측 fail-open 봉쇄)**: 핸드오프 파일 필수화(부재=차단), implemented/verified_by 빈 값·타입·커버리지 검증, card_id는 kanban DB 실존 확인, 빈 diff 판정은 `.forge-base-sha`(작업 시작 SHA) 기준 커밋 diff 포함(committed-clean 오판 제거), 핸드오프 파일만 바뀐 작업 차단. **호출 배선**: executor(kanban-codex-delegate 스킬)가 kanban_complete 전에 반드시 게이트를 실행하고 rc=0일 때만 완료를 선언한다 — 게이트 미실행 완료는 성급한 완료 선언으로 간주. 회귀 감시는 canary 5케이스 + `tests/test_stop_gate.py`(CI pull_request마다 실행).
 
 **첫 e2e 절차**: 작은 이슈 1건 수동 투입(수용 기준 필수) → Manual decompose → executor → PR → 자동 reviewer 구축 전이므로 사람 + 대화형 Claude(로컬)로 수동 리뷰 → 머지 → **태스크당 codex 쿼터 소모 실측치를 이 문서 15절에 기록**. 이 수치가 재시도 3회(D13) 예산과 밤당 spec 투입량을 확정한다.
 

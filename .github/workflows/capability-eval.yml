@@ -1,9 +1,15 @@
-# plan.md 7절 ⑤ + 14절 Phase 3: Capability eval + 회귀 + 감시 — 주간 스케줄 잡.
+# plan.md 7절 ⑤ + 14절 Phase 3: Capability eval + 회귀 + 감시.
 # 결정론 검사만 수행한다(7절: CI에 LLM을 올리지 않는다).
 # LLM 층의 능력 점검은 VPS canary(6시간 주기, 정답이 알려진 더미 태스크)가 담당한다.
+# pull_request/push 트리거: PR에 status check를 실제로 생성한다 (2026-07-12 실측:
+# PR #2·#4에 check 0개 — 주간 스케줄만으로는 머지 시점 검증이 없던 구멍의 봉쇄).
+# private/free 플랜이라 required check 강제는 불가(D30) — green 없이 머지 금지는 운영 규약.
 name: capability-eval
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   schedule:
     - cron: "0 22 * * 0" # 매주 월요일 07:00 KST (일 22:00 UTC) — 아침 검수대에 결과 노출
   workflow_dispatch:

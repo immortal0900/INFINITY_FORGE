@@ -19,7 +19,12 @@ metadata:
 1. **카드 파악**: `kanban_show`로 카드 본문·수용 기준(AC)·이전 시도(runs)·코멘트(반성문 포함)를 전부 읽는다.
    - 이전 시도가 있으면: 실패 원인과 반성문을 codex 프롬프트에 반드시 포함한다.
 2. **작업 지시서 작성**: 카드 AC를 그대로 인용한 지시문을 만든다. AC를 재해석·축소하지 않는다 (본문 수정 금지 — 코멘트만 허용).
-3. **codex exec 스폰 (tmux)** — 반드시 OPENAI/CODEX 계열 env를 제거하고 스폰한다(hermes가 주입한 env가 있으면 codex가 ChatGPT 로그인 대신 API키 모드로 빠져 401이 난다):
+3. **base SHA 기록 + codex exec 스폰 (tmux)** — 스폰 전에 반드시 작업 시작 시점 SHA를 기록한다(게이트가 "이번 작업의 커밋"을 판정하는 기준):
+   ```bash
+   cd <워크스페이스> && git rev-parse HEAD > .forge-base-sha
+   ```
+   지시문에는 다음을 반드시 포함한다: "작업 종료 전에 워크스페이스 루트에 `handoff.json`을 작성하라 — 필수 3필드 implemented(비어있지 않은 문자열 배열)/not_implemented(JSON 배열, 없으면 빈 배열)/verified_by(구현항목→검증수단 객체, implemented 전체를 덮을 것) + pr_url/changed_files."
+   반드시 OPENAI/CODEX 계열 env를 제거하고 스폰한다(hermes가 주입한 env가 있으면 codex가 ChatGPT 로그인 대신 API키 모드로 빠져 401이 난다):
    ```bash
    tmux new-session -d -s task-<카드ID> 'cd <워크스페이스> && env -u OPENAI_API_KEY -u OPENAI_BASE_URL -u OPENAI_ORG_ID -u CODEX_API_KEY codex exec --skip-git-repo-check "<지시문>" > ~/.hermes/kanban/logs/<카드ID>-codex.log 2>&1'
    ```
@@ -27,8 +32,15 @@ metadata:
    참고: VPS의 ~/.codex/config.toml에 `sandbox_mode = "danger-full-access"`가 설정되어 있어(2026-07-10 결정) 1차 시도부터 파일 쓰기가 된다. 샌드박스 오류가 다시 보이면 bypass 재시도로 토큰을 태우지 말고 오류 줄을 comment로 보고하라.
 4. **하트비트 루프**: codex 실행 중 60~120초마다 `kanban_heartbeat` 호출 + tmux 세션 생존 확인.
    - codex가 60분 넘게 무출력이면: tmux 로그 확인 후 `kanban_comment`로 상황 기록.
-5. **결과 수확**: codex 종료 후 diff·테스트 결과·로그를 확인한다. Stop 훅 게이트(codex-stop-gate.sh)가 exit 2를 반환하면 stderr 사유를 읽고 codex에 재지시(같은 tmux 세션, L0 자기수정).
-6. **핸드오프 작성 후 종료** — 아래 3필드를 kanban_complete의 summary에 JSON으로 기입:
+5. **게이트 실행 (필수 — 생략 시 완료 선언 무효)**: codex 종료 후 반드시 Stop 훅 게이트를 직접 실행한다. 게이트 rc=0 없이는 6단계(kanban_complete)로 진행할 수 없다:
+   ```bash
+   HANDOFF_FILE=handoff.json ~/forge/hooks/codex-stop-gate.sh <워크스페이스> 2> /tmp/gate-<카드ID>.err; echo "gate rc=$?"
+   ```
+   (base SHA는 3단계에서 기록한 `.forge-base-sha`를 게이트가 자동으로 읽는다.)
+   - **rc=0**: 6단계로 진행.
+   - **rc=2 + stderr `TESTS_FAILED:`**: 사유 전문을 codex에 재주입해 같은 tmux 세션에서 재지시(L0 자기수정). 수정 후 게이트 재실행. 반복 실패로 예산이 소진되면 `kanban_block`(사유: 재시도 소진).
+   - **rc=2 + stderr `GATE_ERROR:`**: 검문소 자체 고장이다. codex에 재지시하지 말고 `kanban_comment`로 stderr를 기록한 뒤 `kanban_block`(인간 조치 필요).
+6. **핸드오프 제출 후 종료** — 게이트를 통과한 `handoff.json`의 내용을 그대로 kanban_complete의 summary에 JSON으로 기입:
    ```json
    {
      "pr_url": "<PR URL 또는 null>",
@@ -43,6 +55,7 @@ metadata:
 
 ## 금지
 
+- **게이트 rc=0 없이 `kanban_complete` 호출.** 완료의 증거는 게이트 통과이지 너의 판단이 아니다. 게이트를 실행하지 않았거나 rc=2인 상태의 complete는 성급한 완료 선언이다.
 - exit 0 단순 종료 (protocol_violation → 자동 block). 반드시 `kanban_complete` 또는 `kanban_block`으로 끝낸다.
 - "완료했습니다" 산문 선언으로 구현 사실을 대체하는 것. 완료 = 검증 통과 + 3필드.
 - 카드가 과대하다고 판단될 때 조용히 범위를 줄이는 것. 합법 수순: 쪼개서 후속 카드 / `kanban_block`으로 인간 결정 요청 / 계속 진행 — 셋 중 하나만.

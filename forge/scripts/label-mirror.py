@@ -86,10 +86,13 @@ def main():
             body = (f"GitHub 이슈: {issue['html_url']}\n\n"
                     "AC의 원본(SoT)은 위 이슈 본문이다 — 재해석 금지, 리뷰는 이슈 기준.\n"
                     "kanban-codex-delegate 절차로 작업하고 핸드오프 3필드(not_implemented는 JSON 배열)로 kanban_complete.")
+            # --goal: 완료 판정 judge가 같은 세션을 반복시키는 보조 방어층 (결정론 게이트의 대체가 아님).
+            # --max-retries N은 "N번째 연속 실패에서 차단" = 총 N회 세션. 스펙(최대 4 고유 세션)에 맞춰 4.
             rc2, out2, err2 = sh([HERMES, "kanban", "create", f"[mirror] {issue['title']}",
                                   "--body", body, "--assignee", "executor",
                                   "--workspace", f"dir:{HOME}/work/{repo.split('/')[1]}",
-                                  "--idempotency-key", key, "--max-retries", "3"], timeout=60)
+                                  "--idempotency-key", key, "--max-retries", "4",
+                                  "--goal", "--goal-max-turns", "20"], timeout=60)
             print(f"import {key}: {'ok' if rc2 == 0 else 'FAIL ' + err2[:80]}")
         # ── 투영 ──
         for key, status in keys.items():
