@@ -758,6 +758,8 @@ gh api "repos/immortal0900/INFINITY_FORGE/rulesets/$rulesetId"
 
 ### 13.2 P1 병합 뒤 VPS production 배포
 
+> **부트스트랩 예외 — PR #6 한정:** PR #6은 이 stage-orchestrator를 production에 처음 설치하는 변경이므로, 병합·배포 전에 새 pipeline이 자기 원본 이슈를 `forge:mergeable`로 투영할 수 없다. 이 한 건은 최신 HEAD의 `eval=success`, 독립 코드·문서 리뷰 PASS, active `protect-main` read-back을 근거로 사람이 P1 병합한다. 배포가 끝난 뒤 생성되는 일반 작업에는 이 예외를 적용하지 않으며 9장대로 원본 이슈 `forge:mergeable`을 필수 확인한다.
+
 이 변경 PR을 사람이 main에 병합한 뒤에만 다음을 실행한다. feature branch나 로컬 파일을 production에 직접 복사하지 않는다.
 
 ```powershell
