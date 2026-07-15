@@ -3,3 +3,4 @@
 
 SPEC-001 | README.md 작성
 SPEC-002 | flush-outbox parse_entry 단위 테스트 추가
+SPEC-003 | PR 제목과 본문 한국어 작성 원칙

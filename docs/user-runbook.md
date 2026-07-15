@@ -236,6 +236,7 @@ notepad "$env:USERPROFILE\forge-backups\vps-dashboard-cred.txt"
 8. 오른쪽 **Labels**에서 `forge:need-execution`을 붙인다.
 
 라벨을 붙이는 8단계가 실제 작업 투입 승인이다. 그 전까지는 워커가 실행되지 않는다.
+자동 워커나 사람이 생성하는 PR 제목과 본문은 기본적으로 한국어로 작성한다. 다만 코드 식별자, 명령어, 로그, 고유 제품명은 정확성을 위해 원문 표기를 유지할 수 있다.
 
 ### 6.2 좋은 수용 기준 예시
 
