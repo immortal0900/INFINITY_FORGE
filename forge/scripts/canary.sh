@@ -13,7 +13,7 @@ slack() {
 }
 
 # 게이트 검문 fixture 공통: 유효 핸드오프 (v0.2부터 핸드오프 필수 — D16)
-HANDOFF_OK='{"pr_url":null,"changed_files":["file.txt"],"implemented":["AC1"],"not_implemented":[],"verified_by":{"AC1":"canary fixture"}}'
+HANDOFF_OK='{"pr_url":"https://github.com/example/project/pull/1","changed_files":["file.txt"],"implemented":["AC1"],"not_implemented":[],"verified_by":{"AC1":"canary fixture"}}'
 
 # 1. 게이트: 빈 diff는 차단(exit 2)해야 정상
 T=$(mktemp -d); (cd "$T" && git init -q)

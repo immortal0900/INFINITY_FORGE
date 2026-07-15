@@ -7,6 +7,7 @@
 """
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -199,6 +200,23 @@ def test_executor_handoff_matches_exact_five_field_contract(
 
     assert result.returncode == 2
     assert message in result.stderr
+
+
+def test_canary_valid_handoff_matches_stop_gate_contract(tmp_path):
+    script = (REPO / "forge" / "scripts" / "canary.sh").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"HANDOFF_OK='(\{.*\})'", script)
+    assert match is not None
+    handoff = json.loads(match.group(1))
+
+    repo = make_repo(tmp_path)
+    (repo / "file.txt").write_text("work")
+    write_handoff(repo, handoff)
+
+    result = run_gate(repo)
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_empty_implemented_blocked(tmp_path):

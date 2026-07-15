@@ -22,26 +22,42 @@ metadata:
 2. **작업 지시서 작성**: 카드 AC를 그대로 인용한 지시문을 만든다. AC를 재해석·축소하지 않는다 (본문 수정 금지 — 코멘트만 허용).
    - `executor-rework`에서는 영수증의 reflection, PR URL, bound HEAD를 codex exec 지시문에 반드시 포함한다. 같은 PR 브랜치에서 reflection의 실패를 먼저 재현하고, 수정 뒤 기존 테스트와 해당 회귀 테스트를 실행하도록 지시한다.
    - rework 지시문에서 새 PR을 만들도록 지시하지 않는다. 영수증의 `pr_url`이 가리키는 기존 PR을 계속 사용한다.
-3. **재작업 전용 worktree 고정** — `executor-rework`이면 공유 repo checkout에서 바로 수정하지 않는다. 먼저 PR branch와 카드 receipt HEAD를 읽고 카드별 worktree를 만든다. `<저장소루트>`와 `<카드ID>`는 실제 값으로 바꾼다.
+3. **재작업 전용 worktree 고정 또는 검증된 재개** — `executor-rework`이면 공유 repo checkout에서 바로 수정하지 않는다. 먼저 PR branch와 카드 receipt HEAD를 읽고 카드별 worktree를 만들거나, 같은 카드의 기존 worktree만 검증해 재개한다. `<저장소루트>`와 `<카드ID>`는 실제 값으로 바꾼다.
    ```bash
    PR_JSON="$(gh pr view "$PR_URL" --json url,state,isDraft,headRefName,headRefOid)"
    PR_HEAD_BRANCH="$(printf '%s' "$PR_JSON" | jq -r .headRefName)"
    PR_HEAD_SHA="$(printf '%s' "$PR_JSON" | jq -r .headRefOid)"
    test "$(printf '%s' "$PR_JSON" | jq -r .state)" = OPEN
    test "$(printf '%s' "$PR_JSON" | jq -r .isDraft)" = false
-   test "$PR_HEAD_SHA" = "$BOUND_HEAD_SHA"
    TASK_WORKTREE="$HOME/.hermes/worktrees/<카드ID>"
-   test ! -e "$TASK_WORKTREE"
    git -C <저장소루트> fetch origin "$PR_HEAD_BRANCH"
-   (cd <저장소루트> && git worktree add --detach "$TASK_WORKTREE" "$BOUND_HEAD_SHA")
-   test -z "$(git -C "$TASK_WORKTREE" status --porcelain)"
-   test "$(git -C "$TASK_WORKTREE" rev-parse HEAD)" = "$BOUND_HEAD_SHA"
+   if git -C "$TASK_WORKTREE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+     git -C <저장소루트> worktree list --porcelain | grep -Fx -- "worktree $TASK_WORKTREE"
+     LOCAL_HEAD="$(git -C "$TASK_WORKTREE" rev-parse HEAD)"
+     git -C "$TASK_WORKTREE" merge-base --is-ancestor "$BOUND_HEAD_SHA" "$LOCAL_HEAD"
+     test "$PR_HEAD_SHA" = "$BOUND_HEAD_SHA" || test "$PR_HEAD_SHA" = "$LOCAL_HEAD"
+   else
+     test ! -e "$TASK_WORKTREE"
+     test "$PR_HEAD_SHA" = "$BOUND_HEAD_SHA"
+     (cd <저장소루트> && git worktree add --detach "$TASK_WORKTREE" "$BOUND_HEAD_SHA")
+     test -z "$(git -C "$TASK_WORKTREE" status --porcelain)"
+     test "$(git -C "$TASK_WORKTREE" rev-parse HEAD)" = "$BOUND_HEAD_SHA"
+   fi
    export WORKSPACE="$TASK_WORKTREE"
    ```
-   하나라도 실패하면 파일을 수정하지 말고 protocol violation으로 `kanban_block`한다. 최초 executor는 카드에 지정된 repo workspace를 `export WORKSPACE=<워크스페이스>`로 설정한다.
-4. **base SHA 기록 + codex exec 스폰 (tmux)** — 위 checkout·clean·HEAD 검증이 끝난 뒤에만 작업 시작 SHA를 기록한다(게이트가 "이번 작업의 커밋"을 판정하는 기준):
+   기존 worktree 재개는 (a) 로컬 HEAD가 receipt HEAD의 후손이고 (b) live PR HEAD가 receipt HEAD(아직 push 전) 또는 그 로컬 HEAD(이미 push 완료)일 때만 허용한다. 다른 SHA로 움직인 PR은 자동 덮어쓰지 않는다. 카드 하나에서 두 워커를 동시에 실행하지 않는다. 하나라도 실패하면 파일을 수정하지 말고 protocol violation으로 `kanban_block`한다. 최초 executor는 카드에 지정된 repo workspace를 `export WORKSPACE=<워크스페이스>`로 설정한다.
+4. **base SHA 기록 + codex exec 스폰 (tmux)** — 위 checkout·HEAD 검증이 끝난 뒤에만 작업 시작 SHA를 기록한다(게이트가 "이번 작업의 커밋"을 판정하는 기준). 재작업 재개 때는 기존 기준을 덮어쓰지 않고 receipt HEAD와 같은지 검증한다:
    ```bash
-   cd "$WORKSPACE" && git rev-parse HEAD > .forge-base-sha
+   PIPELINE_STAGE="<카드 idempotency key에서 읽은 executor 또는 executor-rework>"
+   if test "$PIPELINE_STAGE" = executor-rework; then
+     if test -f "$WORKSPACE/.forge-base-sha"; then
+       test "$(cat "$WORKSPACE/.forge-base-sha")" = "$BOUND_HEAD_SHA"
+     else
+       printf '%s\n' "$BOUND_HEAD_SHA" > "$WORKSPACE/.forge-base-sha"
+     fi
+   else
+     git -C "$WORKSPACE" rev-parse HEAD > "$WORKSPACE/.forge-base-sha"
+   fi
    ```
    지시문에는 다음을 반드시 포함한다: "작업 종료 전에 워크스페이스 루트에 `handoff.json`을 작성하라 — 정확히 5필드 pr_url/changed_files/implemented/not_implemented/verified_by만 사용하고, pr_url은 생성·수정한 GitHub PR URL이어야 한다."
    `executor-rework` 지시문에는 `git push origin HEAD:<PR_HEAD_BRANCH>`로 기존 PR branch에만 push하고 새 PR을 만들지 말라는 규칙도 포함한다.
@@ -55,7 +71,7 @@ metadata:
    - codex가 60분 넘게 무출력이면: tmux 로그 확인 후 `kanban_comment`로 상황 기록.
 6. **게이트 실행 (필수 — 생략 시 완료 선언 무효)**: codex 종료 후 반드시 Stop 훅 게이트를 직접 실행한다. 게이트 rc=0 없이는 완료 단계로 진행할 수 없다:
    ```bash
-   HANDOFF_FILE=handoff.json ~/forge/hooks/codex-stop-gate.sh <워크스페이스> 2> /tmp/gate-<카드ID>.err; echo "gate rc=$?"
+   HANDOFF_FILE=handoff.json ~/forge/hooks/codex-stop-gate.sh "$WORKSPACE" 2> /tmp/gate-<카드ID>.err; echo "gate rc=$?"
    ```
    (base SHA는 3단계에서 기록한 `.forge-base-sha`를 게이트가 자동으로 읽는다.)
    - **rc=0**: 6단계로 진행.
@@ -65,6 +81,7 @@ metadata:
    ```bash
    LOCAL_HEAD="$(git -C "$WORKSPACE" rev-parse HEAD)"
    LIVE_HEAD="$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)"
+   test "$LOCAL_HEAD" != "$BOUND_HEAD_SHA"
    test "$LOCAL_HEAD" = "$LIVE_HEAD"
    git -C "$WORKSPACE" merge-base --is-ancestor "$BOUND_HEAD_SHA" "$LOCAL_HEAD"
    ```

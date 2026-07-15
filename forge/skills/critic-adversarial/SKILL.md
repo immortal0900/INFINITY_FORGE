@@ -18,24 +18,31 @@ metadata:
 
 1. **영수증과 시작 HEAD 고정**: `kanban_show`로 카드 본문의 canonical JSON 영수증을 읽는다.
    - 카드의 `source_digest`, `pr_url`, `bound_head_sha`를 기록한다.
-   - `gh pr view <pr_url> --json url,headRefName,headRefOid,state,isDraft`로 PR이 open/non-draft이며 시작 HEAD가 `bound_head_sha`와 같은지 확인한다.
-   - URL 또는 시작 HEAD가 다르거나 영수증이 불완전하면 protocol violation으로 `kanban_block`한다.
-2. **카드 전용 worktree 생성**: 공유 repo checkout을 직접 수정하지 않는다. 변경 전에 아래 순서로 receipt HEAD에 고정된 clean worktree를 만든다.
+   - `gh pr view <pr_url> --json url,headRefName,headRefOid,state,isDraft`로 PR이 open/non-draft인지 확인한다. 최초 실행의 live HEAD는 `bound_head_sha`와 같아야 한다. 기존 카드 worktree가 있는 재시도만 2단계의 제한된 재개 규칙을 적용한다.
+   - URL이 다르거나 영수증이 불완전하거나, 2단계로 증명할 수 없는 HEAD 차이가 있으면 protocol violation으로 `kanban_block`한다.
+2. **카드 전용 worktree 생성 또는 검증된 재개**: 공유 repo checkout을 직접 수정하지 않는다. 변경 전에 receipt HEAD에 고정된 worktree를 만들거나, 같은 카드의 기존 worktree만 검증해 재개한다.
    ```bash
    PR_JSON="$(gh pr view "$PR_URL" --json url,state,isDraft,headRefName,headRefOid)"
    PR_HEAD_BRANCH="$(printf '%s' "$PR_JSON" | jq -r .headRefName)"
    PR_HEAD_SHA="$(printf '%s' "$PR_JSON" | jq -r .headRefOid)"
    test "$(printf '%s' "$PR_JSON" | jq -r .state)" = OPEN
    test "$(printf '%s' "$PR_JSON" | jq -r .isDraft)" = false
-   test "$PR_HEAD_SHA" = "$BOUND_HEAD_SHA"
    TASK_WORKTREE="$HOME/.hermes/worktrees/<카드ID>"
-   test ! -e "$TASK_WORKTREE"
    git -C <저장소루트> fetch origin "$PR_HEAD_BRANCH"
-   (cd <저장소루트> && git worktree add --detach "$TASK_WORKTREE" "$BOUND_HEAD_SHA")
-   test -z "$(git -C "$TASK_WORKTREE" status --porcelain)"
-   test "$(git -C "$TASK_WORKTREE" rev-parse HEAD)" = "$BOUND_HEAD_SHA"
+   if git -C "$TASK_WORKTREE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+     git -C <저장소루트> worktree list --porcelain | grep -Fx -- "worktree $TASK_WORKTREE"
+     LOCAL_HEAD="$(git -C "$TASK_WORKTREE" rev-parse HEAD)"
+     git -C "$TASK_WORKTREE" merge-base --is-ancestor "$BOUND_HEAD_SHA" "$LOCAL_HEAD"
+     test "$PR_HEAD_SHA" = "$BOUND_HEAD_SHA" || test "$PR_HEAD_SHA" = "$LOCAL_HEAD"
+   else
+     test ! -e "$TASK_WORKTREE"
+     test "$PR_HEAD_SHA" = "$BOUND_HEAD_SHA"
+     (cd <저장소루트> && git worktree add --detach "$TASK_WORKTREE" "$BOUND_HEAD_SHA")
+     test -z "$(git -C "$TASK_WORKTREE" status --porcelain)"
+     test "$(git -C "$TASK_WORKTREE" rev-parse HEAD)" = "$BOUND_HEAD_SHA"
+   fi
    ```
-   하나라도 실패하면 테스트나 코드를 쓰지 말고 `kanban_block`한다. 이후 모든 파일·테스트·git 명령은 `TASK_WORKTREE` 안에서만 실행한다.
+   기존 worktree 재개는 (a) 로컬 HEAD가 receipt HEAD의 후손이고 (b) live PR HEAD가 receipt HEAD(아직 push 전) 또는 그 로컬 HEAD(이미 push 완료)일 때만 허용한다. 다른 SHA로 움직인 PR은 자동 덮어쓰지 않는다. 카드 하나에서 두 워커를 동시에 실행하지 않는다. 하나라도 실패하면 테스트나 코드를 쓰지 말고 `kanban_block`한다. 이후 모든 파일·테스트·git 명령은 `TASK_WORKTREE` 안에서만 실행한다.
 3. **깨뜨릴 시나리오 목록화**: 최소 3개 관점에서 가설을 세운다.
    - 경계값: 빈 입력, 0, 음수, 최대치, 유니코드/한글, 개행.
    - 상태: 동시 호출, 순서 뒤바뀜, 재시도와 멱등성, 부분 실패.
@@ -45,10 +52,15 @@ metadata:
    ```bash
    LOCAL_HEAD="$(git -C "$TASK_WORKTREE" rev-parse HEAD)"
    LIVE_HEAD="$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)"
+   test "$LOCAL_HEAD" != "$BOUND_HEAD_SHA"
    test "$LOCAL_HEAD" = "$LIVE_HEAD"
    git -C "$TASK_WORKTREE" merge-base --is-ancestor "$BOUND_HEAD_SHA" "$LOCAL_HEAD"
+   CHANGED_FILES="$(git -C "$TASK_WORKTREE" diff --name-only "$BOUND_HEAD_SHA" "$LOCAL_HEAD")"
+   for path in <added_tests 배열의 각 경로>; do
+     printf '%s\n' "$CHANGED_FILES" | grep -Fx -- "$path"
+   done
    ```
-   `LOCAL_HEAD == LIVE_HEAD`인 값을 `result_head_sha`로 기록하고, 카드의 `bound_head_sha`를 `reviewed_head_sha`로 복사한다. 어느 증거든 불일치하면 complete하지 않고 block한다.
+   `added_tests 배열의 각 경로`는 결과 JSON에 적을 실제 경로로 치환한다. 배열은 비어 있으면 안 되고 각 경로가 receipt HEAD 이후 diff에 실제로 존재해야 한다. `LOCAL_HEAD == LIVE_HEAD`인 값을 `result_head_sha`로 기록하고, 카드의 `bound_head_sha`를 `reviewed_head_sha`로 복사한다. 어느 증거든 불일치하면 complete하지 않고 block한다.
 6. **결과 판정**:
    - 추가 테스트가 모두 통과하면 `pass`다.
    - 추가 테스트가 재현 가능한 제품 결함 때문에 실패하면 `defect_found`다. 실패 테스트도 PR에 남기고 재현 명령·원인·수정 방향을 비어 있지 않은 `reflection`에 기록한다.

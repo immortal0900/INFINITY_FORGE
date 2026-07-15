@@ -155,6 +155,55 @@ def test_mutating_stage_uses_bound_head_task_worktree(skill_name: str) -> None:
     assert "HEAD:<PR_HEAD_BRANCH>" in skill
 
 
+@pytest.mark.parametrize(
+    "skill_name",
+    ["critic-adversarial", "kanban-codex-delegate"],
+)
+def test_mutating_stage_can_resume_only_its_verified_card_worktree(
+    skill_name: str,
+) -> None:
+    skill = _skill(skill_name)
+
+    for required in (
+        "rev-parse --is-inside-work-tree",
+        'test "$PR_HEAD_SHA" = "$BOUND_HEAD_SHA" || test "$PR_HEAD_SHA" = "$LOCAL_HEAD"',
+        "재개",
+    ):
+        assert required in skill
+
+
+@pytest.mark.parametrize(
+    "skill_name, workspace",
+    [
+        ("critic-adversarial", "$TASK_WORKTREE"),
+        ("kanban-codex-delegate", "$WORKSPACE"),
+    ],
+)
+def test_mutating_stage_requires_a_new_pushed_commit(
+    skill_name: str, workspace: str
+) -> None:
+    skill = _skill(skill_name)
+
+    assert 'test "$LOCAL_HEAD" != "$BOUND_HEAD_SHA"' in skill
+    assert 'test "$LOCAL_HEAD" = "$LIVE_HEAD"' in skill
+    assert f'git -C "{workspace}" merge-base --is-ancestor' in skill
+
+
+def test_executor_gate_runs_against_the_selected_workspace() -> None:
+    skill = _skill("kanban-codex-delegate")
+
+    assert 'codex-stop-gate.sh "$WORKSPACE"' in skill
+    assert "codex-stop-gate.sh <워크스페이스>" not in skill
+
+
+def test_critic_proves_every_reported_test_was_added_after_bound_head() -> None:
+    skill = _skill("critic-adversarial")
+
+    assert 'diff --name-only "$BOUND_HEAD_SHA" "$LOCAL_HEAD"' in skill
+    assert "added_tests 배열의 각 경로" in skill
+    assert 'grep -Fx -- "$path"' in skill
+
+
 def test_rework_records_base_only_after_bound_checkout() -> None:
     skill = _skill("kanban-codex-delegate")
 

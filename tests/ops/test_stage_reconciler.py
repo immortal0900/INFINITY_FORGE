@@ -430,6 +430,20 @@ def test_green_critic_pass_marks_pipeline_mergeable() -> None:
     assert action.kind is ActionKind.MARK_MERGEABLE
 
 
+def test_critic_pass_requires_a_new_result_commit() -> None:
+    unchanged = critic_snapshot(
+        reviewed_head=BOUND_HEAD_SHA,
+        bound_head=BOUND_HEAD_SHA,
+        result_head=BOUND_HEAD_SHA,
+        live_head=BOUND_HEAD_SHA,
+    )
+
+    action = decide_next_action(unchanged)
+
+    assert action.kind is ActionKind.GATE_ERROR
+    assert "result HEAD" in action.reason
+
+
 @pytest.mark.parametrize(
     "snapshot",
     [

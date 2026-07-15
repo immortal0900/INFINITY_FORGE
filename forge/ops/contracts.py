@@ -387,6 +387,11 @@ def validate_stage_result_binding(
     )
     if reviewed_head_sha != expected_head_sha:
         raise ContractError("reviewed head does not match expected_head_sha")
+    if (
+        isinstance(result, CriticResult)
+        and result.result_head_sha == result.reviewed_head_sha
+    ):
+        raise ContractError("critic result HEAD must differ from reviewed HEAD")
 
 
 def transition_digest(
