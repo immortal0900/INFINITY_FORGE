@@ -19,6 +19,13 @@ def test_eval_is_the_single_stable_ruleset_context() -> None:
     assert "private/free" not in workflow
 
 
+def test_eval_runs_pytest_through_the_configured_python() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    assert "python -m pytest tests/ -q" in workflow
+    assert re.search(r"(?m)^\s+pytest tests/ -q$", workflow) is None
+
+
 def test_repo_importing_services_run_from_repo_root() -> None:
     deploy = DEPLOY.read_text(encoding="utf-8")
 

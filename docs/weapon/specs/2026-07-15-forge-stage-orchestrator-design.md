@@ -214,4 +214,4 @@ CRITIC          → REVIEWER | EXECUTOR_REWORK
 ## 변경이력
 
 - 2026-07-15 | 설계 확정 | 변경: executor→reviewer→critic JIT 전이, reject 재작업, exact-HEAD CI gate, main ruleset 계약을 정의 | 검증: `docs/plan.md`, 현재 코드, VPS Hermes v0.18.2 CLI·SQLite, GitHub live check/ruleset 상태 대조
-- 2026-07-15 | strict 복구 확장 | 변경: updated HEAD fresh reviewer, actionable CI failure same-PR rework, semantic child validator, 비-actionable conclusion fail-closed를 추가 | 검증: 전체 `243 passed, 2 skipped`, 독립 코드 리뷰 PASS
+- 2026-07-15 | strict 복구 확장 | 변경: updated HEAD fresh reviewer, actionable CI failure same-PR rework, semantic child validator, 비-actionable conclusion fail-closed를 추가 | 검증: 전체 `244 passed, 2 skipped`, 독립 코드 리뷰 PASS

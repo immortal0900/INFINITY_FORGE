@@ -27,7 +27,7 @@ jobs:
       - name: 회귀 테스트 (pytest)
         run: |
           pip install --quiet pytest pyyaml
-          pytest tests/ -q
+          python -m pytest tests/ -q
 
       - name: 게이트·운영 스크립트 무결성 (bash 문법)
         run: |

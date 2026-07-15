@@ -359,7 +359,7 @@ git commit -m "ops: activate Forge reviewer and critic pipeline"
 - [x] worker push 전·후 crash 재개와 외부 divergence fail-closed 계약 검증
 - [x] 전체 테스트와 독립 코드 리뷰 통과
 
-검증 결과: `tests/ops` 213 passed, 전체 243 passed·2 skipped, 독립 리뷰 PASS. 구현 커밋은 `5194733`이다.
+검증 결과: `tests/ops` 214 passed, 전체 244 passed·2 skipped, 독립 리뷰 PASS. 구현 커밋은 `5194733`이며 PR #6 CI import 보완은 후속 커밋에 포함한다.
 
 ### Task 6: GitHub ruleset 적용, VPS 배포, E2E 검증
 
@@ -367,14 +367,14 @@ git commit -m "ops: activate Forge reviewer and critic pipeline"
 - GitHub repository `immortal0900/INFINITY_FORGE`
 - Ubuntu VPS `ubuntu@51.222.27.48`
 
-- [ ] **Step 1: 배포 전 fresh local verification**
+- [x] **Step 1: 배포 전 fresh local verification**
 
 ```powershell
 %LOCALAPPDATA%\InfinityForge\dev-venv\Scripts\python.exe -m pytest -q
 git diff --check
 ```
 
-- [ ] **Step 2: branch push와 PR 생성**
+- [x] **Step 2: branch push와 PR 생성**
 
 Ruleset 적용 전 `eval`이 실제 PR HEAD에 생성되는지 확인한다. 사용자 소유 미커밋 파일은 staging scope에서 제외한다.
 
@@ -426,4 +426,4 @@ for f in forge/scripts/*.sh forge/hooks/*.sh; do bash -n "$f"; done
 ## 변경이력
 
 - 2026-07-15 | 최초 계획 | 변경: stage contract, reconciler, adapter, label projection, worker 계약, ruleset, VPS E2E를 6개 검증 단위로 분해 | 검증: placeholder scan 0건, task별 파일·interface·검증 명령 자체 대조
-- 2026-07-15 | Task 1~5B 실행 | 변경: stage pipeline, strict HEAD 재검증, CI 실패 same-PR rework와 운영 문서를 구현 | 검증: 전체 `243 passed, 2 skipped`, 독립 리뷰 PASS; Task 6은 PR·ruleset·P1 merge 후 배포 순서로 계속
+- 2026-07-15 | Task 1~5B 실행 | 변경: stage pipeline, strict HEAD 재검증, CI 실패 same-PR rework와 운영 문서를 구현 | 검증: 전체 `244 passed, 2 skipped`, 독립 리뷰 PASS; Task 6은 PR·ruleset·P1 merge 후 배포 순서로 계속
