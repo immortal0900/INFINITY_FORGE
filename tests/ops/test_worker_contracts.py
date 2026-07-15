@@ -217,6 +217,18 @@ def test_executor_gate_runs_against_the_selected_workspace() -> None:
     assert "codex-stop-gate.sh <워크스페이스>" not in skill
 
 
+def test_executor_passes_prompt_file_through_stdin_without_shell_reparse() -> None:
+    skill = _skill("kanban-codex-delegate")
+
+    assert "codex exec --skip-git-repo-check -" in skill
+    assert "printf -v TMUX_COMMAND" in skill
+    assert "< %q > %q 2>&1" in skill
+    assert '"$PROMPT_FILE" "$LOG_FILE"' in skill
+    assert 'LOG_FILE="/home/ubuntu/.hermes/kanban/logs/' in skill
+    assert 'codex exec --skip-git-repo-check "<지시문>"' not in skill
+    assert "지시문 본문을 tmux 명령 문자열에 삽입하지 않는다" in skill
+
+
 def test_critic_proves_every_reported_test_was_added_after_bound_head() -> None:
     skill = _skill("critic-adversarial")
 
