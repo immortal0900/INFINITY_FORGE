@@ -80,37 +80,68 @@ def critic_summary(*, outcome: str) -> dict[str, object]:
     return value
 
 
-def bound_critic_card() -> dict[str, object]:
+def stage_body(
+    *,
+    source_task_id: str,
+    source_digest: str,
+    bound_head_sha: str,
+    pr_url: str = "https://github.com/acme/widgets/pull/99",
+) -> str:
     binding = {
-        "bound_head_sha": "d" * 40,
-        "pr_url": "https://github.com/acme/widgets/pull/99",
+        "bound_head_sha": bound_head_sha,
+        "pr_url": pr_url,
         "reflection": None,
-        "source_digest": "c" * 64,
+        "source_digest": source_digest,
         "source_run_id": 8,
-        "source_task_id": "reviewer",
+        "source_task_id": source_task_id,
     }
+    return f"```json\n{json.dumps(binding)}\n```"
+
+
+def bound_critic_card() -> dict[str, object]:
     return card(
         "critic",
         status="done",
         parent_id="reviewer",
         summary=critic_summary(outcome="pass"),
-        body=f"```json\n{json.dumps(binding)}\n```",
+        body=stage_body(
+            source_task_id="reviewer",
+            source_digest="c" * 64,
+            bound_head_sha="d" * 40,
+        ),
     )
+
+
+def bound_reviewer_card(*, verdict: str = "approve") -> dict[str, object]:
+    return card(
+        "reviewer",
+        status="done",
+        parent_id="root",
+        summary=reviewer_summary(verdict=verdict),
+        body=stage_body(
+            source_task_id="root",
+            source_digest="a" * 64,
+            bound_head_sha="b" * 40,
+        ),
+    )
+
+
+def pipeline_to_critic(
+    critic: dict[str, object] | None = None,
+) -> dict[str, dict[str, object]]:
+    return {
+        "github-issue:acme/widgets#7": card("root", status="done"),
+        "forge-stage:acme/widgets#7:reviewer:" + "a" * 16: bound_reviewer_card(),
+        "forge-stage:acme/widgets#7:critic:" + "c" * 16: (
+            critic if critic is not None else bound_critic_card()
+        ),
+    }
 
 
 def test_projection_uses_issue_identity_from_keys_not_pr_number() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
-    critic_key = "forge-stage:acme/widgets#7:critic:" + "1" * 16
-    cards = {
-        root_key: card("root", status="done"),
-        critic_key: card(
-            "critic",
-            status="done",
-            parent_id="root",
-            summary=critic_summary(outcome="pass"),
-        ),
-    }
+    cards = pipeline_to_critic()
 
     targets = mirror.projection_targets(
         cards,
@@ -138,15 +169,10 @@ def test_raw_root_done_projects_need_review_without_calling_ci() -> None:
 def test_reviewer_approve_frontier_projects_need_critic() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
-    reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "1" * 16
+    reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "a" * 16
     cards = {
         root_key: card("root", status="done"),
-        reviewer_key: card(
-            "reviewer",
-            status="done",
-            parent_id="root",
-            summary=reviewer_summary(verdict="approve"),
-        ),
+        reviewer_key: bound_reviewer_card(),
     }
 
     targets = mirror.projection_targets(cards, current_head_green=lambda _: False)
@@ -157,15 +183,10 @@ def test_reviewer_approve_frontier_projects_need_critic() -> None:
 def test_reviewer_reject_frontier_projects_need_execution() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
-    reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "1" * 16
+    reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "a" * 16
     cards = {
         root_key: card("root", status="done"),
-        reviewer_key: card(
-            "reviewer",
-            status="done",
-            parent_id="root",
-            summary=reviewer_summary(verdict="reject"),
-        ),
+        reviewer_key: bound_reviewer_card(verdict="reject"),
     }
 
     targets = mirror.projection_targets(cards, current_head_green=lambda _: False)
@@ -176,16 +197,7 @@ def test_reviewer_reject_frontier_projects_need_execution() -> None:
 def test_critic_pass_requires_injected_exact_head_ci_gate() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
-    critic_key = "forge-stage:acme/widgets#7:critic:" + "1" * 16
-    cards = {
-        root_key: card("root", status="done"),
-        critic_key: card(
-            "critic",
-            status="done",
-            parent_id="root",
-            summary=critic_summary(outcome="pass"),
-        ),
-    }
+    cards = pipeline_to_critic()
 
     pending = mirror.projection_targets(cards, current_head_green=lambda _: False)
     green = mirror.projection_targets(cards, current_head_green=lambda _: True)
@@ -214,6 +226,7 @@ def test_live_critic_gate_requires_current_result_head_eval_success(
             ), ""
         return 0, json.dumps(
             {
+                "total_count": 1,
                 "check_runs": [
                     {
                         "name": "eval",
@@ -249,6 +262,7 @@ def test_live_critic_gate_keeps_pending_eval_non_mergeable(
             ), ""
         return 0, json.dumps(
             {
+                "total_count": 1,
                 "check_runs": [
                     {
                         "name": "eval",
@@ -287,7 +301,9 @@ def test_live_critic_gate_rejects_duplicate_eval_checks(
             "conclusion": "success",
             "head_sha": "e" * 40,
         }
-        return 0, json.dumps({"check_runs": [check, check]}), ""
+        return 0, json.dumps(
+            {"total_count": 2, "check_runs": [check, check]}
+        ), ""
 
     monkeypatch.setattr(mirror, "sh", fake_sh)
 
@@ -328,7 +344,7 @@ def test_live_critic_gate_rejects_malformed_github_evidence(
             "head_sha": "e" * 40,
         }
         check.update(check_overrides)
-        return 0, json.dumps({"check_runs": [check]}), ""
+        return 0, json.dumps({"total_count": 1, "check_runs": [check]}), ""
 
     monkeypatch.setattr(mirror, "sh", fake_sh)
 
@@ -338,17 +354,9 @@ def test_live_critic_gate_rejects_malformed_github_evidence(
 
 def test_malformed_done_critic_result_is_not_treated_as_mergeable() -> None:
     mirror = load_mirror()
-    root_key = "github-issue:acme/widgets#7"
-    critic_key = "forge-stage:acme/widgets#7:critic:" + "1" * 16
-    cards = {
-        root_key: card("root", status="done"),
-        critic_key: card(
-            "critic",
-            status="done",
-            parent_id="root",
-            summary={"outcome": "pass"},
-        ),
-    }
+    invalid_critic = bound_critic_card()
+    invalid_critic["summary"] = {"outcome": "pass"}
+    cards = pipeline_to_critic(invalid_critic)
 
     with pytest.raises(mirror.ProjectionError, match="critic result"):
         mirror.projection_targets(cards, current_head_green=lambda _: True)
@@ -356,19 +364,10 @@ def test_malformed_done_critic_result_is_not_treated_as_mergeable() -> None:
 
 def test_unsuccessful_done_stage_run_is_rejected_before_projection() -> None:
     mirror = load_mirror()
-    root_key = "github-issue:acme/widgets#7"
-    critic_key = "forge-stage:acme/widgets#7:critic:" + "1" * 16
-    cards = {
-        root_key: card("root", status="done"),
-        critic_key: card(
-            "critic",
-            status="done",
-            parent_id="root",
-            summary=critic_summary(outcome="pass"),
-            run_status="failed",
-            run_outcome="error",
-        ),
-    }
+    invalid_critic = bound_critic_card()
+    invalid_critic["run_status"] = "failed"
+    invalid_critic["run_outcome"] = "error"
+    cards = pipeline_to_critic(invalid_critic)
 
     with pytest.raises(mirror.ProjectionError, match="successful completed run"):
         mirror.projection_targets(cards, current_head_green=lambda _: True)
@@ -379,15 +378,25 @@ def test_multiple_pipeline_leaves_fail_closed() -> None:
     root_key = "github-issue:acme/widgets#7"
     cards = {
         root_key: card("root", status="done"),
-        "forge-stage:acme/widgets#7:reviewer:" + "1" * 16: card(
+        "forge-stage:acme/widgets#7:reviewer:" + "a" * 16: card(
             "reviewer-one",
             status="ready",
             parent_id="root",
+            body=stage_body(
+                source_task_id="root",
+                source_digest="a" * 64,
+                bound_head_sha="b" * 40,
+            ),
         ),
-        "forge-stage:acme/widgets#7:reviewer:" + "2" * 16: card(
+        "forge-stage:acme/widgets#7:reviewer:" + "f" * 16: card(
             "reviewer-two",
             status="ready",
             parent_id="root",
+            body=stage_body(
+                source_task_id="root",
+                source_digest="f" * 64,
+                bound_head_sha="b" * 40,
+            ),
         ),
     }
 
@@ -433,7 +442,7 @@ def test_cards_by_key_reads_root_stage_links_and_latest_run(tmp_path: Path) -> N
                 "legacy-review",
                 None,
                 "done",
-                "github-issue:acme/widgets#7-review",
+                "github-issue:immortal0900/INFINITY_FORGE#3-review",
                 4,
             ),
         ],
@@ -490,3 +499,130 @@ def test_import_new_issues_keeps_root_executor_creation(monkeypatch: pytest.Monk
     assert create[create.index("--assignee") + 1] == "executor"
     assert create[create.index("--idempotency-key") + 1] == "github-issue:acme/widgets#7"
     assert create[create.index("--max-retries") + 1] == "4"
+
+
+def test_projection_rejects_root_to_critic_shortcut() -> None:
+    mirror = load_mirror()
+    cards = {
+        "github-issue:acme/widgets#7": card("root", status="done"),
+        "forge-stage:acme/widgets#7:critic:" + "c" * 16: bound_critic_card(),
+    }
+    cards[next(key for key in cards if ":critic:" in key)]["parent_id"] = "root"
+
+    with pytest.raises(mirror.ProjectionError, match="transition"):
+        mirror.projection_targets(cards, current_head_green=lambda _: True)
+
+
+def test_projection_binds_stage_receipt_to_key_and_parent() -> None:
+    mirror = load_mirror()
+    root_key = "github-issue:acme/widgets#7"
+    reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "f" * 16
+    cards = {
+        root_key: card("root", status="done"),
+        reviewer_key: card(
+            "reviewer",
+            status="done",
+            parent_id="root",
+            summary=reviewer_summary(verdict="approve"),
+            body=stage_body(
+                source_task_id="different-parent",
+                source_digest="a" * 64,
+                bound_head_sha="b" * 40,
+            ),
+        ),
+    }
+
+    with pytest.raises(mirror.ProjectionError, match="receipt"):
+        mirror.projection_targets(cards, current_head_green=lambda _: False)
+
+
+def test_projection_rejects_cross_repository_stage_result() -> None:
+    mirror = load_mirror()
+    root_key = "github-issue:acme/widgets#7"
+    reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "a" * 16
+    summary = reviewer_summary(verdict="approve")
+    summary["pr_url"] = "https://github.com/other/repo/pull/99"
+    cards = {
+        root_key: card("root", status="done"),
+        reviewer_key: card(
+            "reviewer",
+            status="done",
+            parent_id="root",
+            summary=summary,
+            body=stage_body(
+                source_task_id="root",
+                source_digest="a" * 64,
+                bound_head_sha="b" * 40,
+                pr_url="https://github.com/other/repo/pull/99",
+            ),
+        ),
+    }
+
+    with pytest.raises(mirror.ProjectionError, match="repository"):
+        mirror.projection_targets(cards, current_head_green=lambda _: False)
+
+
+def test_projection_scope_excludes_unconfigured_repositories() -> None:
+    mirror = load_mirror()
+    cards = {
+        "github-issue:acme/widgets#7": card("root-a", status="done"),
+        "github-issue:other/repo#8": card("root-b", status="done"),
+    }
+
+    targets = mirror.projection_targets(
+        cards,
+        current_head_green=lambda _: False,
+        repositories=("acme/widgets",),
+    )
+
+    assert targets == {"github-issue:acme/widgets#7": "forge:need-review"}
+
+
+def test_live_critic_gate_rejects_truncated_check_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mirror = load_mirror()
+
+    def fake_sh(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
+        if "/pulls/99" in args[-1]:
+            return 0, json.dumps(
+                {
+                    "number": 99,
+                    "html_url": "https://github.com/acme/widgets/pull/99",
+                    "state": "open",
+                    "draft": False,
+                    "head": {"sha": "e" * 40},
+                }
+            ), ""
+        return 0, json.dumps(
+            {
+                "total_count": 101,
+                "check_runs": [
+                    {
+                        "name": "eval",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "head_sha": "e" * 40,
+                    }
+                ],
+            }
+        ), ""
+
+    monkeypatch.setattr(mirror, "sh", fake_sh)
+
+    with pytest.raises(mirror.ProjectionError, match="complete check-run set"):
+        mirror.critic_current_head_green(bound_critic_card())
+
+
+def test_project_issue_label_rejects_unknown_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mirror = load_mirror()
+    monkeypatch.setattr(
+        mirror,
+        "_gh_json",
+        lambda *args, **kwargs: {"state": "mystery", "labels": []},
+    )
+
+    with pytest.raises(mirror.ProjectionError, match="state"):
+        mirror.project_issue_label("acme/widgets", 7, "forge:need-review")

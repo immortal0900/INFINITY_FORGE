@@ -44,13 +44,17 @@ NOTIFY_LABEL = {
 ROOT_KEY_RE = re.compile(
     r"^github-issue:(?P<repository>[^#\s]+/[^#\s]+)#(?P<issue>[1-9][0-9]*)$"
 )
-LEGACY_ROOT_KEY_RE = re.compile(
-    r"^github-issue:[^#\s]+/[^#\s]+#[1-9][0-9]*-(?:exec|review|critic)$"
+LEGACY_ROOT_KEYS = frozenset(
+    {
+        "github-issue:immortal0900/INFINITY_FORGE#3-exec",
+        "github-issue:immortal0900/INFINITY_FORGE#3-review",
+        "github-issue:immortal0900/INFINITY_FORGE#3-critic",
+    }
 )
 STAGE_KEY_RE = re.compile(
     r"^forge-stage:(?P<repository>[^#\s]+/[^#\s]+)#"
     r"(?P<issue>[1-9][0-9]*):"
-    r"(?P<stage>reviewer|critic|executor-rework):[0-9a-f]{16}$"
+    r"(?P<stage>reviewer|critic|executor-rework):(?P<digest>[0-9a-f]{16})$"
 )
 PR_URL_RE = re.compile(
     r"^https://github\.com/(?P<repository>[^/]+/[^/]+)/pull/(?P<number>[1-9][0-9]*)$"
@@ -69,6 +73,16 @@ CHECK_CONCLUSIONS = frozenset(
         "timed_out",
     }
 )
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+ALLOWED_CHILDREN = {
+    PipelineStage.EXECUTOR: frozenset({PipelineStage.REVIEWER}),
+    PipelineStage.EXECUTOR_REWORK: frozenset({PipelineStage.REVIEWER}),
+    PipelineStage.REVIEWER: frozenset(
+        {PipelineStage.CRITIC, PipelineStage.EXECUTOR_REWORK}
+    ),
+    PipelineStage.CRITIC: frozenset({PipelineStage.EXECUTOR_REWORK}),
+}
 
 
 class ProjectionError(RuntimeError):
@@ -162,7 +176,7 @@ def cards_by_key() -> dict[str, dict[str, object]]:
     ) in rows:
         if not isinstance(key, str) or not key:
             raise ProjectionError("pipeline card has no idempotency key")
-        if LEGACY_ROOT_KEY_RE.fullmatch(key) is not None:
+        if key in LEGACY_ROOT_KEYS:
             continue
         if key in cards:
             raise ProjectionError(f"duplicate pipeline card key: {key}")
@@ -232,12 +246,49 @@ def _frontier(
                 raise ProjectionError("pipeline parent_id is malformed")
             parent_ids.add(parent_id)
 
-    for _, card, _, is_root in entries:
+    roots: list[str] = []
+    for key, card, stage, is_root in entries:
+        card_id = _card_field(card, "id", str)
         parent_id = card.get("parent_id")
         if is_root and parent_id is not None:
             raise ProjectionError("root pipeline card cannot have a parent")
-        if not is_root and parent_id not in cards_by_id:
+        if is_root:
+            roots.append(card_id)
+            continue
+        if parent_id not in cards_by_id:
             raise ProjectionError("stage pipeline card has an unknown parent")
+        parent_entry = cards_by_id[parent_id]
+        parent_stage = parent_entry[2]
+        if stage not in ALLOWED_CHILDREN[parent_stage]:
+            raise ProjectionError(
+                f"stage transition {parent_stage.value} -> {stage.value} is not allowed"
+            )
+        receipt = _stage_binding(card.get("body"))
+        if receipt["source_task_id"] != parent_id:
+            raise ProjectionError("stage receipt parent does not match task link")
+        match = STAGE_KEY_RE.fullmatch(key)
+        if match is None or match.group("digest") != str(receipt["source_digest"])[:16]:
+            raise ProjectionError("stage receipt digest does not match its key")
+        pr_match = PR_URL_RE.fullmatch(str(receipt["pr_url"]))
+        repository = _key_identity(key)[0]
+        if pr_match is None or pr_match.group("repository") != repository:
+            raise ProjectionError("stage receipt PR repository does not match pipeline")
+
+    if len(roots) != 1:
+        raise ProjectionError(f"pipeline must have exactly one root; found {len(roots)}")
+    root_id = roots[0]
+    for card_id, entry in cards_by_id.items():
+        cursor_id = card_id
+        visited: set[str] = set()
+        while cursor_id != root_id:
+            if cursor_id in visited:
+                raise ProjectionError("pipeline graph contains a cycle")
+            visited.add(cursor_id)
+            cursor = cards_by_id[cursor_id][1]
+            parent_id = cursor.get("parent_id")
+            if not isinstance(parent_id, str) or parent_id not in cards_by_id:
+                raise ProjectionError("pipeline stage is not reachable from its root")
+            cursor_id = parent_id
 
     leaves = [entry for card_id, entry in cards_by_id.items() if card_id not in parent_ids]
     if len(leaves) != 1:
@@ -250,6 +301,7 @@ def _frontier(
 def _stage_outcome(
     stage: PipelineStage,
     card: Mapping[str, object],
+    repository: str,
 ) -> StageOutcome | None:
     if card.get("status") != "done" or stage in {
         PipelineStage.EXECUTOR,
@@ -267,6 +319,14 @@ def _stage_outcome(
         raise ProjectionError(f"{stage.value} result is missing")
     try:
         result = parse_stage_result(stage, summary, metadata)
+        receipt = _stage_binding(card.get("body"))
+        validate_stage_result_binding(
+            result,
+            expected_repository=repository,
+            expected_pr_url=receipt["pr_url"],
+            expected_source_digest=receipt["source_digest"],
+            expected_head_sha=receipt["bound_head_sha"],
+        )
     except ContractError as error:
         raise ProjectionError(f"{stage.value} result is invalid: {error}") from error
     if isinstance(result, ReviewerResult):
@@ -281,6 +341,7 @@ def projection_targets(
     *,
     current_head_green: Callable[[Mapping[str, object]], bool],
     max_reworks: int = 3,
+    repositories: tuple[str, ...] | None = None,
 ) -> dict[str, str]:
     """Project each root pipeline's unique leaf without using PR numbers as issue IDs."""
 
@@ -289,10 +350,13 @@ def projection_targets(
         list[tuple[str, Mapping[str, object], PipelineStage, bool]],
     ] = {}
     roots: dict[tuple[str, int], str] = {}
+    allowed_repositories = None if repositories is None else frozenset(repositories)
     for key, card in cards.items():
         if not isinstance(key, str) or not isinstance(card, Mapping):
             raise ProjectionError("pipeline cards mapping is malformed")
         repository, issue_number, stage, is_root = _key_identity(key)
+        if allowed_repositories is not None and repository not in allowed_repositories:
+            continue
         identity = (repository, issue_number)
         pipelines.setdefault(identity, []).append((key, card, stage, is_root))
         if is_root:
@@ -307,7 +371,7 @@ def projection_targets(
     for identity, entries in pipelines.items():
         _, frontier_card, stage, _ = _frontier(entries)
         status = _card_field(frontier_card, "status", str)
-        outcome = _stage_outcome(stage, frontier_card)
+        outcome = _stage_outcome(stage, frontier_card, identity[0])
         rework_count = sum(
             1 for _, _, entry_stage, _ in entries
             if entry_stage is PipelineStage.EXECUTOR_REWORK
@@ -339,6 +403,39 @@ def _stage_binding(body: object) -> Mapping[str, object]:
     value = _json_object(match.group(1), label="critic card binding", missing={})
     if not isinstance(value, Mapping):
         raise ProjectionError("critic card binding must be an object")
+    required = {
+        "bound_head_sha",
+        "pr_url",
+        "reflection",
+        "source_digest",
+        "source_run_id",
+        "source_task_id",
+    }
+    if set(value) != required:
+        raise ProjectionError("stage receipt fields are invalid")
+    if not isinstance(value["source_task_id"], str) or not value["source_task_id"].strip():
+        raise ProjectionError("stage receipt source task is invalid")
+    if (
+        not isinstance(value["source_run_id"], int)
+        or isinstance(value["source_run_id"], bool)
+        or value["source_run_id"] < 1
+    ):
+        raise ProjectionError("stage receipt source run is invalid")
+    if not isinstance(value["source_digest"], str) or SHA256_RE.fullmatch(
+        value["source_digest"]
+    ) is None:
+        raise ProjectionError("stage receipt source digest is invalid")
+    if not isinstance(value["bound_head_sha"], str) or GIT_SHA_RE.fullmatch(
+        value["bound_head_sha"]
+    ) is None:
+        raise ProjectionError("stage receipt bound HEAD is invalid")
+    if not isinstance(value["pr_url"], str) or PR_URL_RE.fullmatch(value["pr_url"]) is None:
+        raise ProjectionError("stage receipt PR URL is invalid")
+    reflection = value["reflection"]
+    if reflection is not None and (
+        not isinstance(reflection, str) or not reflection.strip()
+    ):
+        raise ProjectionError("stage receipt reflection is invalid")
     return value
 
 
@@ -421,6 +518,14 @@ def critic_current_head_green(card: Mapping[str, object]) -> bool:
     check_runs = checks_payload.get("check_runs")
     if not isinstance(check_runs, list):
         raise ProjectionError("GitHub check-runs payload is malformed")
+    total_count = checks_payload.get("total_count")
+    if (
+        not isinstance(total_count, int)
+        or isinstance(total_count, bool)
+        or total_count < 0
+        or total_count != len(check_runs)
+    ):
+        raise ProjectionError("GitHub did not return the complete check-run set")
     matches = [
         check for check in check_runs
         if isinstance(check, Mapping) and check.get("name") == "eval"
@@ -550,7 +655,10 @@ def project_issue_label(repo: str, issue_number: int, target: str) -> None:
         [GH, "api", f"repos/{repo}/issues/{issue_number}"],
         label=f"GitHub issue read for {repo}#{issue_number}",
     )
-    if issue.get("state") != "open":
+    state = issue.get("state")
+    if state not in {"open", "closed"}:
+        raise ProjectionError("GitHub issue state is malformed")
+    if state == "closed":
         return
     labels = issue.get("labels")
     if not isinstance(labels, list):
@@ -594,6 +702,7 @@ def main() -> int:
         targets = projection_targets(
             cards,
             current_head_green=critic_current_head_green,
+            repositories=tuple(REPOS),
         )
         existing_keys = set(cards)
         for repo in REPOS:
