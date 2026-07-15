@@ -31,6 +31,15 @@ def test_runbook_requires_both_pr_title_and_body_to_be_korean() -> None:
     assert "이슈" not in line
 
 
+def test_korean_pr_guideline_is_normative_text_not_a_fenced_example() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    guideline = re.search(r"(?m)^자동 워커나 사람이 생성하는 PR 제목과 본문은 .+$", runbook)
+    assert guideline is not None
+    preceding_text = runbook[: guideline.start()]
+    assert preceding_text.count("```") % 2 == 0
+
+
 def test_original_notation_exception_is_limited_to_tokens_not_whole_prs() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
 
