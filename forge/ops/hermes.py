@@ -178,7 +178,7 @@ class HermesStore:
                     SELECT id, task_id, status, outcome, summary, metadata
                     FROM task_runs
                     WHERE task_id = ?
-                      AND status = 'done'
+                      AND status IN ('done', 'completed')
                       AND outcome = 'completed'
                     ORDER BY id DESC
                     LIMIT 1
