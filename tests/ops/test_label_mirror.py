@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+from forge.ops.contracts import PipelineStage, transition_digest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "forge" / "scripts" / "label-mirror.py"
@@ -35,6 +37,7 @@ def card(
     body: str | None = None,
     run_status: str | None = None,
     run_outcome: str | None = None,
+    run_id: int | None = None,
 ) -> dict[str, object]:
     return {
         "id": card_id,
@@ -46,14 +49,41 @@ def card(
         "body": body,
         "run_status": run_status or ("done" if summary is not None else None),
         "run_outcome": run_outcome or ("completed" if summary is not None else None),
+        "run_id": run_id if run_id is not None else (1 if summary is not None else None),
     }
 
 
-def reviewer_summary(*, verdict: str) -> dict[str, object]:
+def executor_summary() -> dict[str, object]:
+    return {
+        "pr_url": "https://github.com/acme/widgets/pull/99",
+        "changed_files": ["src/widget.py"],
+        "implemented": ["AC1"],
+        "not_implemented": [],
+        "verified_by": {"AC1": "tests/test_widget.py"},
+    }
+
+
+def executor_digest() -> str:
+    return transition_digest(
+        task_id="root",
+        run_id=1,
+        stage=PipelineStage.EXECUTOR,
+        summary=executor_summary(),
+        metadata={},
+        pr_url="https://github.com/acme/widgets/pull/99",
+        head_sha="b" * 40,
+    )
+
+
+def reviewer_summary(
+    *,
+    verdict: str,
+    source_digest: str | None = None,
+) -> dict[str, object]:
     value: dict[str, object] = {
         "schema_version": "forge-reviewer-result/v1",
         "verdict": verdict,
-        "source_digest": "a" * 64,
+        "source_digest": source_digest or executor_digest(),
         "pr_url": "https://github.com/acme/widgets/pull/99",
         "head_sha": "b" * 40,
         "delta_check": {"implemented_verified": ["AC1"], "discrepancies": []},
@@ -64,13 +94,30 @@ def reviewer_summary(*, verdict: str) -> dict[str, object]:
     return value
 
 
-def critic_summary(*, outcome: str) -> dict[str, object]:
+def reviewer_digest() -> str:
+    summary = reviewer_summary(verdict="approve")
+    return transition_digest(
+        task_id="reviewer",
+        run_id=2,
+        stage=PipelineStage.REVIEWER,
+        summary=summary,
+        metadata={},
+        pr_url="https://github.com/acme/widgets/pull/99",
+        head_sha="b" * 40,
+    )
+
+
+def critic_summary(
+    *,
+    outcome: str,
+    source_digest: str | None = None,
+) -> dict[str, object]:
     value: dict[str, object] = {
         "schema_version": "forge-critic-result/v1",
         "outcome": outcome,
-        "source_digest": "c" * 64,
+        "source_digest": source_digest or reviewer_digest(),
         "pr_url": "https://github.com/acme/widgets/pull/99",
-        "reviewed_head_sha": "d" * 40,
+        "reviewed_head_sha": "b" * 40,
         "result_head_sha": "e" * 40,
         "added_tests": ["tests/test_widget.py"],
         "scenarios": ["concurrent update"],
@@ -86,13 +133,14 @@ def stage_body(
     source_digest: str,
     bound_head_sha: str,
     pr_url: str = "https://github.com/acme/widgets/pull/99",
+    source_run_id: int = 8,
 ) -> str:
     binding = {
         "bound_head_sha": bound_head_sha,
         "pr_url": pr_url,
         "reflection": None,
         "source_digest": source_digest,
-        "source_run_id": 8,
+        "source_run_id": source_run_id,
         "source_task_id": source_task_id,
     }
     return f"```json\n{json.dumps(binding)}\n```"
@@ -106,9 +154,11 @@ def bound_critic_card() -> dict[str, object]:
         summary=critic_summary(outcome="pass"),
         body=stage_body(
             source_task_id="reviewer",
-            source_digest="c" * 64,
-            bound_head_sha="d" * 40,
+            source_digest=reviewer_digest(),
+            bound_head_sha="b" * 40,
+            source_run_id=2,
         ),
+        run_id=3,
     )
 
 
@@ -120,9 +170,20 @@ def bound_reviewer_card(*, verdict: str = "approve") -> dict[str, object]:
         summary=reviewer_summary(verdict=verdict),
         body=stage_body(
             source_task_id="root",
-            source_digest="a" * 64,
+            source_digest=executor_digest(),
             bound_head_sha="b" * 40,
+            source_run_id=1,
         ),
+        run_id=2,
+    )
+
+
+def bound_root_card() -> dict[str, object]:
+    return card(
+        "root",
+        status="done",
+        summary=executor_summary(),
+        run_id=1,
     )
 
 
@@ -130,9 +191,11 @@ def pipeline_to_critic(
     critic: dict[str, object] | None = None,
 ) -> dict[str, dict[str, object]]:
     return {
-        "github-issue:acme/widgets#7": card("root", status="done"),
-        "forge-stage:acme/widgets#7:reviewer:" + "a" * 16: bound_reviewer_card(),
-        "forge-stage:acme/widgets#7:critic:" + "c" * 16: (
+        "github-issue:acme/widgets#7": bound_root_card(),
+        "forge-stage:acme/widgets#7:reviewer:"
+        + executor_digest()[:16]: bound_reviewer_card(),
+        "forge-stage:acme/widgets#7:critic:"
+        + reviewer_digest()[:16]: (
             critic if critic is not None else bound_critic_card()
         ),
     }
@@ -159,7 +222,7 @@ def test_raw_root_done_projects_need_review_without_calling_ci() -> None:
         raise AssertionError("raw executor completion must not query mergeability")
 
     targets = mirror.projection_targets(
-        {root_key: card("root", status="done")},
+        {root_key: bound_root_card()},
         current_head_green=unexpected_ci,
     )
 
@@ -169,9 +232,11 @@ def test_raw_root_done_projects_need_review_without_calling_ci() -> None:
 def test_reviewer_approve_frontier_projects_need_critic() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
-    reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "a" * 16
+    reviewer_key = (
+        "forge-stage:acme/widgets#7:reviewer:" + executor_digest()[:16]
+    )
     cards = {
-        root_key: card("root", status="done"),
+        root_key: bound_root_card(),
         reviewer_key: bound_reviewer_card(),
     }
 
@@ -183,9 +248,11 @@ def test_reviewer_approve_frontier_projects_need_critic() -> None:
 def test_reviewer_reject_frontier_projects_need_execution() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
-    reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "a" * 16
+    reviewer_key = (
+        "forge-stage:acme/widgets#7:reviewer:" + executor_digest()[:16]
+    )
     cards = {
-        root_key: card("root", status="done"),
+        root_key: bound_root_card(),
         reviewer_key: bound_reviewer_card(verdict="reject"),
     }
 
@@ -377,15 +444,16 @@ def test_multiple_pipeline_leaves_fail_closed() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
     cards = {
-        root_key: card("root", status="done"),
-        "forge-stage:acme/widgets#7:reviewer:" + "a" * 16: card(
+        root_key: bound_root_card(),
+        "forge-stage:acme/widgets#7:reviewer:" + executor_digest()[:16]: card(
             "reviewer-one",
             status="ready",
             parent_id="root",
             body=stage_body(
                 source_task_id="root",
-                source_digest="a" * 64,
+                source_digest=executor_digest(),
                 bound_head_sha="b" * 40,
+                source_run_id=1,
             ),
         ),
         "forge-stage:acme/widgets#7:reviewer:" + "f" * 16: card(
@@ -396,11 +464,12 @@ def test_multiple_pipeline_leaves_fail_closed() -> None:
                 source_task_id="root",
                 source_digest="f" * 64,
                 bound_head_sha="b" * 40,
+                source_run_id=1,
             ),
         ),
     }
 
-    with pytest.raises(mirror.ProjectionError, match="frontier"):
+    with pytest.raises(mirror.ProjectionError, match="frontier|digest"):
         mirror.projection_targets(cards, current_head_green=lambda _: False)
 
 
@@ -504,7 +573,7 @@ def test_import_new_issues_keeps_root_executor_creation(monkeypatch: pytest.Monk
 def test_projection_rejects_root_to_critic_shortcut() -> None:
     mirror = load_mirror()
     cards = {
-        "github-issue:acme/widgets#7": card("root", status="done"),
+        "github-issue:acme/widgets#7": bound_root_card(),
         "forge-stage:acme/widgets#7:critic:" + "c" * 16: bound_critic_card(),
     }
     cards[next(key for key in cards if ":critic:" in key)]["parent_id"] = "root"
@@ -518,7 +587,7 @@ def test_projection_binds_stage_receipt_to_key_and_parent() -> None:
     root_key = "github-issue:acme/widgets#7"
     reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "f" * 16
     cards = {
-        root_key: card("root", status="done"),
+        root_key: bound_root_card(),
         reviewer_key: card(
             "reviewer",
             status="done",
@@ -526,8 +595,9 @@ def test_projection_binds_stage_receipt_to_key_and_parent() -> None:
             summary=reviewer_summary(verdict="approve"),
             body=stage_body(
                 source_task_id="different-parent",
-                source_digest="a" * 64,
+                source_digest=executor_digest(),
                 bound_head_sha="b" * 40,
+                source_run_id=1,
             ),
         ),
     }
@@ -539,11 +609,13 @@ def test_projection_binds_stage_receipt_to_key_and_parent() -> None:
 def test_projection_rejects_cross_repository_stage_result() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
-    reviewer_key = "forge-stage:acme/widgets#7:reviewer:" + "a" * 16
+    reviewer_key = (
+        "forge-stage:acme/widgets#7:reviewer:" + executor_digest()[:16]
+    )
     summary = reviewer_summary(verdict="approve")
     summary["pr_url"] = "https://github.com/other/repo/pull/99"
     cards = {
-        root_key: card("root", status="done"),
+        root_key: bound_root_card(),
         reviewer_key: card(
             "reviewer",
             status="done",
@@ -551,8 +623,9 @@ def test_projection_rejects_cross_repository_stage_result() -> None:
             summary=summary,
             body=stage_body(
                 source_task_id="root",
-                source_digest="a" * 64,
+                source_digest=executor_digest(),
                 bound_head_sha="b" * 40,
+                source_run_id=1,
                 pr_url="https://github.com/other/repo/pull/99",
             ),
         ),
@@ -565,7 +638,7 @@ def test_projection_rejects_cross_repository_stage_result() -> None:
 def test_projection_scope_excludes_unconfigured_repositories() -> None:
     mirror = load_mirror()
     cards = {
-        "github-issue:acme/widgets#7": card("root-a", status="done"),
+        "github-issue:acme/widgets#7": bound_root_card(),
         "github-issue:other/repo#8": card("root-b", status="done"),
     }
 
@@ -626,3 +699,56 @@ def test_project_issue_label_rejects_unknown_state(
 
     with pytest.raises(mirror.ProjectionError, match="state"):
         mirror.project_issue_label("acme/widgets", 7, "forge:need-review")
+
+
+def test_reviewer_reject_cannot_parent_a_critic() -> None:
+    mirror = load_mirror()
+    cards = pipeline_to_critic()
+    reviewer = next(card for key, card in cards.items() if ":reviewer:" in key)
+    reviewer["summary"] = reviewer_summary(verdict="reject")
+
+    with pytest.raises(mirror.ProjectionError, match="reject|transition"):
+        mirror.projection_targets(cards, current_head_green=lambda _: True)
+
+
+def test_stage_receipt_digest_must_recompute_from_parent_run() -> None:
+    mirror = load_mirror()
+    cards = pipeline_to_critic()
+    reviewer_key = next(key for key in cards if ":reviewer:" in key)
+    reviewer = cards.pop(reviewer_key)
+    reviewer["body"] = stage_body(
+        source_task_id="root",
+        source_digest="f" * 64,
+        bound_head_sha="b" * 40,
+    )
+    cards["forge-stage:acme/widgets#7:reviewer:" + "f" * 16] = reviewer
+
+    with pytest.raises(mirror.ProjectionError, match="digest|run"):
+        mirror.projection_targets(cards, current_head_green=lambda _: True)
+
+
+def test_projection_rejects_more_than_three_rework_cards() -> None:
+    mirror = load_mirror()
+    cards: dict[str, dict[str, object]] = {
+        "github-issue:acme/widgets#7": card("root", status="done")
+    }
+    parent = "root"
+    for index in range(4):
+        key = (
+            "forge-stage:acme/widgets#7:executor-rework:"
+            + f"{index + 1:016x}"
+        )
+        cards[key] = card(
+            f"rework-{index}",
+            status="ready" if index == 3 else "done",
+            parent_id=parent,
+            body=stage_body(
+                source_task_id=parent,
+                source_digest=f"{index + 1:064x}",
+                bound_head_sha="b" * 40,
+            ),
+        )
+        parent = f"rework-{index}"
+
+    with pytest.raises(mirror.ProjectionError, match="rework"):
+        mirror.projection_targets(cards, current_head_green=lambda _: False)

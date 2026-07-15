@@ -20,10 +20,13 @@ from collections.abc import Callable, Mapping
 from forge.ops.contracts import (
     ContractError,
     CriticResult,
+    ExecutorResult,
     PipelineStage,
     ReviewerResult,
+    StageResult,
     StageOutcome,
     parse_stage_result,
+    transition_digest,
     validate_stage_result_binding,
 )
 from forge.ops.label_projection import ProjectionState, projected_label
@@ -137,6 +140,7 @@ def cards_by_key() -> dict[str, dict[str, object]]:
             t.body,
             t.created_at,
             l.parent_id,
+            r.id,
             r.status,
             r.outcome,
             r.summary,
@@ -169,6 +173,7 @@ def cards_by_key() -> dict[str, dict[str, object]]:
         body,
         created_at,
         parent_id,
+        run_id,
         run_status,
         run_outcome,
         summary,
@@ -187,6 +192,7 @@ def cards_by_key() -> dict[str, dict[str, object]]:
             "body": body,
             "created_at": created_at,
             "parent_id": parent_id,
+            "run_id": run_id,
             "run_status": run_status,
             "run_outcome": run_outcome,
             "summary": _json_object(
@@ -273,6 +279,13 @@ def _frontier(
         repository = _key_identity(key)[0]
         if pr_match is None or pr_match.group("repository") != repository:
             raise ProjectionError("stage receipt PR repository does not match pipeline")
+        _validate_parent_transition(
+            parent_stage=parent_stage,
+            parent_card=parent_entry[1],
+            child_stage=stage,
+            child_receipt=receipt,
+            repository=repository,
+        )
 
     if len(roots) != 1:
         raise ProjectionError(f"pipeline must have exactly one root; found {len(roots)}")
@@ -303,37 +316,119 @@ def _stage_outcome(
     card: Mapping[str, object],
     repository: str,
 ) -> StageOutcome | None:
-    if card.get("status") != "done" or stage in {
-        PipelineStage.EXECUTOR,
-        PipelineStage.EXECUTOR_REWORK,
-    }:
+    if card.get("status") != "done":
         return None
+    result = _completed_stage_result(stage, card, repository)
+    if isinstance(result, ExecutorResult):
+        return None
+    if isinstance(result, ReviewerResult):
+        return result.verdict
+    if isinstance(result, CriticResult):
+        return result.outcome
+    raise ProjectionError(f"{stage.value} result has the wrong type")
+
+
+def _completed_stage_result(
+    stage: PipelineStage,
+    card: Mapping[str, object],
+    repository: str,
+) -> StageResult:
     terminal_run = (card.get("run_status"), card.get("run_outcome"))
     if terminal_run not in {("done", "completed"), ("completed", "success")}:
         raise ProjectionError(
             f"{stage.value} result has no successful completed run"
         )
+    run_id = card.get("run_id")
+    if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id < 1:
+        raise ProjectionError(f"{stage.value} completed run id is invalid")
     summary = card.get("summary")
     metadata = card.get("metadata", {})
     if not isinstance(summary, Mapping) or not isinstance(metadata, Mapping):
         raise ProjectionError(f"{stage.value} result is missing")
     try:
         result = parse_stage_result(stage, summary, metadata)
-        receipt = _stage_binding(card.get("body"))
-        validate_stage_result_binding(
-            result,
-            expected_repository=repository,
-            expected_pr_url=receipt["pr_url"],
-            expected_source_digest=receipt["source_digest"],
-            expected_head_sha=receipt["bound_head_sha"],
-        )
+        if isinstance(result, ExecutorResult):
+            validate_stage_result_binding(
+                result,
+                expected_repository=repository,
+            )
+            if stage is PipelineStage.EXECUTOR_REWORK:
+                own_receipt = _stage_binding(card.get("body"))
+                if result.pr_url != own_receipt["pr_url"]:
+                    raise ContractError("rework result PR does not match its receipt")
+        else:
+            own_receipt = _stage_binding(card.get("body"))
+            validate_stage_result_binding(
+                result,
+                expected_repository=repository,
+                expected_pr_url=own_receipt["pr_url"],
+                expected_source_digest=own_receipt["source_digest"],
+                expected_head_sha=own_receipt["bound_head_sha"],
+            )
     except ContractError as error:
         raise ProjectionError(f"{stage.value} result is invalid: {error}") from error
-    if isinstance(result, ReviewerResult):
-        return result.verdict
-    if isinstance(result, CriticResult):
-        return result.outcome
-    raise ProjectionError(f"{stage.value} result has the wrong type")
+    return result
+
+
+def _validate_parent_transition(
+    *,
+    parent_stage: PipelineStage,
+    parent_card: Mapping[str, object],
+    child_stage: PipelineStage,
+    child_receipt: Mapping[str, object],
+    repository: str,
+) -> None:
+    if parent_card.get("status") != "done":
+        raise ProjectionError("stage child has an incomplete parent")
+    result = _completed_stage_result(parent_stage, parent_card, repository)
+    if result.pr_url != child_receipt["pr_url"]:
+        raise ProjectionError("stage receipt PR does not match parent result")
+
+    expected_child: PipelineStage | None
+    expected_head: str | None = None
+    if isinstance(result, ExecutorResult):
+        expected_child = PipelineStage.REVIEWER
+    elif isinstance(result, ReviewerResult):
+        expected_head = result.head_sha
+        expected_child = (
+            PipelineStage.CRITIC
+            if result.verdict is StageOutcome.APPROVE
+            else PipelineStage.EXECUTOR_REWORK
+        )
+    else:
+        expected_head = result.result_head_sha
+        expected_child = (
+            PipelineStage.EXECUTOR_REWORK
+            if result.outcome is StageOutcome.DEFECT_FOUND
+            else None
+        )
+    if child_stage is not expected_child:
+        outcome = getattr(result, "verdict", getattr(result, "outcome", "complete"))
+        raise ProjectionError(
+            f"parent result {outcome} cannot transition to {child_stage.value}"
+        )
+    if expected_head is not None and child_receipt["bound_head_sha"] != expected_head:
+        raise ProjectionError("stage receipt HEAD does not match parent result")
+
+    parent_run_id = parent_card.get("run_id")
+    if child_receipt["source_run_id"] != parent_run_id:
+        raise ProjectionError("stage receipt run id does not match parent run")
+    summary = parent_card.get("summary")
+    metadata = parent_card.get("metadata", {})
+    if not isinstance(summary, Mapping) or not isinstance(metadata, Mapping):
+        raise ProjectionError("parent run evidence is missing")
+    parent_task_id = _card_field(parent_card, "id", str)
+    expected_digest = transition_digest(
+        task_id=parent_task_id,
+        run_id=parent_run_id,
+        stage=parent_stage,
+        summary=summary,
+        metadata=metadata,
+        pr_url=str(child_receipt["pr_url"]),
+        head_sha=str(child_receipt["bound_head_sha"]),
+    )
+    if child_receipt["source_digest"] != expected_digest:
+        raise ProjectionError("stage receipt digest does not match parent run")
 
 
 def projection_targets(
@@ -350,6 +445,12 @@ def projection_targets(
         list[tuple[str, Mapping[str, object], PipelineStage, bool]],
     ] = {}
     roots: dict[tuple[str, int], str] = {}
+    if (
+        not isinstance(max_reworks, int)
+        or isinstance(max_reworks, bool)
+        or not 1 <= max_reworks <= 3
+    ):
+        raise ValueError("max_reworks must be from 1 through 3")
     allowed_repositories = None if repositories is None else frozenset(repositories)
     for key, card in cards.items():
         if not isinstance(key, str) or not isinstance(card, Mapping):
@@ -369,13 +470,16 @@ def projection_targets(
 
     targets: dict[str, str] = {}
     for identity, entries in pipelines.items():
+        rework_count = sum(
+            1
+            for _, _, entry_stage, _ in entries
+            if entry_stage is PipelineStage.EXECUTOR_REWORK
+        )
+        if rework_count > max_reworks:
+            raise ProjectionError("pipeline exceeds the maximum rework count")
         _, frontier_card, stage, _ = _frontier(entries)
         status = _card_field(frontier_card, "status", str)
         outcome = _stage_outcome(stage, frontier_card, identity[0])
-        rework_count = sum(
-            1 for _, _, entry_stage, _ in entries
-            if entry_stage is PipelineStage.EXECUTOR_REWORK
-        )
         green = False
         if (
             stage is PipelineStage.CRITIC
