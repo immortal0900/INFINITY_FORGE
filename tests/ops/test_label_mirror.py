@@ -752,3 +752,38 @@ def test_projection_rejects_more_than_three_rework_cards() -> None:
 
     with pytest.raises(mirror.ProjectionError, match="rework"):
         mirror.projection_targets(cards, current_head_green=lambda _: False)
+
+
+def test_rework_receipt_must_copy_parent_reflection_exactly() -> None:
+    mirror = load_mirror()
+    reviewer = bound_reviewer_card(verdict="reject")
+    reviewer_result = reviewer["summary"]
+    assert isinstance(reviewer_result, dict)
+    digest = transition_digest(
+        task_id="reviewer",
+        run_id=2,
+        stage=PipelineStage.REVIEWER,
+        summary=reviewer_result,
+        metadata={},
+        pr_url="https://github.com/acme/widgets/pull/99",
+        head_sha="b" * 40,
+    )
+    cards = {
+        "github-issue:acme/widgets#7": bound_root_card(),
+        "forge-stage:acme/widgets#7:reviewer:"
+        + executor_digest()[:16]: reviewer,
+        "forge-stage:acme/widgets#7:executor-rework:" + digest[:16]: card(
+            "rework",
+            status="ready",
+            parent_id="reviewer",
+            body=stage_body(
+                source_task_id="reviewer",
+                source_digest=digest,
+                bound_head_sha="b" * 40,
+                source_run_id=2,
+            ),
+        ),
+    }
+
+    with pytest.raises(mirror.ProjectionError, match="reflection"):
+        mirror.projection_targets(cards, current_head_green=lambda _: False)

@@ -47,6 +47,8 @@ def projected_label(snapshot: ProjectionState, max_reworks: int = 3) -> str | No
         or snapshot.rework_count < 0
     ):
         raise ValueError("rework_count must be a non-negative integer")
+    if snapshot.rework_count > max_reworks:
+        raise ValueError("rework_count exceeds max_reworks")
 
     status = snapshot.task_status
     if status == "blocked":

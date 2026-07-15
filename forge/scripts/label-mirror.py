@@ -407,6 +407,14 @@ def _validate_parent_transition(
         raise ProjectionError(
             f"parent result {outcome} cannot transition to {child_stage.value}"
         )
+    expected_reflection = (
+        result.reflection
+        if child_stage is PipelineStage.EXECUTOR_REWORK
+        and isinstance(result, (ReviewerResult, CriticResult))
+        else None
+    )
+    if child_receipt["reflection"] != expected_reflection:
+        raise ProjectionError("stage receipt reflection does not match parent result")
     if expected_head is not None and child_receipt["bound_head_sha"] != expected_head:
         raise ProjectionError("stage receipt HEAD does not match parent result")
 

@@ -108,3 +108,16 @@ def test_projection_rejects_invalid_rework_limit(max_reworks: int) -> None:
 
     with pytest.raises(ValueError, match="max_reworks"):
         projected_label(state, max_reworks=max_reworks)
+
+
+def test_projection_rejects_rework_count_above_limit_before_mergeable() -> None:
+    state = ProjectionState(
+        PipelineStage.CRITIC,
+        "done",
+        StageOutcome.PASS,
+        True,
+        4,
+    )
+
+    with pytest.raises(ValueError, match="rework_count"):
+        projected_label(state)
