@@ -95,7 +95,7 @@ class CheckRun:
 class PullRequestSnapshot:
     pr_url: str
     repository: str
-    issue_number: int
+    pr_number: int
     head_sha: str
     is_open: bool
     is_draft: bool

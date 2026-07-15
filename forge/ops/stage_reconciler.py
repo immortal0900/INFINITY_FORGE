@@ -25,6 +25,29 @@ from .contracts import (
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_ROOT_KEY_RE = re.compile(
+    r"^github-issue:(?P<repository>[^#]+)#(?P<issue>[1-9][0-9]*)$"
+)
+_STAGE_KEY_RE = re.compile(
+    r"^forge-stage:(?P<repository>[^#]+)#(?P<issue>[1-9][0-9]*):"
+    r"(?P<stage>reviewer|critic|executor-rework):(?P<digest>[0-9a-f]{16})$"
+)
+_VALID_CHECK_STATUSES = frozenset({"queued", "in_progress", "completed"})
+_VALID_CHECK_CONCLUSIONS = frozenset(
+    {
+        "action_required",
+        "cancelled",
+        "failure",
+        "neutral",
+        "pending",
+        "skipped",
+        "stale",
+        "startup_failure",
+        "success",
+        "timed_out",
+    }
+)
+_MAX_REWORKS = 3
 
 
 class ActionKind(str, Enum):
@@ -42,11 +65,15 @@ class PipelineSnapshot:
     """Complete, already-fetched evidence for one side-effect-free decision."""
 
     stage: PipelineStage
+    # Root GitHub issue identity. This is intentionally separate from PR number.
+    issue_number: int
     source_task: TaskRecord
     source_run: RunRecord
     result: StageResult
+    # Digest of source_run; used to create the next child receipt.
     source_digest: str
     pull_request: PullRequestSnapshot
+    # Receipt fields embedded when the current stage card was created.
     bound_source_digest: str | None = None
     bound_pr_url: str | None = None
     bound_head_sha: str | None = None
@@ -108,12 +135,39 @@ def _validate_snapshot_shape(snapshot: PipelineSnapshot) -> StageAction | None:
         return _gate_error("source run is malformed")
     if snapshot.source_run.task_id != snapshot.source_task.task_id:
         return _gate_error("source run is bound to a different task")
+    if snapshot.source_task.status != "done":
+        return _gate_error("source task is not completed")
+    if snapshot.source_run.status != "completed":
+        return _gate_error("source run is not completed")
+    if snapshot.source_run.outcome != "success":
+        return _gate_error("source run outcome is not success")
+    if (
+        not isinstance(snapshot.issue_number, int)
+        or isinstance(snapshot.issue_number, bool)
+        or snapshot.issue_number < 1
+    ):
+        return _gate_error("root issue identity is invalid")
     if not isinstance(snapshot.source_digest, str) or _SHA256_RE.fullmatch(
         snapshot.source_digest
     ) is None:
         return _gate_error("source digest has an invalid format")
     if not isinstance(snapshot.pull_request, PullRequestSnapshot):
         return _gate_error("PR snapshot is malformed")
+    identity_error = _validate_source_identity(snapshot)
+    if identity_error is not None:
+        return identity_error
+    if (
+        not isinstance(snapshot.pull_request.pr_number, int)
+        or isinstance(snapshot.pull_request.pr_number, bool)
+        or snapshot.pull_request.pr_number < 1
+    ):
+        return _gate_error("PR number is invalid")
+    expected_pr_url = (
+        f"https://github.com/{snapshot.pull_request.repository}/pull/"
+        f"{snapshot.pull_request.pr_number}"
+    )
+    if snapshot.pull_request.pr_url != expected_pr_url:
+        return _gate_error("PR URL, repository, and PR number do not match")
     if _GIT_SHA_RE.fullmatch(snapshot.pull_request.head_sha) is None:
         return _gate_error("live PR head has an invalid format")
     if (
@@ -126,13 +180,61 @@ def _validate_snapshot_shape(snapshot: PipelineSnapshot) -> StageAction | None:
         not isinstance(snapshot.max_reworks, int)
         or isinstance(snapshot.max_reworks, bool)
         or snapshot.max_reworks < 1
+        or snapshot.max_reworks > _MAX_REWORKS
     ):
-        return _gate_error("max reworks must be a positive integer")
+        return _gate_error("max reworks must be an integer from 1 through 3")
     if (
         not isinstance(snapshot.required_check_name, str)
         or not snapshot.required_check_name.strip()
     ):
         return _gate_error("required check name must be non-empty")
+    check_error = _validate_check_evidence(snapshot.pull_request)
+    if check_error is not None:
+        return check_error
+    return None
+
+
+def _validate_source_identity(snapshot: PipelineSnapshot) -> StageAction | None:
+    key = snapshot.source_task.idempotency_key
+    if not isinstance(key, str):
+        return _gate_error("source task identity key is missing")
+    if snapshot.stage is PipelineStage.EXECUTOR:
+        match = _ROOT_KEY_RE.fullmatch(key)
+        if match is None:
+            return _gate_error("executor source identity key is malformed")
+    else:
+        match = _STAGE_KEY_RE.fullmatch(key)
+        if match is None:
+            return _gate_error("stage source identity key is malformed")
+        if match.group("stage") != snapshot.stage.value:
+            return _gate_error("source identity stage does not match snapshot stage")
+    if (
+        match.group("repository") != snapshot.pull_request.repository
+        or int(match.group("issue")) != snapshot.issue_number
+    ):
+        return _gate_error("source task identity does not match repository and issue")
+    return None
+
+
+def _validate_check_evidence(pr: PullRequestSnapshot) -> StageAction | None:
+    if not isinstance(pr.checks, tuple):
+        return _gate_error("check evidence must be a tuple")
+    for check in pr.checks:
+        if not isinstance(check, CheckRun):
+            return _gate_error("check evidence contains a malformed entry")
+        if not isinstance(check.name, str) or not check.name.strip():
+            return _gate_error("check name is malformed")
+        if check.status not in _VALID_CHECK_STATUSES:
+            return _gate_error("check status is malformed")
+        if _GIT_SHA_RE.fullmatch(check.head_sha) is None:
+            return _gate_error("check head SHA is malformed")
+        if check.head_sha != pr.head_sha:
+            return _gate_error("check evidence is not bound to the live PR head")
+        if check.status == "completed":
+            if check.conclusion not in _VALID_CHECK_CONCLUSIONS:
+                return _gate_error("completed check conclusion is malformed")
+        elif check.conclusion is not None:
+            return _gate_error("unfinished check cannot have a conclusion")
     return None
 
 
@@ -198,7 +300,7 @@ def _required_check_decision(
     matches = tuple(
         check
         for check in snapshot.pull_request.checks
-        if isinstance(check, CheckRun) and check.name == snapshot.required_check_name
+        if check.name == snapshot.required_check_name
     )
     if not matches:
         return _gate_error(
@@ -348,13 +450,13 @@ def build_stage_card_spec(
     )
     return StageCardSpec(
         target_stage=target_stage,
-        title=f"Forge {target_stage.value}: {pr.repository}#{pr.issue_number}",
+        title=f"Forge {target_stage.value}: {pr.repository}#{snapshot.issue_number}",
         body=f"```json\n{canonical}\n```",
         parent_id=snapshot.source_task.task_id,
         assignee=assignee,
         skill=skill,
         idempotency_key=(
-            f"forge-stage:{pr.repository}#{pr.issue_number}:"
+            f"forge-stage:{pr.repository}#{snapshot.issue_number}:"
             f"{target_stage.value}:{snapshot.source_digest[:16]}"
         ),
     )

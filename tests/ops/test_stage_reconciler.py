@@ -51,10 +51,18 @@ def _check(
 
 
 def _source_records(stage: PipelineStage) -> tuple[TaskRecord, RunRecord]:
+    if stage is PipelineStage.EXECUTOR:
+        idempotency_key = f"github-issue:{REPOSITORY}#{ISSUE_NUMBER}"
+    else:
+        idempotency_key = (
+            f"forge-stage:{REPOSITORY}#{ISSUE_NUMBER}:"
+            f"{stage.value}:{BOUND_SOURCE_DIGEST[:16]}"
+        )
     task = TaskRecord(
         task_id=f"t_{stage.value}",
         title=f"Forge {stage.value}",
         status="done",
+        idempotency_key=idempotency_key,
     )
     run = RunRecord(
         run_id=12,
@@ -79,7 +87,7 @@ def _pull_request(
     return PullRequestSnapshot(
         pr_url=PR_URL,
         repository=REPOSITORY,
-        issue_number=ISSUE_NUMBER,
+        pr_number=17,
         head_sha=live_head,
         is_open=is_open,
         is_draft=is_draft,
@@ -104,6 +112,7 @@ def executor_snapshot(
         )
     return PipelineSnapshot(
         stage=stage,
+        issue_number=ISSUE_NUMBER,
         source_task=task,
         source_run=run,
         result=ExecutorResult(
@@ -139,6 +148,7 @@ def reviewer_snapshot(
     task, run = _source_records(PipelineStage.REVIEWER)
     return PipelineSnapshot(
         stage=PipelineStage.REVIEWER,
+        issue_number=ISSUE_NUMBER,
         source_task=task,
         source_run=run,
         result=ReviewerResult(
@@ -188,6 +198,7 @@ def critic_snapshot(
         )
     return PipelineSnapshot(
         stage=PipelineStage.CRITIC,
+        issue_number=ISSUE_NUMBER,
         source_task=task,
         source_run=run,
         result=CriticResult(
@@ -247,7 +258,6 @@ def test_required_check_must_exist_exactly_once(
         ("completed", "pending"),
         ("completed", "failure"),
         ("completed", "cancelled"),
-        ("in_progress", "success"),
     ],
 )
 def test_non_green_required_check_waits(
@@ -421,6 +431,105 @@ def test_stage_result_type_mismatch_is_gate_error() -> None:
     action = decide_next_action(mismatched)
 
     assert action.kind is ActionKind.GATE_ERROR
+
+
+@pytest.mark.parametrize(
+    ("task_status", "run_status", "run_outcome"),
+    [
+        ("running", "completed", "success"),
+        ("done", "running", None),
+        ("done", "completed", "failure"),
+    ],
+)
+def test_source_must_be_a_successfully_completed_run(
+    task_status: str,
+    run_status: str,
+    run_outcome: str | None,
+) -> None:
+    snapshot = executor_snapshot()
+    invalid = replace(
+        snapshot,
+        source_task=replace(snapshot.source_task, status=task_status),
+        source_run=replace(
+            snapshot.source_run,
+            status=run_status,
+            outcome=run_outcome,
+        ),
+    )
+
+    action = decide_next_action(invalid)
+
+    assert action.kind is ActionKind.GATE_ERROR
+    assert "completed" in action.reason or "success" in action.reason
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        replace(executor_snapshot(), issue_number=17),
+        replace(
+            executor_snapshot(),
+            source_task=replace(
+                executor_snapshot().source_task,
+                idempotency_key=f"github-issue:{REPOSITORY}#17",
+            ),
+        ),
+        replace(
+            reviewer_snapshot(),
+            source_task=replace(
+                reviewer_snapshot().source_task,
+                idempotency_key=(
+                    f"forge-stage:{REPOSITORY}#{ISSUE_NUMBER}:critic:"
+                    f"{BOUND_SOURCE_DIGEST[:16]}"
+                ),
+            ),
+        ),
+    ],
+)
+def test_root_issue_identity_is_bound_to_source_task_key(
+    snapshot: PipelineSnapshot,
+) -> None:
+    action = decide_next_action(snapshot)
+
+    assert action.kind is ActionKind.GATE_ERROR
+    assert "identity" in action.reason or "stage" in action.reason
+
+
+def test_rework_limit_cannot_be_configured_above_three() -> None:
+    snapshot = reviewer_snapshot(
+        verdict=StageOutcome.REJECT,
+        reflection="AC2 누락",
+        rework_count=3,
+    )
+
+    action = decide_next_action(replace(snapshot, max_reworks=4))
+
+    assert action.kind is ActionKind.GATE_ERROR
+    assert "rework" in action.reason
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        (_check(status="unknown"),),
+        (_check(status="in_progress", conclusion="success"),),
+        (_check(conclusion="mystery"),),
+        (_check(), object()),
+    ],
+)
+def test_malformed_check_evidence_is_gate_error(
+    checks: tuple[object, ...],
+) -> None:
+    snapshot = executor_snapshot()
+    invalid = replace(
+        snapshot,
+        pull_request=replace(snapshot.pull_request, checks=checks),
+    )
+
+    action = decide_next_action(invalid)
+
+    assert action.kind is ActionKind.GATE_ERROR
+    assert "check" in action.reason
 
 
 def test_decision_is_deterministic_for_same_snapshot() -> None:
