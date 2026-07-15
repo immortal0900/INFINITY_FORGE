@@ -3,7 +3,7 @@
 # LLM 층의 능력 점검은 VPS canary(6시간 주기, 정답이 알려진 더미 태스크)가 담당한다.
 # pull_request/push 트리거: PR에 status check를 실제로 생성한다 (2026-07-12 실측:
 # PR #2·#4에 check 0개 — 주간 스케줄만으로는 머지 시점 검증이 없던 구멍의 봉쇄).
-# private/free 플랜이라 required check 강제는 불가(D30) — green 없이 머지 금지는 운영 규약.
+# ruleset required status context: eval (보호 규칙 활성화 뒤 이 job 이름을 바꾸지 않는다).
 name: capability-eval
 
 on:
@@ -27,7 +27,7 @@ jobs:
       - name: 회귀 테스트 (pytest)
         run: |
           pip install --quiet pytest pyyaml
-          pytest tests/ -q
+          python -m pytest tests/ -q
 
       - name: 게이트·운영 스크립트 무결성 (bash 문법)
         run: |

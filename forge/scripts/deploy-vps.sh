@@ -56,13 +56,15 @@ mkdir -p ~/forge/hooks
 [ -f forge/hooks/codex-stop-gate.sh ] && install -m 755 forge/hooks/codex-stop-gate.sh ~/forge/hooks/
 [ -f forge/scripts/flush-outbox.py ] && install -m 755 forge/scripts/flush-outbox.py ~/forge/
 [ -f forge/scripts/nightly-backup.sh ] && install -m 755 forge/scripts/nightly-backup.sh ~/backups/
-for S in ledger-emit.py label-mirror.py canary.sh drift-audit.sh spec-coverage.sh morning-report.sh; do
+for S in ledger-emit.py canary.sh drift-audit.sh spec-coverage.sh morning-report.sh; do
   [ -f "forge/scripts/$S" ] && install -m 755 "forge/scripts/$S" ~/forge/
 done
 
 echo "[deploy] systemd 타이머 설치..."
 UD=~/.config/systemd/user
 mkdir -p "$UD"
+[ -x /usr/bin/flock ] || { echo "[deploy] /usr/bin/flock 누락" >&2; exit 1; }
+PIPELINE_LOCK="/usr/bin/flock --nonblock --conflict-exit-code 0 %t/forge-pipeline.lock"
 mkunit() { # $1=이름 $2=ExecStart $3=OnCalendar/OnUnitActiveSec 지시어 전체
   cat > "$UD/forge-$1.service" << UNIT
 [Unit]
@@ -70,6 +72,8 @@ Description=INFINITY_FORGE $1
 [Service]
 Type=oneshot
 Environment=PATH=/home/ubuntu/.hermes/node/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=$REPO_DIR
+WorkingDirectory=$REPO_DIR
 ExecStart=$2
 UNIT
   cat > "$UD/forge-$1.timer" << UNIT
@@ -77,18 +81,22 @@ UNIT
 Description=INFINITY_FORGE $1 timer
 [Timer]
 $3
+AccuracySec=1s
 Persistent=true
 [Install]
 WantedBy=timers.target
 UNIT
 }
 mkunit ledger  "/usr/bin/python3 /home/ubuntu/forge/ledger-emit.py"   "OnCalendar=*:0/10"
-mkunit mirror  "/usr/bin/python3 /home/ubuntu/forge/label-mirror.py"  "OnCalendar=*:0/2"
+# 같은 oneshot unit은 systemd가 중첩 실행하지 않는다. 두 pipeline unit은 공유
+# runtime lock과 30초 간격을 쓰며 stage의 결정적 idempotency key가 replay를 막는다.
+mkunit stage  "$PIPELINE_LOCK /usr/bin/python3 $REPO_DIR/forge/scripts/stage-reconciler.py" "OnCalendar=*-*-* *:*:00"
+mkunit mirror  "$PIPELINE_LOCK /usr/bin/python3 $REPO_DIR/forge/scripts/label-mirror.py"    "OnCalendar=*-*-* *:*:30"
 mkunit canary  "/bin/bash /home/ubuntu/forge/canary.sh"               "OnCalendar=*-*-* 00/6:00:00 Asia/Seoul"
 mkunit drift   "/bin/bash /home/ubuntu/forge/drift-audit.sh"          "OnCalendar=hourly"
 mkunit morning "/bin/bash /home/ubuntu/forge/morning-report.sh"       "OnCalendar=*-*-* 07:30:00 Asia/Seoul"
 systemctl --user daemon-reload
-for T in ledger mirror canary drift morning; do systemctl --user enable --now "forge-$T.timer" > /dev/null; done
+for T in ledger stage mirror canary drift morning; do systemctl --user enable --now "forge-$T.timer" > /dev/null; done
 
 echo "[deploy] 게이트웨이 스킬 리로드..."
 systemctl --user restart hermes-gateway

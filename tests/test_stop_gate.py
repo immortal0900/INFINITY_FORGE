@@ -7,6 +7,7 @@
 """
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -71,7 +72,7 @@ def make_repo(tmp_path):
 
 def valid_handoff(**overrides):
     h = {
-        "pr_url": None,
+        "pr_url": "https://github.com/example/project/pull/1",
         "changed_files": ["file.txt"],
         "implemented": ["AC1 파일 생성"],
         "not_implemented": [],
@@ -177,6 +178,45 @@ def test_malformed_handoff_blocked(tmp_path):
     r = run_gate(repo)
     assert r.returncode == 2
     assert "TESTS_FAILED" in r.stderr and "parse failed" in r.stderr
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"pr_url": None}, "pr_url"),
+        ({"pr_url": "https://github.com/example/project/issues/1"}, "pr_url"),
+        ({"changed_files": "file.txt"}, "changed_files"),
+        ({"extra": "not allowed"}, "unexpected fields"),
+    ],
+)
+def test_executor_handoff_matches_exact_five_field_contract(
+    tmp_path, overrides, message
+):
+    repo = make_repo(tmp_path)
+    (repo / "file.txt").write_text("work")
+    write_handoff(repo, valid_handoff(**overrides))
+
+    result = run_gate(repo)
+
+    assert result.returncode == 2
+    assert message in result.stderr
+
+
+def test_canary_valid_handoff_matches_stop_gate_contract(tmp_path):
+    script = (REPO / "forge" / "scripts" / "canary.sh").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"HANDOFF_OK='(\{.*\})'", script)
+    assert match is not None
+    handoff = json.loads(match.group(1))
+
+    repo = make_repo(tmp_path)
+    (repo / "file.txt").write_text("work")
+    write_handoff(repo, handoff)
+
+    result = run_gate(repo)
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_empty_implemented_blocked(tmp_path):

@@ -1,7 +1,7 @@
 ---
 name: reviewer-verdict
 description: "reviewer 전용: executor의 핸드오프 델타 표를 diff·테스트와 대조하고 PR을 스펙과 대조해 verdict JSON을 산출한다. 리뷰 태스크를 배정받았을 때 항상 적용."
-version: 0.1.0
+version: 0.2.0
 author: INFINITY_FORGE
 platforms: [linux, macos, windows]
 metadata:
@@ -12,31 +12,77 @@ metadata:
 
 # reviewer-verdict (리뷰 절차)
 
-너는 **새 세션**이다 — executor의 컨텍스트를 물려받지 않았고, 그래서 가치가 있다. 산문 칭찬은 불필요하다. 산출물은 verdict JSON 하나다.
+너는 **새 세션**이다. executor의 대화 컨텍스트를 물려받지 않고 카드 영수증, PR diff, 테스트 파일만 근거로 판단한다. 산문 완료 선언 대신 `kanban_complete` summary에 정확한 reviewer result JSON 하나를 제출한다.
 
 ## 절차 (순서 엄수)
 
-1. **1차 임무 — 델타 대조**: `kanban_show`로 카드와 executor의 핸드오프 3필드를 읽는다. 그 다음 실제 diff(`gh pr diff <PR>` 또는 git diff)와 대조한다:
-   - implemented에 있는 항목이 diff에 실제로 존재하는가?
+1. **영수증과 HEAD 고정**: `kanban_show`로 카드 본문의 canonical JSON 영수증을 읽는다.
+   - `source_digest`, `pr_url`, `bound_head_sha`를 별도로 기록한다.
+   - `gh pr view <pr_url> --json url,headRefOid,state,isDraft`로 PR이 open/non-draft이며 현재 HEAD가 `bound_head_sha`와 같은지 확인한다.
+   - URL 또는 HEAD가 다르거나 영수증 필드가 없으면 품질 반려가 아니라 protocol violation이다. 사유를 남기고 `kanban_block`한다.
+2. **1차 임무 — 조상 델타 대조**: 카드의 `source_task_id`에서 parent chain을 루트 방향으로 따라가 **가장 가까운 executor 또는 executor-rework**의 exact 5-field 핸드오프(`pr_url`, `changed_files`, `implemented`, `not_implemented`, `verified_by`)를 읽고 실제 diff(`gh pr diff <pr_url>` 또는 고정된 HEAD의 git diff)와 대조한다. fresh reviewer의 직접 부모는 critic일 수 있으므로 직접 부모 summary를 executor handoff라고 가정하지 않는다.
+   - implemented 항목이 diff에 실제로 존재하는가?
    - verified_by의 테스트 파일이 실존하고 해당 항목을 실제로 검증하는가?
-   - diff에는 있는데 핸드오프에 없는 변경(미신고 변경)이 있는가?
-   - **not_implemented 누락 탐지**: 카드 AC 항목 중 implemented에도 not_implemented에도 없는 것이 있으면 그 자체가 반려 사유다.
-2. **2차 임무 — 스펙 대조**: PR diff를 카드의 수용 기준(AC)과 항목별로 대조한다.
-3. **verdict JSON 산출** — kanban_complete의 summary에 아래 스키마로만 기입:
-   ```json
-   {
-     "verdict": "approve" | "reject",
-     "delta_check": {
-       "implemented_verified": ["<대조 통과 항목>"],
-       "discrepancies": ["<핸드오프와 실물의 불일치>"]
-     },
-     "spec_check": {"met": ["<충족 AC>"], "unmet": ["<미충족 AC>"]},
-     "reflection": "<reject일 때만: 다음 시도가 읽을 반성문 — 무엇이 왜 틀렸고 어떻게 접근해야 하는지>"
-   }
-   ```
-4. **반려 시**: reflection을 PR 코멘트로도 남긴다(`gh pr comment`). 다음 executor 세션이 이 코멘트를 읽는다.
+   - diff에는 있는데 핸드오프에 없는 변경이 있는가?
+   - 카드 AC 중 implemented와 not_implemented 양쪽에 모두 없는 항목은 반려 사유다.
+   - parent chain에서 가장 가까운 critic 조상(재작업 뒤에도 남은 모든 미해결 critic 조상 포함)의 `added_tests` 경로가 비어 있지 않고 **현재 HEAD에 모두 남아** 있으며 실제 테스트인지 확인한다. Update branch 또는 executor-rework 과정에서 테스트가 사라졌거나 무력화됐으면 reject한다.
+3. **2차 임무 — 스펙 대조**: PR diff를 카드의 수용 기준(AC)과 항목별로 대조한다.
+4. **바인딩 복사**: 카드의 `source_digest`와 `pr_url`을 결과의 같은 이름 필드에 그대로 복사하고, 카드의 `bound_head_sha`를 결과의 `head_sha`로 복사한다. 아래 예시 값을 그대로 쓰지 말고 카드 값을 한 글자도 바꾸지 않는다.
+5. **결과 제출**: summary에는 아래 exact field set 외의 필드를 넣지 않는다. `reject`도 정상적인 품질 판정이므로 `kanban_block`이 아니라 `kanban_complete`로 제출한다.
+
+| verdict | 종료 호출 |
+|---|---|
+| `approve` | `kanban_complete` |
+| `reject` | `kanban_complete` |
+
+`approve` summary 예시:
+
+```json
+{
+  "schema_version": "forge-reviewer-result/v1",
+  "verdict": "approve",
+  "source_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "pr_url": "https://github.com/example/project/pull/1",
+  "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "delta_check": {
+    "implemented_verified": ["AC1 구현과 테스트가 diff에 존재"],
+    "discrepancies": []
+  },
+  "spec_check": {
+    "met": ["AC1"],
+    "unmet": []
+  }
+}
+```
+
+`reject` summary 예시:
+
+```json
+{
+  "schema_version": "forge-reviewer-result/v1",
+  "verdict": "reject",
+  "source_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "pr_url": "https://github.com/example/project/pull/1",
+  "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "delta_check": {
+    "implemented_verified": [],
+    "discrepancies": ["AC2 테스트가 handoff에는 있으나 diff에 없음"]
+  },
+  "spec_check": {
+    "met": ["AC1"],
+    "unmet": ["AC2"]
+  },
+  "reflection": "AC2 회귀 테스트를 먼저 추가하고 실패를 확인한 뒤 구현을 보완해야 한다."
+}
+```
+
+6. **반려 기록**: reject의 `reflection`은 비어 있지 않아야 하며 PR 코멘트로도 남긴다(`gh pr comment <pr_url> --body <reflection>`). 다음 executor-rework 카드가 같은 reflection을 전달받는다.
+
+Hermes blocked는 인프라 장애나 protocol violation에만 사용한다. 스펙 미충족, 미신고 변경, 테스트 누락은 `reject` 완료 결과다.
 
 ## 금지
-- 결정론 검사(테스트 실행 결과)를 재현하려 들지 마라 — 그건 CI와 게이트의 몫. 너는 대조와 판단만.
-- 카드 본문(AC) 수정 금지. verdict 없이 종료 금지(exit 0 = protocol_violation).
-- "대체로 좋음" 같은 모호 판정 금지 — approve 아니면 reject.
+
+- 카드 영수증과 다른 `source_digest`, `pr_url`, `head_sha` 제출.
+- summary에 schema 밖 필드나 JSON 앞뒤 산문 추가.
+- 카드 본문 또는 AC 수정, verdict 없이 단순 exit 0.
+- "대체로 좋음" 같은 모호 판정. approve 아니면 reject다.
