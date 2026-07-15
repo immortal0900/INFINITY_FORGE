@@ -8,6 +8,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Sequence
 
+import pytest
+
 from forge.ops.contracts import (
     CheckRun,
     PipelineStage,
@@ -106,6 +108,7 @@ class _Create:
                 task_id="child",
                 title=call[2],
                 status="todo",
+                body=call[call.index("--body") + 1],
                 parent_id=parent,
                 idempotency_key=key,
             )
@@ -163,12 +166,29 @@ def test_same_executor_receipt_creates_reviewer_only_once() -> None:
 
 def test_reviewer_binding_digest_is_separate_from_current_run_digest() -> None:
     cli = _load_cli()
+    root_run = RunRecord(
+        run_id=12,
+        task_id="root",
+        status="completed",
+        outcome="success",
+        summary=_executor_summary(),
+        metadata={"worker_session_id": "executor-session"},
+    )
+    bound_digest = transition_digest(
+        task_id="root",
+        run_id=12,
+        stage=PipelineStage.EXECUTOR,
+        summary=root_run.summary,
+        metadata=root_run.metadata,
+        pr_url=PR_URL,
+        head_sha=HEAD_SHA,
+    )
     body = json.dumps(
         {
             "bound_head_sha": HEAD_SHA,
             "pr_url": PR_URL,
             "reflection": None,
-            "source_digest": BOUND_DIGEST,
+            "source_digest": bound_digest,
             "source_run_id": 12,
             "source_task_id": "root",
         },
@@ -183,13 +203,13 @@ def test_reviewer_binding_digest_is_separate_from_current_run_digest() -> None:
         parent_id="root",
         idempotency_key=(
             f"forge-stage:{REPOSITORY}#{ISSUE_NUMBER}:reviewer:"
-            f"{BOUND_DIGEST[:16]}"
+            f"{bound_digest[:16]}"
         ),
     )
     summary = {
         "schema_version": "forge-reviewer-result/v1",
         "verdict": "approve",
-        "source_digest": BOUND_DIGEST,
+        "source_digest": bound_digest,
         "pr_url": PR_URL,
         "head_sha": HEAD_SHA,
         "delta_check": {"implemented_verified": ["AC1"], "discrepancies": []},
@@ -209,7 +229,7 @@ def test_reviewer_binding_digest_is_separate_from_current_run_digest() -> None:
         status="done",
         idempotency_key=f"github-issue:{REPOSITORY}#{ISSUE_NUMBER}",
     )
-    store = _Store([root, task], {"reviewer": run})
+    store = _Store([root, task], {"root": root_run, "reviewer": run})
     create = _Create(store)
 
     report = cli.reconcile_once(
@@ -234,7 +254,7 @@ def test_reviewer_binding_digest_is_separate_from_current_run_digest() -> None:
     assert key.endswith(f":critic:{current_digest[:16]}")
     card_payload = json.loads(call[call.index("--body") + 1].splitlines()[1])
     assert card_payload["source_digest"] == current_digest
-    assert card_payload["source_digest"] != BOUND_DIGEST
+    assert card_payload["source_digest"] != bound_digest
 
 
 def test_executor_rework_is_bound_to_its_parent_receipt() -> None:
@@ -245,7 +265,23 @@ def test_executor_rework_is_bound_to_its_parent_receipt() -> None:
         status="done",
         idempotency_key=f"github-issue:{REPOSITORY}#{ISSUE_NUMBER}",
     )
-    reviewer_digest = "c" * 64
+    root_run = RunRecord(
+        run_id=12,
+        task_id="root",
+        status="completed",
+        outcome="success",
+        summary=_executor_summary(),
+        metadata={"worker_session_id": "executor-session"},
+    )
+    reviewer_digest = transition_digest(
+        task_id="root",
+        run_id=12,
+        stage=PipelineStage.EXECUTOR,
+        summary=root_run.summary,
+        metadata=root_run.metadata,
+        pr_url=PR_URL,
+        head_sha=HEAD_SHA,
+    )
     reviewer = TaskRecord(
         task_id="reviewer",
         title="reviewer",
@@ -257,12 +293,45 @@ def test_executor_rework_is_bound_to_its_parent_receipt() -> None:
             f"{reviewer_digest[:16]}"
         ),
     )
-    rework_digest = "d" * 64
+    reviewer_summary = {
+        "schema_version": "forge-reviewer-result/v1",
+        "verdict": "reject",
+        "source_digest": reviewer_digest,
+        "pr_url": PR_URL,
+        "head_sha": HEAD_SHA,
+        "delta_check": {
+            "implemented_verified": [],
+            "discrepancies": ["AC1"],
+        },
+        "spec_check": {"met": [], "unmet": ["AC1"]},
+        "reflection": "AC1 is incomplete",
+    }
+    reviewer_run = RunRecord(
+        run_id=13,
+        task_id="reviewer",
+        status="completed",
+        outcome="success",
+        summary=reviewer_summary,
+        metadata={"worker_session_id": "reviewer-session"},
+    )
+    rework_digest = transition_digest(
+        task_id="reviewer",
+        run_id=13,
+        stage=PipelineStage.REVIEWER,
+        summary=reviewer_run.summary,
+        metadata=reviewer_run.metadata,
+        pr_url=PR_URL,
+        head_sha=HEAD_SHA,
+    )
     rework = TaskRecord(
         task_id="rework",
         title="rework",
         status="done",
-        body=_receipt_body(source_task_id="reviewer", source_digest=rework_digest),
+        body=_receipt_body(
+            source_task_id="reviewer",
+            source_digest=rework_digest,
+            source_run_id=13,
+        ),
         parent_id="reviewer",
         idempotency_key=(
             f"forge-stage:{REPOSITORY}#{ISSUE_NUMBER}:executor-rework:"
@@ -277,7 +346,10 @@ def test_executor_rework_is_bound_to_its_parent_receipt() -> None:
         summary=_executor_summary(),
         metadata={"worker_session_id": "rework-session"},
     )
-    store = _Store([root, reviewer, rework], {"rework": run})
+    store = _Store(
+        [root, reviewer, rework],
+        {"root": root_run, "reviewer": reviewer_run, "rework": run},
+    )
 
     report = cli.reconcile_once(
         store,
@@ -367,13 +439,15 @@ def test_malformed_external_evidence_returns_exit_two_json_report(capsys) -> Non
     assert output.err == ""
 
 
-def _receipt_body(*, source_task_id: str, source_digest: str) -> str:
+def _receipt_body(
+    *, source_task_id: str, source_digest: str, source_run_id: int = 12
+) -> str:
     payload = {
         "bound_head_sha": HEAD_SHA,
         "pr_url": PR_URL,
         "reflection": None,
         "source_digest": source_digest,
-        "source_run_id": 12,
+        "source_run_id": source_run_id,
         "source_task_id": source_task_id,
     }
     return f"```json\n{json.dumps(payload, sort_keys=True, separators=(',', ':'))}\n```"
@@ -456,3 +530,118 @@ def test_pipeline_graph_rejects_disconnected_stage_cycle() -> None:
 
     assert report.ok is False
     assert "cycle" in report.errors[0]
+
+
+def test_cross_repository_child_cannot_resurrect_filtered_root() -> None:
+    cli = _load_cli()
+    root = TaskRecord(
+        task_id="root",
+        title="root",
+        status="todo",
+        idempotency_key=f"github-issue:{REPOSITORY}#{ISSUE_NUMBER}",
+    )
+    digest = "e" * 64
+    foreign = TaskRecord(
+        task_id="foreign-reviewer",
+        title="foreign reviewer",
+        status="todo",
+        body=_receipt_body(source_task_id="root", source_digest=digest),
+        parent_id="root",
+        idempotency_key=f"forge-stage:other/repo#9:reviewer:{digest[:16]}",
+    )
+    store = _Store([root, foreign], {})
+
+    report = cli.reconcile_once(
+        store,
+        _UnexpectedGitHub(),
+        _Create(store),
+        cli.ReconcileConfig(repository=REPOSITORY),
+    )
+
+    assert report.ok is False
+    assert "crosses pipeline identity" in report.errors[0]
+
+
+def test_legacy_child_blocks_canonical_parent_reconciliation() -> None:
+    cli = _load_cli()
+    root = TaskRecord(
+        task_id="root",
+        title="root",
+        status="todo",
+        idempotency_key=f"github-issue:{REPOSITORY}#{ISSUE_NUMBER}",
+    )
+    store = _Store([root], {})
+    store.topology_blocked_parent_ids = frozenset({"root"})
+
+    report = cli.reconcile_once(
+        store,
+        _UnexpectedGitHub(),
+        _Create(store),
+        cli.ReconcileConfig(repository=REPOSITORY),
+    )
+
+    assert report.ok is False
+    assert "ignored legacy child" in report.errors[0]
+
+
+@pytest.mark.parametrize("mismatch", ["run_id", "digest"])
+def test_stage_receipt_must_match_parent_completed_run(mismatch: str) -> None:
+    cli = _load_cli()
+    root = TaskRecord(
+        task_id="root",
+        title="root",
+        status="done",
+        idempotency_key=f"github-issue:{REPOSITORY}#{ISSUE_NUMBER}",
+    )
+    parent_run = RunRecord(
+        run_id=12,
+        task_id="root",
+        status="completed",
+        outcome="success",
+        summary=_executor_summary(),
+        metadata={"worker_session_id": "executor-session"},
+    )
+    expected_digest = transition_digest(
+        task_id="root",
+        run_id=12,
+        stage=PipelineStage.EXECUTOR,
+        summary=parent_run.summary,
+        metadata=parent_run.metadata,
+        pr_url=PR_URL,
+        head_sha=HEAD_SHA,
+    )
+    receipt_digest = "f" * 64 if mismatch == "digest" else expected_digest
+    payload = {
+        "bound_head_sha": HEAD_SHA,
+        "pr_url": PR_URL,
+        "reflection": None,
+        "source_digest": receipt_digest,
+        "source_run_id": 99 if mismatch == "run_id" else 12,
+        "source_task_id": "root",
+    }
+    reviewer = TaskRecord(
+        task_id="reviewer",
+        title="reviewer",
+        status="todo",
+        body=(
+            "```json\n"
+            f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}\n"
+            "```"
+        ),
+        parent_id="root",
+        idempotency_key=(
+            f"forge-stage:{REPOSITORY}#{ISSUE_NUMBER}:reviewer:"
+            f"{receipt_digest[:16]}"
+        ),
+    )
+    store = _Store([root, reviewer], {"root": parent_run})
+
+    report = cli.reconcile_once(
+        store,
+        _UnexpectedGitHub(),
+        _Create(store),
+        cli.ReconcileConfig(repository=REPOSITORY),
+    )
+
+    assert report.ok is False
+    assert "parent run receipt" in report.errors[0]

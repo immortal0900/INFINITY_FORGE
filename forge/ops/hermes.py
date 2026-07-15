@@ -21,9 +21,12 @@ class GateError(RuntimeError):
 _ROOT_KEY_RE = re.compile(
     r"^github-issue:[^/#:\s]+/[^/#:\s]+#[1-9][0-9]*$"
 )
-_LEGACY_STAGE_KEY_RE = re.compile(
-    r"^github-issue:[^/#:\s]+/[^/#:\s]+#[1-9][0-9]*-"
-    r"(?:exec|review|critic)$"
+_LEGACY_STAGE_KEYS = frozenset(
+    {
+        "github-issue:immortal0900/INFINITY_FORGE#3-exec",
+        "github-issue:immortal0900/INFINITY_FORGE#3-review",
+        "github-issue:immortal0900/INFINITY_FORGE#3-critic",
+    }
 )
 _STAGE_KEY_RE = re.compile(
     r"^forge-stage:[^/#:\s]+/[^/#:\s]+#[1-9][0-9]*:"
@@ -55,6 +58,7 @@ class HermesStore:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = Path(db_path).expanduser().resolve()
         self.ignored_legacy_count = 0
+        self.topology_blocked_parent_ids: frozenset[str] = frozenset()
 
     def _connect(self) -> sqlite3.Connection:
         uri = f"{self._db_path.as_uri()}?mode=ro"
@@ -64,6 +68,7 @@ class HermesStore:
 
     def list_pipeline_tasks(self) -> Sequence[TaskRecord]:
         self.ignored_legacy_count = 0
+        self.topology_blocked_parent_ids = frozenset()
         try:
             with closing(self._connect()) as connection:
                 rows = connection.execute(
@@ -89,11 +94,16 @@ class HermesStore:
         keys: dict[str, str] = {}
         parents: dict[str, set[str]] = {}
         ignored_legacy_ids: set[str] = set()
+        topology_blocked_parent_ids: set[str] = set()
         for row in rows:
             task_id = _require_text(row["id"], "task id")
             key = _require_text(row["idempotency_key"], "idempotency key")
-            if _LEGACY_STAGE_KEY_RE.fullmatch(key) is not None:
+            if key in _LEGACY_STAGE_KEYS:
                 ignored_legacy_ids.add(task_id)
+                if row["parent_id"] is not None:
+                    topology_blocked_parent_ids.add(
+                        _require_text(row["parent_id"], "legacy parent id")
+                    )
                 continue
             if (
                 _ROOT_KEY_RE.fullmatch(key) is None
@@ -123,6 +133,9 @@ class HermesStore:
                 )
 
         self.ignored_legacy_count = len(ignored_legacy_ids)
+        self.topology_blocked_parent_ids = frozenset(
+            topology_blocked_parent_ids
+        )
         result: list[TaskRecord] = []
         for task_id in sorted(records):
             task_parents = parents.get(task_id, set())

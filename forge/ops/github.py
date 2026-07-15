@@ -125,6 +125,15 @@ class GitHubClient:
         raw_checks = check_payload.get("check_runs")
         if not isinstance(raw_checks, list):
             raise GateError("GitHub check-runs must be an array")
+        total_count = check_payload.get("total_count")
+        if (
+            not isinstance(total_count, int)
+            or isinstance(total_count, bool)
+            or total_count != len(raw_checks)
+        ):
+            raise GateError(
+                "GitHub check-runs total_count does not match the complete payload"
+            )
 
         checks: list[CheckRun] = []
         for required_name in required_names:

@@ -136,7 +136,9 @@ def test_store_rejects_duplicate_pipeline_idempotency_key(tmp_path: Path) -> Non
         HermesStore(db_path).list_pipeline_tasks()
 
 
-def test_store_ignores_only_known_spec_002_legacy_stage_keys(tmp_path: Path) -> None:
+def test_store_ignores_only_exact_live_spec_002_legacy_stage_keys(
+    tmp_path: Path,
+) -> None:
     db_path = tmp_path / "kanban.db"
     connection = _create_live_schema(db_path)
     _insert_task(
@@ -148,7 +150,10 @@ def test_store_ignores_only_known_spec_002_legacy_stage_keys(tmp_path: Path) -> 
         _insert_task(
             connection,
             task_id=f"legacy-{suffix}",
-            key=f"github-issue:owner/repo#8-{suffix}",
+            key=(
+                "github-issue:immortal0900/INFINITY_FORGE#3-"
+                f"{suffix}"
+            ),
         )
     connection.commit()
     connection.close()
@@ -158,6 +163,34 @@ def test_store_ignores_only_known_spec_002_legacy_stage_keys(tmp_path: Path) -> 
 
     assert [task.task_id for task in tasks] == ["root"]
     assert store.ignored_legacy_count == 3
+
+
+def test_store_preserves_canonical_parent_blocked_by_legacy_child(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    connection = _create_live_schema(db_path)
+    _insert_task(
+        connection,
+        task_id="root",
+        key="github-issue:immortal0900/INFINITY_FORGE#1",
+    )
+    _insert_task(
+        connection,
+        task_id="legacy",
+        key="github-issue:immortal0900/INFINITY_FORGE#3-review",
+    )
+    connection.execute(
+        "INSERT INTO task_links (parent_id, child_id) VALUES ('root', 'legacy')"
+    )
+    connection.commit()
+    connection.close()
+
+    store = HermesStore(db_path)
+    tasks = store.list_pipeline_tasks()
+
+    assert [task.task_id for task in tasks] == ["root"]
+    assert store.topology_blocked_parent_ids == frozenset({"root"})
 
 
 def test_store_rejects_unknown_malformed_pipeline_key(tmp_path: Path) -> None:
@@ -273,10 +306,19 @@ def test_stage_create_argv_uses_explicit_repository_workspace() -> None:
     assert argv[argv.index("--workspace") + 1] == "dir:/home/user/work/repo"
 
 
+_AUTO_TOTAL = object()
+
+
 class _GitHubRunner:
-    def __init__(self, *, checks: list[dict[str, object]]) -> None:
+    def __init__(
+        self,
+        *,
+        checks: list[dict[str, object]],
+        total_count: object = _AUTO_TOTAL,
+    ) -> None:
         self.calls: list[tuple[str, ...]] = []
         self._checks = checks
+        self._total_count = total_count
 
     def __call__(
         self,
@@ -294,7 +336,14 @@ class _GitHubRunner:
                 "head": {"sha": HEAD_SHA},
             }
         else:
-            payload = {"check_runs": self._checks}
+            payload = {
+                "check_runs": self._checks,
+                "total_count": (
+                    len(self._checks)
+                    if self._total_count is _AUTO_TOTAL
+                    else self._total_count
+                ),
+            }
         return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
 
 
@@ -340,3 +389,13 @@ def test_github_preserves_pending_check_as_not_successful(status: str) -> None:
 
     assert snapshot.checks[0].status == status
     assert snapshot.checks[0].conclusion is None
+
+
+@pytest.mark.parametrize("total_count", [True, "1", 2])
+def test_github_rejects_invalid_or_truncated_check_count(
+    total_count: object,
+) -> None:
+    runner = _GitHubRunner(checks=[_api_check()], total_count=total_count)
+
+    with pytest.raises(GateError, match="total_count"):
+        GitHubClient("gh", runner=runner).get_pr_snapshot(PR_URL, ("eval",))

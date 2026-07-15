@@ -57,6 +57,9 @@ _DEFAULT_WORKSPACE = f"dir:{Path('~/work/INFINITY_FORGE').expanduser()}"
 
 
 class PipelineStore(Protocol):
+    ignored_legacy_count: int
+    topology_blocked_parent_ids: frozenset[str]
+
     def list_pipeline_tasks(self) -> Sequence[TaskRecord]: ...
 
     def latest_completed_run(self, task_id: str) -> RunRecord: ...
@@ -233,10 +236,16 @@ def _error(report: ReconcileReport, task_id: str, reason: str) -> None:
 def _validate_pipeline_graph(
     tasks: Sequence[TaskRecord],
     identities: dict[str, PipelineIdentity],
+    topology_blocked_parent_ids: frozenset[str],
 ) -> None:
     task_by_id = {task.task_id: task for task in tasks}
     if len(task_by_id) != len(tasks):
         raise GateError("duplicate pipeline task id")
+    blocked = sorted(topology_blocked_parent_ids.intersection(task_by_id))
+    if blocked:
+        raise GateError(
+            f"canonical parent {blocked[0]} has an ignored legacy child"
+        )
     roots: dict[tuple[str, int], int] = {}
     allowed_children = {
         PipelineStage.EXECUTOR: {PipelineStage.REVIEWER},
@@ -295,6 +304,69 @@ def _validate_pipeline_graph(
             cursor = task_by_id[cursor.parent_id]
         if identities[cursor.task_id].stage is not PipelineStage.EXECUTOR:
             raise GateError(f"stage task {task.task_id} is disconnected from its root")
+    parent_ids = {task.parent_id for task in tasks if task.parent_id is not None}
+    leaves_by_pipeline: dict[tuple[str, int], int] = {}
+    for task in tasks:
+        if task.task_id in parent_ids:
+            continue
+        identity = identities[task.task_id]
+        pipeline = (identity.repository, identity.issue_number)
+        leaves_by_pipeline[pipeline] = leaves_by_pipeline.get(pipeline, 0) + 1
+    ambiguous = [pipeline for pipeline, count in leaves_by_pipeline.items() if count != 1]
+    if ambiguous:
+        repository, issue = sorted(ambiguous)[0]
+        raise GateError(f"multiple leaves for {repository}#{issue}")
+
+
+def _validate_stage_receipts(
+    tasks: Sequence[TaskRecord],
+    identities: dict[str, PipelineIdentity],
+    store: PipelineStore,
+) -> None:
+    task_by_id = {task.task_id: task for task in tasks}
+    parent_runs: dict[str, RunRecord] = {}
+    for task in tasks:
+        identity = identities[task.task_id]
+        if identity.stage is PipelineStage.EXECUTOR:
+            continue
+        receipt = _parse_card_receipt(task)
+        parent_id = task.parent_id
+        if parent_id is None:
+            raise GateError(f"stage task {task.task_id} has no pipeline parent")
+        parent = task_by_id[parent_id]
+        if parent.status != "done":
+            raise GateError(
+                f"stage task {task.task_id} parent is not completed"
+            )
+        if parent_id not in parent_runs:
+            parent_runs[parent_id] = store.latest_completed_run(parent_id)
+        parent_run = parent_runs[parent_id]
+        if (
+            parent_run.task_id != parent_id
+            or parent_run.status != "completed"
+            or parent_run.outcome != "success"
+        ):
+            raise GateError(
+                f"stage task {task.task_id} parent run is not completed with success"
+            )
+        if receipt["source_run_id"] != parent_run.run_id:
+            raise GateError(
+                f"stage task {task.task_id} parent run receipt id does not match"
+            )
+        parent_identity = identities[parent_id]
+        expected_digest = transition_digest(
+            task_id=parent_id,
+            run_id=parent_run.run_id,
+            stage=parent_identity.stage,
+            summary=parent_run.summary,
+            metadata=parent_run.metadata,
+            pr_url=str(receipt["pr_url"]),
+            head_sha=str(receipt["bound_head_sha"]),
+        )
+        if receipt["source_digest"] != expected_digest:
+            raise GateError(
+                f"stage task {task.task_id} parent run receipt digest does not match"
+            )
 
 
 def reconcile_once(
@@ -310,14 +382,22 @@ def reconcile_once(
         all_tasks = tuple(store.list_pipeline_tasks())
         report.ignored_legacy = int(getattr(store, "ignored_legacy_count", 0))
         parsed = {task.task_id: _parse_identity(task) for task in all_tasks}
+        raw_blockers = getattr(store, "topology_blocked_parent_ids", frozenset())
+        if not isinstance(raw_blockers, (set, frozenset)) or any(
+            not isinstance(task_id, str) or not task_id.strip()
+            for task_id in raw_blockers
+        ):
+            raise GateError("legacy topology blockers are malformed")
+        topology_blockers = frozenset(raw_blockers)
+        _validate_pipeline_graph(all_tasks, parsed, topology_blockers)
+        _validate_stage_receipts(all_tasks, parsed, store)
         tasks = tuple(
             task
             for task in all_tasks
             if parsed[task.task_id].repository == config.repository
         )
         identities = {task.task_id: parsed[task.task_id] for task in tasks}
-        _validate_pipeline_graph(tasks, identities)
-    except (GateError, ContractError, ValueError) as error:
+    except (GateError, ContractError, ValueError, KeyError) as error:
         _error(report, "pipeline", str(error))
         return report
 
