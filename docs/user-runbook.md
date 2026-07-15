@@ -36,7 +36,7 @@
 | P3 전면 자동 머지 | **설계만 있음** | 자동 머지 호출 코드가 없음 |
 | `forge:automerge-ok` 태스크 예외 | **미구현** | 현재 GitHub 라벨 목록과 실행 코드에 없음 |
 | `forge:adr` 자동 왕복 | **부분 구현** | 라벨 정의는 있으나 결정 후 카드를 자동 재개하는 연결 코드 없음 |
-| GitHub main 보호 | **이번 작업에서 적용** | `protect-main`: PR 필수, approvals 0, strict `eval`, bypass 없음; 실제 ID는 13장에 기록 |
+| GitHub main 보호 | **적용 완료** | `protect-main` ruleset ID `18974841`: PR 필수, approvals 0, strict `eval`, bypass 없음 |
 
 여기서 중요한 구분은 다음과 같다.
 
@@ -742,13 +742,16 @@ main이 자주 전진할 때 선택지는 세 가지다.
 
 approvals가 0인 이유는 현재 워커와 사람이 같은 GitHub 계정을 써서 PR 작성자가 자기 PR에 공식 Approve를 남길 수 없기 때문이다. 별도 reviewer 계정이 생기면 1 이상으로 강화한다. strict를 켜도 12장 시나리오 K처럼 갱신된 HEAD를 자동으로 fresh reviewer→critic에 되돌리므로 검증 고착이 생기지 않는다.
 
+2026-07-15 실제 적용 결과는 ruleset ID `18974841`, enforcement `active`, `current_user_can_bypass=never`다. effective `main` rules API에서도 deletion, non-fast-forward, pull-request, strict required-status-check 네 규칙이 같은 ID로 확인됐다. CI run을 재실행한 검증에서는 `eval=queued`일 때 PR #6이 `BLOCKED`, success 뒤 다시 `MERGEABLE`이 됐다.
+
 CLI로 적용 결과를 읽을 때는 다음 명령을 쓴다.
 
 ```powershell
 gh api repos/immortal0900/INFINITY_FORGE/rulesets `
   --jq '.[] | {id,name,enforcement,target}'
 
-gh api repos/immortal0900/INFINITY_FORGE/rulesets/<RULESET_ID>
+$rulesetId = 18974841
+gh api "repos/immortal0900/INFINITY_FORGE/rulesets/$rulesetId"
 ```
 
 이 ruleset은 PR 경유·최신 main·`eval` 성공만 강제한다. **원본 이슈의 `forge:mergeable`은 사람이 별도로 확인해야 한다.** `--admin`이나 새 bypass actor로 우회하지 않는다.
@@ -773,7 +776,7 @@ ssh ubuntu@51.222.27.48 'cd "$HOME/work/INFINITY_FORGE" && PYTHONPATH="$PWD" pyt
 
 ## 14. 현재 환경 점검표
 
-다음 표는 2026-07-14 실측이며 시간이 지나면 바뀔 수 있다.
+다음 표는 2026-07-15 실측이며 시간이 지나면 바뀔 수 있다.
 
 | 항목 | 실측 상태 | 의미 |
 |---|---|---|
@@ -782,11 +785,11 @@ ssh ubuntu@51.222.27.48 'cd "$HOME/work/INFINITY_FORGE" && PYTHONPATH="$PWD" pyt
 | VPS Forge 타이머 | mirror·flush·ledger·drift·canary·morning·backup 가동 | 자동 감시·동기화·백업 실행 중 |
 | VPS Kanban | active 0, done 5 | 현재 실행 중 작업 없음 |
 | Windows Codex | ChatGPT 로그인 | 로컬 Codex 사용 가능 |
-| Windows GitHub CLI | 미로그인 | 3.2절 로그인 필요 |
+| Windows GitHub CLI | `immortal0900` 로그인 | 로컬에서 PR·ruleset 조회와 push 가능 |
 | Windows local-sync | 실행 중 | 로컬 상태 공유·백업 루프 실행 중 |
 | Windows local Gateway | 프로세스 미검출 | `#forge-local` 사용 전 `hermes gateway start` 필요 |
-| GitHub 저장소 | public, main 보호 없음, ruleset 없음 | red check 머지를 플랫폼이 막지 않음 |
-| 열린 PR | 0개 | 현재 검토 대상 없음 |
+| GitHub 저장소 | public, `protect-main` active, ID `18974841` | PR·strict `eval`·force-push/deletion 차단, bypass 없음 |
+| 열린 PR | PR #6 | `eval` green, P1 사람 승인·병합 대기 |
 | MEMEX MCP | Gateway 재연결 실패 경고 | 지식 배달 지연, 코드 작업은 계속 가능 |
 
 ## 15. 매일 사용하는 최소 체크리스트

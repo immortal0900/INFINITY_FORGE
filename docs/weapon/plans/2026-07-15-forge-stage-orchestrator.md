@@ -378,11 +378,11 @@ git diff --check
 
 Ruleset 적용 전 `eval`이 실제 PR HEAD에 생성되는지 확인한다. 사용자 소유 미커밋 파일은 staging scope에서 제외한다.
 
-- [ ] **Step 3: active ruleset 생성**
+- [x] **Step 3: active ruleset 생성**
 
 GitHub REST/UI desired state는 `protect-main`, `~DEFAULT_BRANCH`, bypass 없음, pull_request approvals 0, required status `eval` source GitHub Actions, strict true, deletion/non-fast-forward 차단이다. 생성 뒤 REST API로 exact read-back한다.
 
-- [ ] **Step 4: ruleset 차단 검증**
+- [x] **Step 4: ruleset 차단 검증**
 
 PR의 `eval`이 pending/red이면 mergeability가 blocked이고 success이면 CI 조건이 충족되는지 확인한다. 실제 merge는 P1 사람 승인 전 수행하지 않는다.
 
@@ -427,3 +427,4 @@ for f in forge/scripts/*.sh forge/hooks/*.sh; do bash -n "$f"; done
 
 - 2026-07-15 | 최초 계획 | 변경: stage contract, reconciler, adapter, label projection, worker 계약, ruleset, VPS E2E를 6개 검증 단위로 분해 | 검증: placeholder scan 0건, task별 파일·interface·검증 명령 자체 대조
 - 2026-07-15 | Task 1~5B 실행 | 변경: stage pipeline, strict HEAD 재검증, CI 실패 same-PR rework와 운영 문서를 구현 | 검증: 전체 `244 passed, 2 skipped`, 독립 리뷰 PASS; Task 6은 PR·ruleset·P1 merge 후 배포 순서로 계속
+- 2026-07-15 | Task 6 P1 대기 지점 | 변경: PR #6 생성, `protect-main` ruleset ID `18974841` active 적용 | 검증: bypass 없음, strict GitHub Actions `eval` app ID `15368`; queued에서 PR BLOCKED, success에서 MERGEABLE read-back; 사람 merge 전 production 배포는 보류

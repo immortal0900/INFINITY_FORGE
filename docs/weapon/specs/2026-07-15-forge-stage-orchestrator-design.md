@@ -167,6 +167,8 @@ CRITIC          → REVIEWER | EXECUTOR_REWORK
 - force push 차단
 - branch deletion 차단
 
+적용 실측(2026-07-15): ruleset ID `18974841`, enforcement active, bypass `[]`, current user bypass `never`, required `eval` source GitHub Actions app ID `15368`.
+
 단일 GitHub 계정 환경이므로 approval 1개는 요구하지 않는다. 독립 collaborator 또는 GitHub App reviewer가 준비된 뒤 별도 변경으로 강화한다.
 
 > RISK(security): bypass actor를 추가하거나 required check source를 `any source`로 완화하면 red CI 차단을 우회할 수 있다. 기본 설정은 bypass 없음과 GitHub Actions source 고정이다. ruleset은 원본 이슈의 `forge:mergeable` 라벨을 강제하지 못하므로 P1 사람이 별도로 확인한다.
