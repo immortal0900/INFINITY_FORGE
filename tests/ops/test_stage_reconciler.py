@@ -133,6 +133,7 @@ def executor_snapshot(
             if stage is PipelineStage.EXECUTOR_REWORK
             else None
         ),
+        bound_pr_url=(PR_URL if stage is PipelineStage.EXECUTOR_REWORK else None),
         rework_count=1 if stage is PipelineStage.EXECUTOR_REWORK else 0,
     )
 
@@ -303,6 +304,24 @@ def test_executor_result_pr_must_match_live_pr() -> None:
 
     assert action.kind is ActionKind.GATE_ERROR
     assert "PR" in action.reason
+
+
+def test_rework_result_cannot_switch_to_another_pr_in_same_repository() -> None:
+    snapshot = executor_snapshot(stage=PipelineStage.EXECUTOR_REWORK)
+    switched = replace(
+        snapshot,
+        result=replace(snapshot.result, pr_url=OTHER_PR_URL),
+        pull_request=replace(
+            snapshot.pull_request,
+            pr_url=OTHER_PR_URL,
+            pr_number=18,
+        ),
+    )
+
+    action = decide_next_action(switched)
+
+    assert action.kind is ActionKind.GATE_ERROR
+    assert "bound PR" in action.reason
 
 
 def test_reviewer_approve_creates_critic() -> None:

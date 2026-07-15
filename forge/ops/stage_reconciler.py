@@ -269,6 +269,11 @@ def _validate_result_binding(snapshot: PipelineSnapshot) -> StageAction | None:
                 result,
                 expected_repository=pr.repository,
             )
+            if snapshot.stage is PipelineStage.EXECUTOR_REWORK:
+                if not isinstance(snapshot.bound_pr_url, str):
+                    return _gate_error("rework stage is missing its bound PR")
+                if result.pr_url != snapshot.bound_pr_url:
+                    return _gate_error("rework result does not match its bound PR")
             return None
 
         if (
