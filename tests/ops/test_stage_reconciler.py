@@ -128,6 +128,11 @@ def executor_snapshot(
             is_open=is_open,
             is_draft=is_draft,
         ),
+        bound_source_digest=(
+            BOUND_SOURCE_DIGEST
+            if stage is PipelineStage.EXECUTOR_REWORK
+            else None
+        ),
         rework_count=1 if stage is PipelineStage.EXECUTOR_REWORK else 0,
     )
 
@@ -483,6 +488,20 @@ def test_source_must_be_a_successfully_completed_run(
                     f"{BOUND_SOURCE_DIGEST[:16]}"
                 ),
             ),
+        ),
+        replace(
+            reviewer_snapshot(),
+            source_task=replace(
+                reviewer_snapshot().source_task,
+                idempotency_key=(
+                    f"forge-stage:{REPOSITORY}#{ISSUE_NUMBER}:reviewer:"
+                    f"{'e' * 16}"
+                ),
+            ),
+        ),
+        replace(
+            executor_snapshot(stage=PipelineStage.EXECUTOR_REWORK),
+            bound_source_digest="e" * 64,
         ),
     ],
 )

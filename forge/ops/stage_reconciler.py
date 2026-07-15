@@ -208,6 +208,14 @@ def _validate_source_identity(snapshot: PipelineSnapshot) -> StageAction | None:
             return _gate_error("stage source identity key is malformed")
         if match.group("stage") != snapshot.stage.value:
             return _gate_error("source identity stage does not match snapshot stage")
+        if (
+            not isinstance(snapshot.bound_source_digest, str)
+            or _SHA256_RE.fullmatch(snapshot.bound_source_digest) is None
+            or match.group("digest") != snapshot.bound_source_digest[:16]
+        ):
+            return _gate_error(
+                "source identity receipt does not match the bound source digest"
+            )
     if (
         match.group("repository") != snapshot.pull_request.repository
         or int(match.group("issue")) != snapshot.issue_number
