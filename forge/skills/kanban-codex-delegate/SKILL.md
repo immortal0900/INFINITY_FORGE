@@ -1,7 +1,7 @@
 ---
 name: kanban-codex-delegate
 description: "executor 전용: kanban 카드를 받으면 tmux로 codex exec를 스폰해 실제 구현을 위임하고, 하트비트를 유지하며, 핸드오프 3필드(implemented/not_implemented/verified_by)로만 종료한다. kanban 태스크를 배정받았을 때 항상 적용."
-version: 0.1.0
+version: 0.2.0
 author: INFINITY_FORGE
 platforms: [linux]
 metadata:
@@ -18,7 +18,10 @@ metadata:
 
 1. **카드 파악**: `kanban_show`로 카드 본문·수용 기준(AC)·이전 시도(runs)·코멘트(반성문 포함)를 전부 읽는다.
    - 이전 시도가 있으면: 실패 원인과 반성문을 codex 프롬프트에 반드시 포함한다.
+   - 카드 idempotency key의 단계가 `executor-rework`이면 카드 본문의 canonical JSON 영수증에서 `source_digest`, `pr_url`, `bound_head_sha`, `reflection`을 읽는다. 이 reflection은 직전 reviewer/critic이 남긴 실패 원인이므로 누락하거나 요약하지 않는다.
 2. **작업 지시서 작성**: 카드 AC를 그대로 인용한 지시문을 만든다. AC를 재해석·축소하지 않는다 (본문 수정 금지 — 코멘트만 허용).
+   - `executor-rework`에서는 영수증의 reflection, PR URL, bound HEAD를 codex exec 지시문에 반드시 포함한다. 같은 PR 브랜치에서 reflection의 실패를 먼저 재현하고, 수정 뒤 기존 테스트와 해당 회귀 테스트를 실행하도록 지시한다.
+   - rework 지시문에서 새 PR을 만들도록 지시하지 않는다. 영수증의 `pr_url`이 가리키는 기존 PR을 계속 사용한다.
 3. **base SHA 기록 + codex exec 스폰 (tmux)** — 스폰 전에 반드시 작업 시작 시점 SHA를 기록한다(게이트가 "이번 작업의 커밋"을 판정하는 기준):
    ```bash
    cd <워크스페이스> && git rev-parse HEAD > .forge-base-sha
