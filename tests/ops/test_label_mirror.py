@@ -231,6 +231,21 @@ def test_raw_root_done_projects_need_review_without_calling_ci() -> None:
     assert targets[root_key] == "forge:need-review"
 
 
+def test_synthetic_manual_executor_completion_projects_need_review() -> None:
+    mirror = load_mirror()
+    root_key = "github-issue:acme/widgets#7"
+    root = bound_root_card()
+    root["run_status"] = "completed"
+    root["run_outcome"] = "completed"
+
+    targets = mirror.projection_targets(
+        {root_key: root},
+        current_head_green=lambda _: False,
+    )
+
+    assert targets[root_key] == "forge:need-review"
+
+
 def test_done_executor_failed_ci_projects_need_execution() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
