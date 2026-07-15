@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from forge.ops.contracts import PipelineStage, transition_digest
+from forge.ops.stage_reconciler import required_check_failure_reflection
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -134,11 +135,12 @@ def stage_body(
     bound_head_sha: str,
     pr_url: str = "https://github.com/acme/widgets/pull/99",
     source_run_id: int = 8,
+    reflection: str | None = None,
 ) -> str:
     binding = {
         "bound_head_sha": bound_head_sha,
         "pr_url": pr_url,
-        "reflection": None,
+        "reflection": reflection,
         "source_digest": source_digest,
         "source_run_id": source_run_id,
         "source_task_id": source_task_id,
@@ -229,6 +231,19 @@ def test_raw_root_done_projects_need_review_without_calling_ci() -> None:
     assert targets[root_key] == "forge:need-review"
 
 
+def test_done_executor_failed_ci_projects_need_execution() -> None:
+    mirror = load_mirror()
+    root_key = "github-issue:acme/widgets#7"
+
+    targets = mirror.projection_targets(
+        {root_key: bound_root_card()},
+        current_head_green=lambda _: False,
+        current_head_failed=lambda _card, stage: stage is PipelineStage.EXECUTOR,
+    )
+
+    assert targets[root_key] == "forge:need-execution"
+
+
 def test_reviewer_approve_frontier_projects_need_critic() -> None:
     mirror = load_mirror()
     root_key = "github-issue:acme/widgets#7"
@@ -259,6 +274,23 @@ def test_reviewer_reject_frontier_projects_need_execution() -> None:
     targets = mirror.projection_targets(cards, current_head_green=lambda _: False)
 
     assert targets[root_key] == "forge:need-execution"
+
+
+def test_critic_defect_does_not_call_ci_failure_gate() -> None:
+    mirror = load_mirror()
+    defect = bound_critic_card()
+    defect["summary"] = critic_summary(outcome="defect_found")
+
+    def unexpected_failure_gate(*_args: object) -> bool:
+        raise AssertionError("defect_found is already a rework result")
+
+    targets = mirror.projection_targets(
+        pipeline_to_critic(defect),
+        current_head_green=lambda _: False,
+        current_head_failed=unexpected_failure_gate,
+    )
+
+    assert targets["github-issue:acme/widgets#7"] == "forge:need-execution"
 
 
 def test_critic_pass_requires_injected_exact_head_ci_gate() -> None:
@@ -344,6 +376,83 @@ def test_live_critic_gate_keeps_pending_eval_non_mergeable(
     monkeypatch.setattr(mirror, "sh", fake_sh)
 
     assert mirror.critic_current_head_green(bound_critic_card()) is False
+
+
+def test_live_executor_gate_detects_actionable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mirror = load_mirror()
+
+    def fake_sh(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
+        if "/pulls/99" in args[-1]:
+            return 0, json.dumps(
+                {
+                    "number": 99,
+                    "html_url": "https://github.com/acme/widgets/pull/99",
+                    "state": "open",
+                    "draft": False,
+                    "head": {"sha": "b" * 40},
+                }
+            ), ""
+        return 0, json.dumps(
+            {
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "eval",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "head_sha": "b" * 40,
+                    }
+                ],
+            }
+        ), ""
+
+    monkeypatch.setattr(mirror, "sh", fake_sh)
+
+    assert mirror.stage_current_head_failed(
+        bound_root_card(),
+        PipelineStage.EXECUTOR,
+    ) is True
+
+
+def test_live_executor_gate_rejects_completed_nonactionable_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mirror = load_mirror()
+
+    def fake_sh(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
+        if "/pulls/99" in args[-1]:
+            return 0, json.dumps(
+                {
+                    "number": 99,
+                    "html_url": "https://github.com/acme/widgets/pull/99",
+                    "state": "open",
+                    "draft": False,
+                    "head": {"sha": "b" * 40},
+                }
+            ), ""
+        return 0, json.dumps(
+            {
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "eval",
+                        "status": "completed",
+                        "conclusion": "startup_failure",
+                        "head_sha": "b" * 40,
+                    }
+                ],
+            }
+        ), ""
+
+    monkeypatch.setattr(mirror, "sh", fake_sh)
+
+    with pytest.raises(mirror.ProjectionError, match="non-actionable"):
+        mirror.stage_current_head_failed(
+            bound_root_card(),
+            PipelineStage.EXECUTOR,
+        )
 
 
 def test_live_critic_gate_rejects_duplicate_eval_checks(
@@ -709,6 +818,115 @@ def test_reviewer_reject_cannot_parent_a_critic() -> None:
 
     with pytest.raises(mirror.ProjectionError, match="reject|transition"):
         mirror.projection_targets(cards, current_head_green=lambda _: True)
+
+
+def test_critic_pass_can_parent_fresh_reviewer_on_a_changed_head() -> None:
+    mirror = load_mirror()
+    cards = pipeline_to_critic()
+    critic = bound_critic_card()
+    updated_head = "f" * 40
+    digest = transition_digest(
+        task_id="critic",
+        run_id=3,
+        stage=PipelineStage.CRITIC,
+        summary=critic["summary"],
+        metadata={},
+        pr_url="https://github.com/acme/widgets/pull/99",
+        head_sha=updated_head,
+    )
+    cards[
+        "forge-stage:acme/widgets#7:reviewer:" + digest[:16]
+    ] = card(
+        "fresh-reviewer",
+        status="ready",
+        parent_id="critic",
+        body=stage_body(
+            source_task_id="critic",
+            source_digest=digest,
+            source_run_id=3,
+            bound_head_sha=updated_head,
+        ),
+    )
+
+    targets = mirror.projection_targets(
+        cards,
+        current_head_green=lambda _: False,
+    )
+
+    assert targets["github-issue:acme/widgets#7"] == "forge:need-review"
+
+
+def test_critic_pass_cannot_parent_fresh_reviewer_on_the_same_head() -> None:
+    mirror = load_mirror()
+    cards = pipeline_to_critic()
+    critic = bound_critic_card()
+    unchanged_head = "e" * 40
+    digest = transition_digest(
+        task_id="critic",
+        run_id=3,
+        stage=PipelineStage.CRITIC,
+        summary=critic["summary"],
+        metadata={},
+        pr_url="https://github.com/acme/widgets/pull/99",
+        head_sha=unchanged_head,
+    )
+    cards[
+        "forge-stage:acme/widgets#7:reviewer:" + digest[:16]
+    ] = card(
+        "fresh-reviewer",
+        status="ready",
+        parent_id="critic",
+        body=stage_body(
+            source_task_id="critic",
+            source_digest=digest,
+            source_run_id=3,
+            bound_head_sha=unchanged_head,
+        ),
+    )
+
+    with pytest.raises(mirror.ProjectionError, match="fresh|HEAD"):
+        mirror.projection_targets(cards, current_head_green=lambda _: False)
+
+
+def test_executor_ci_rework_requires_canonical_failure_reflection() -> None:
+    mirror = load_mirror()
+    root = bound_root_card()
+    digest = executor_digest()
+
+    def cards_for(reflection: str) -> dict[str, dict[str, object]]:
+        return {
+            "github-issue:acme/widgets#7": root,
+            "forge-stage:acme/widgets#7:executor-rework:"
+            + digest[:16]: card(
+                "rework",
+                status="ready",
+                parent_id="root",
+                body=stage_body(
+                    source_task_id="root",
+                    source_digest=digest,
+                    source_run_id=1,
+                    bound_head_sha="b" * 40,
+                    reflection=reflection,
+                ),
+            ),
+        }
+
+    valid = required_check_failure_reflection(
+        check_name="eval",
+        conclusion="failure",
+        head_sha="b" * 40,
+    )
+    targets = mirror.projection_targets(
+        cards_for(valid),
+        current_head_green=lambda _: False,
+    )
+    assert targets["github-issue:acme/widgets#7"] == "forge:need-execution"
+
+    with pytest.raises(mirror.ProjectionError, match="reflection|transition"):
+        mirror.projection_targets(
+            cards_for("CI failed somehow"),
+            current_head_green=lambda _: False,
+        )
 
 
 def test_stage_receipt_digest_must_recompute_from_parent_run() -> None:

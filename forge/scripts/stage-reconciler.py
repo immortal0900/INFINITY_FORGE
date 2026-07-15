@@ -38,6 +38,7 @@ from forge.ops.stage_reconciler import (  # noqa: E402
     PipelineSnapshot,
     build_stage_card_spec,
     decide_next_action,
+    validate_stage_child_transition,
 )
 
 
@@ -248,13 +249,22 @@ def _validate_pipeline_graph(
         )
     roots: dict[tuple[str, int], int] = {}
     allowed_children = {
-        PipelineStage.EXECUTOR: {PipelineStage.REVIEWER},
-        PipelineStage.EXECUTOR_REWORK: {PipelineStage.REVIEWER},
+        PipelineStage.EXECUTOR: {
+            PipelineStage.REVIEWER,
+            PipelineStage.EXECUTOR_REWORK,
+        },
+        PipelineStage.EXECUTOR_REWORK: {
+            PipelineStage.REVIEWER,
+            PipelineStage.EXECUTOR_REWORK,
+        },
         PipelineStage.REVIEWER: {
             PipelineStage.CRITIC,
             PipelineStage.EXECUTOR_REWORK,
         },
-        PipelineStage.CRITIC: {PipelineStage.EXECUTOR_REWORK},
+        PipelineStage.CRITIC: {
+            PipelineStage.REVIEWER,
+            PipelineStage.EXECUTOR_REWORK,
+        },
     }
     for task in tasks:
         identity = identities[task.task_id]
@@ -322,6 +332,7 @@ def _validate_stage_receipts(
     tasks: Sequence[TaskRecord],
     identities: dict[str, PipelineIdentity],
     store: PipelineStore,
+    required_check_name: str,
 ) -> None:
     task_by_id = {task.task_id: task for task in tasks}
     parent_runs: dict[str, RunRecord] = {}
@@ -354,6 +365,20 @@ def _validate_stage_receipts(
                 f"stage task {task.task_id} parent run receipt id does not match"
             )
         parent_identity = identities[parent_id]
+        parent_result = parse_stage_result(
+            parent_identity.stage,
+            parent_run.summary,
+            parent_run.metadata,
+        )
+        validate_stage_child_transition(
+            parent_stage=parent_identity.stage,
+            parent_result=parent_result,
+            child_stage=identity.stage,
+            pr_url=str(receipt["pr_url"]),
+            bound_head_sha=str(receipt["bound_head_sha"]),
+            reflection=receipt["reflection"],
+            required_check_name=required_check_name,
+        )
         expected_digest = transition_digest(
             task_id=parent_id,
             run_id=parent_run.run_id,
@@ -390,7 +415,12 @@ def reconcile_once(
             raise GateError("legacy topology blockers are malformed")
         topology_blockers = frozenset(raw_blockers)
         _validate_pipeline_graph(all_tasks, parsed, topology_blockers)
-        _validate_stage_receipts(all_tasks, parsed, store)
+        _validate_stage_receipts(
+            all_tasks,
+            parsed,
+            store,
+            config.required_check,
+        )
         tasks = tuple(
             task
             for task in all_tasks
@@ -476,6 +506,7 @@ def reconcile_once(
             action = decide_next_action(snapshot)
             if action.kind in {
                 ActionKind.CREATE_REVIEWER,
+                ActionKind.CREATE_FRESH_REVIEWER,
                 ActionKind.CREATE_CRITIC,
                 ActionKind.CREATE_REWORK,
             }:

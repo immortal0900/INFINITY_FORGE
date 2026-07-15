@@ -19,8 +19,10 @@ metadata:
 1. **카드 파악**: `kanban_show`로 카드 본문·수용 기준(AC)·이전 시도(runs)·코멘트(반성문 포함)를 전부 읽는다.
    - 이전 시도가 있으면: 실패 원인과 반성문을 codex 프롬프트에 반드시 포함한다.
    - 카드 idempotency key의 단계가 `executor-rework`이면 카드 본문의 canonical JSON 영수증에서 `source_digest`, `pr_url`, `bound_head_sha`, `reflection`을 읽는다. 이 reflection은 직전 reviewer/critic이 남긴 실패 원인이므로 누락하거나 요약하지 않는다.
+   - reflection이 `required check 'eval' concluded ...` 형식이면 reviewer/critic 품질 반려가 아니라 exact `bound_head_sha`에서 발생한 CI failure 재작업이다. GitHub Actions 로그와 같은 PR의 실패 HEAD를 함께 읽는다.
 2. **작업 지시서 작성**: 카드 AC를 그대로 인용한 지시문을 만든다. AC를 재해석·축소하지 않는다 (본문 수정 금지 — 코멘트만 허용).
    - `executor-rework`에서는 영수증의 reflection, PR URL, bound HEAD를 codex exec 지시문에 반드시 포함한다. 같은 PR 브랜치에서 reflection의 실패를 먼저 재현하고, 수정 뒤 기존 테스트와 해당 회귀 테스트를 실행하도록 지시한다.
+   - CI failure 재작업이면 먼저 로컬에서 같은 check를 재현한다. 외부 서비스의 일시 장애처럼 코드로 재현되지 않고 수정할 파일도 없으면 **의미 없는 commit**으로 게이트를 속이지 말고 로그 증거를 코멘트한 뒤 `kanban_block`한다.
    - rework 지시문에서 새 PR을 만들도록 지시하지 않는다. 영수증의 `pr_url`이 가리키는 기존 PR을 계속 사용한다.
 3. **재작업 전용 worktree 고정 또는 검증된 재개** — `executor-rework`이면 공유 repo checkout에서 바로 수정하지 않는다. 먼저 PR branch와 카드 receipt HEAD를 읽고 카드별 worktree를 만들거나, 같은 카드의 기존 worktree만 검증해 재개한다. `<저장소루트>`와 `<카드ID>`는 실제 값으로 바꾼다.
    ```bash

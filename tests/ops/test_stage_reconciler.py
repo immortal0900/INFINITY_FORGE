@@ -261,12 +261,9 @@ def test_required_check_must_exist_exactly_once(
     [
         ("queued", None),
         ("in_progress", None),
-        ("completed", "pending"),
-        ("completed", "failure"),
-        ("completed", "cancelled"),
     ],
 )
-def test_non_green_required_check_waits(
+def test_pending_required_check_waits(
     status: str,
     conclusion: str | None,
 ) -> None:
@@ -275,6 +272,36 @@ def test_non_green_required_check_waits(
     )
 
     assert action.kind is ActionKind.WAIT
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out"])
+@pytest.mark.parametrize("stage", [PipelineStage.EXECUTOR, PipelineStage.EXECUTOR_REWORK])
+def test_executor_check_failure_creates_same_pr_rework(
+    stage: PipelineStage,
+    conclusion: str,
+) -> None:
+    action = decide_next_action(
+        executor_snapshot(stage=stage, check_conclusion=conclusion)
+    )
+
+    assert action.kind is ActionKind.CREATE_REWORK
+    assert action.target_stage is PipelineStage.EXECUTOR_REWORK
+    assert "eval" in str(action.reflection)
+    assert LIVE_HEAD_SHA in str(action.reflection)
+    assert conclusion in str(action.reflection)
+
+
+@pytest.mark.parametrize(
+    "conclusion",
+    ["action_required", "cancelled", "neutral", "pending", "skipped", "stale", "startup_failure"],
+)
+def test_completed_non_actionable_check_is_gate_error(conclusion: str) -> None:
+    action = decide_next_action(
+        executor_snapshot(check_status="completed", check_conclusion=conclusion)
+    )
+
+    assert action.kind is ActionKind.GATE_ERROR
+    assert conclusion in action.reason
 
 
 def test_required_check_from_stale_head_is_gate_error() -> None:
@@ -409,8 +436,6 @@ def test_critic_fourth_defect_marks_pipeline_failed() -> None:
     ("status", "conclusion"),
     [
         ("in_progress", None),
-        ("completed", "pending"),
-        ("completed", "failure"),
     ],
 )
 def test_critic_pass_needs_green_result_head(
@@ -422,6 +447,70 @@ def test_critic_pass_needs_green_result_head(
     )
 
     assert action.kind is ActionKind.WAIT
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out"])
+def test_critic_pass_check_failure_creates_same_pr_rework(
+    conclusion: str,
+) -> None:
+    action = decide_next_action(critic_snapshot(check_conclusion=conclusion))
+
+    assert action.kind is ActionKind.CREATE_REWORK
+    assert action.target_stage is PipelineStage.EXECUTOR_REWORK
+    assert "eval" in str(action.reflection)
+    assert LIVE_HEAD_SHA in str(action.reflection)
+
+
+def test_check_failure_at_rework_limit_marks_pipeline_failed() -> None:
+    action = decide_next_action(
+        critic_snapshot(check_conclusion="failure", rework_count=3)
+    )
+
+    assert action.kind is ActionKind.MARK_FAILED
+
+
+def test_stale_critic_pass_waits_for_updated_head_check() -> None:
+    updated_head = "e" * 40
+    action = decide_next_action(
+        critic_snapshot(
+            live_head=updated_head,
+            checks=(
+                _check(status="in_progress", conclusion=None, head_sha=updated_head),
+            ),
+        )
+    )
+
+    assert action.kind is ActionKind.WAIT
+
+
+def test_stale_critic_pass_creates_fresh_reviewer_after_updated_head_is_green() -> None:
+    updated_head = "e" * 40
+    action = decide_next_action(critic_snapshot(live_head=updated_head))
+
+    assert action.kind is ActionKind.CREATE_FRESH_REVIEWER
+    assert action.target_stage is PipelineStage.REVIEWER
+
+
+def test_stale_critic_pass_failure_reworks_updated_head() -> None:
+    updated_head = "e" * 40
+    action = decide_next_action(
+        critic_snapshot(live_head=updated_head, check_conclusion="failure")
+    )
+
+    assert action.kind is ActionKind.CREATE_REWORK
+    assert updated_head in str(action.reflection)
+
+
+def test_stale_critic_defect_remains_gate_error() -> None:
+    action = decide_next_action(
+        critic_snapshot(
+            outcome=StageOutcome.DEFECT_FOUND,
+            reflection="race remains",
+            live_head="e" * 40,
+        )
+    )
+
+    assert action.kind is ActionKind.GATE_ERROR
 
 
 def test_green_critic_pass_marks_pipeline_mergeable() -> None:
@@ -451,8 +540,6 @@ def test_critic_pass_requires_a_new_result_commit() -> None:
         critic_snapshot(bound_pr_url=OTHER_PR_URL),
         critic_snapshot(bound_head="e" * 40),
         critic_snapshot(reviewed_head="e" * 40),
-        critic_snapshot(result_head="e" * 40),
-        critic_snapshot(live_head="e" * 40),
         critic_snapshot(checks=(_check(head_sha=BOUND_HEAD_SHA),)),
     ],
 )
@@ -616,6 +703,12 @@ def test_decision_is_deterministic_for_same_snapshot() -> None:
             PipelineStage.EXECUTOR_REWORK,
             "executor",
             "kanban-codex-delegate",
+        ),
+        (
+            critic_snapshot(live_head="e" * 40),
+            PipelineStage.REVIEWER,
+            "reviewer",
+            "reviewer-verdict",
         ),
     ],
 )

@@ -88,6 +88,17 @@ def test_reviewer_copies_card_bindings_without_substitution() -> None:
     assert "예시 값을 그대로 쓰지" in skill
 
 
+def test_fresh_reviewer_reads_ancestral_executor_handoff_and_critic_tests() -> None:
+    skill = _skill("reviewer-verdict")
+
+    assert "가장 가까운 executor" in skill
+    assert "exact 5-field" in skill
+    assert "가장 가까운 critic 조상" in skill
+    assert "executor-rework 과정" in skill
+    assert "added_tests" in skill
+    assert "현재 HEAD에 모두 남아" in skill
+
+
 def test_critic_examples_match_parser_exactly() -> None:
     skill = _skill("critic-adversarial")
     examples = _result_examples(skill, "forge-critic-result/v1")
@@ -134,6 +145,16 @@ def test_rework_executor_injects_parent_reflection_into_codex_instruction() -> N
         skill,
         flags=re.IGNORECASE | re.DOTALL,
     )
+
+
+def test_ci_failure_rework_uses_exact_failed_head_and_same_pr() -> None:
+    skill = _skill("kanban-codex-delegate")
+
+    assert "required check" in skill
+    assert "CI failure" in skill
+    assert "bound_head_sha" in skill
+    assert "같은 PR" in skill
+    assert "의미 없는 commit" in skill
 
 
 @pytest.mark.parametrize(

@@ -48,11 +48,13 @@ _VALID_CHECK_CONCLUSIONS = frozenset(
     }
 )
 _MAX_REWORKS = 3
+REWORK_CHECK_CONCLUSIONS = frozenset({"failure", "timed_out"})
 
 
 class ActionKind(str, Enum):
     WAIT = "wait"
     CREATE_REVIEWER = "create-reviewer"
+    CREATE_FRESH_REVIEWER = "create-fresh-reviewer"
     CREATE_CRITIC = "create-critic"
     CREATE_REWORK = "create-rework"
     MARK_MERGEABLE = "mark-mergeable"
@@ -300,9 +302,152 @@ def _validate_result_binding(snapshot: PipelineSnapshot) -> StageAction | None:
     if isinstance(result, ReviewerResult):
         if result.head_sha != pr.head_sha:
             return _gate_error("reviewer head does not match the live PR head")
-    elif result.result_head_sha != pr.head_sha:
+    elif (
+        result.result_head_sha != pr.head_sha
+        and result.outcome is not StageOutcome.PASS
+    ):
         return _gate_error("critic result head does not match the live PR head")
     return None
+
+
+def required_check_failure_reflection(
+    *,
+    check_name: str,
+    conclusion: str,
+    head_sha: str,
+) -> str:
+    """Return the canonical instruction for a code-actionable CI failure."""
+
+    if not isinstance(check_name, str) or not check_name.strip():
+        raise ValueError("check_name must be non-empty")
+    if conclusion not in REWORK_CHECK_CONCLUSIONS:
+        raise ValueError("conclusion is not actionable by executor rework")
+    if not isinstance(head_sha, str) or _GIT_SHA_RE.fullmatch(head_sha) is None:
+        raise ValueError("head_sha has an invalid format")
+    return (
+        f"required check '{check_name}' concluded '{conclusion}' on PR HEAD "
+        f"{head_sha}; inspect GitHub Actions logs, reproduce the failure, and "
+        "push the fix to the same PR"
+    )
+
+
+def is_required_check_failure_reflection(
+    value: object,
+    *,
+    check_name: str,
+    head_sha: str,
+) -> bool:
+    """Return whether ``value`` is one canonical actionable-CI receipt."""
+
+    if not isinstance(value, str):
+        return False
+    return any(
+        value
+        == required_check_failure_reflection(
+            check_name=check_name,
+            conclusion=conclusion,
+            head_sha=head_sha,
+        )
+        for conclusion in REWORK_CHECK_CONCLUSIONS
+    )
+
+
+def validate_stage_child_transition(
+    *,
+    parent_stage: PipelineStage,
+    parent_result: StageResult,
+    child_stage: PipelineStage,
+    pr_url: str,
+    bound_head_sha: str,
+    reflection: object,
+    required_check_name: str = "eval",
+) -> None:
+    """Validate the semantic edge represented by a child-card receipt."""
+
+    expected_type: type[ExecutorResult] | type[ReviewerResult] | type[CriticResult]
+    if parent_stage in {PipelineStage.EXECUTOR, PipelineStage.EXECUTOR_REWORK}:
+        expected_type = ExecutorResult
+    elif parent_stage is PipelineStage.REVIEWER:
+        expected_type = ReviewerResult
+    elif parent_stage is PipelineStage.CRITIC:
+        expected_type = CriticResult
+    else:
+        raise ContractError("parent stage is unsupported")
+    if not isinstance(parent_result, expected_type):
+        raise ContractError("parent result type does not match parent stage")
+    if parent_result.pr_url != pr_url:
+        raise ContractError("child receipt PR does not match parent result")
+    if _GIT_SHA_RE.fullmatch(bound_head_sha) is None:
+        raise ContractError("child receipt HEAD has an invalid format")
+
+    if isinstance(parent_result, ExecutorResult):
+        if child_stage is PipelineStage.REVIEWER:
+            if reflection is not None:
+                raise ContractError("executor to reviewer reflection must be null")
+            return
+        if child_stage is PipelineStage.EXECUTOR_REWORK:
+            if not is_required_check_failure_reflection(
+                reflection,
+                check_name=required_check_name,
+                head_sha=bound_head_sha,
+            ):
+                raise ContractError(
+                    "executor CI rework reflection is not canonical"
+                )
+            return
+        raise ContractError(
+            f"executor result cannot transition to {child_stage.value}"
+        )
+
+    if isinstance(parent_result, ReviewerResult):
+        if parent_result.verdict is StageOutcome.APPROVE:
+            expected_child = PipelineStage.CRITIC
+            expected_reflection = None
+        elif parent_result.verdict is StageOutcome.REJECT:
+            expected_child = PipelineStage.EXECUTOR_REWORK
+            expected_reflection = parent_result.reflection
+        else:
+            raise ContractError("reviewer verdict is unsupported")
+        if child_stage is not expected_child:
+            raise ContractError(
+                f"reviewer {parent_result.verdict.value} cannot transition to "
+                f"{child_stage.value}"
+            )
+        if bound_head_sha != parent_result.head_sha:
+            raise ContractError("reviewer child HEAD does not match reviewer result")
+        if reflection != expected_reflection:
+            raise ContractError("reviewer child reflection does not match result")
+        return
+
+    if parent_result.outcome is StageOutcome.DEFECT_FOUND:
+        if child_stage is not PipelineStage.EXECUTOR_REWORK:
+            raise ContractError(
+                "critic defect_found can only transition to executor-rework"
+            )
+        if bound_head_sha != parent_result.result_head_sha:
+            raise ContractError("critic rework HEAD does not match critic result")
+        if reflection != parent_result.reflection:
+            raise ContractError("critic rework reflection does not match result")
+        return
+    if parent_result.outcome is not StageOutcome.PASS:
+        raise ContractError("critic outcome is unsupported")
+    if child_stage is PipelineStage.REVIEWER:
+        if bound_head_sha == parent_result.result_head_sha:
+            raise ContractError("fresh reviewer requires a changed PR HEAD")
+        if reflection is not None:
+            raise ContractError("fresh reviewer reflection must be null")
+        return
+    if child_stage is PipelineStage.EXECUTOR_REWORK:
+        if not is_required_check_failure_reflection(
+            reflection,
+            check_name=required_check_name,
+            head_sha=bound_head_sha,
+        ):
+            raise ContractError("critic CI rework reflection is not canonical")
+        return
+    raise ContractError(
+        f"critic pass cannot transition to {child_stage.value}"
+    )
 
 
 def _required_check_decision(
@@ -327,10 +472,21 @@ def _required_check_decision(
     check = matches[0]
     if check.head_sha != expected_head_sha:
         return _gate_error("required check head does not match the required PR head")
-    if check.status == "completed" and check.conclusion == "success":
+    if check.status != "completed":
+        return _wait(f"required check is still running: status={check.status}")
+    if check.conclusion == "success":
         return None
-    return _wait(
-        f"required check is not successful: status={check.status}, "
+    if check.conclusion in REWORK_CHECK_CONCLUSIONS:
+        return _rework_or_failure(
+            snapshot,
+            required_check_failure_reflection(
+                check_name=snapshot.required_check_name,
+                conclusion=check.conclusion,
+                head_sha=expected_head_sha,
+            ),
+        )
+    return _gate_error(
+        "required check completed without an actionable result: "
         f"conclusion={check.conclusion}"
     )
 
@@ -400,10 +556,16 @@ def decide_next_action(snapshot: PipelineSnapshot) -> StageAction:
         return _gate_error("critic outcome is unsupported")
     check_decision = _required_check_decision(
         snapshot,
-        expected_head_sha=result.result_head_sha,
+        expected_head_sha=pr.head_sha,
     )
     if check_decision is not None:
         return check_decision
+    if result.result_head_sha != pr.head_sha:
+        return _creation_action(
+            ActionKind.CREATE_FRESH_REVIEWER,
+            PipelineStage.REVIEWER,
+            reason="PR head changed after critic pass and requires fresh review",
+        )
     return StageAction(
         ActionKind.MARK_MERGEABLE,
         reason="critic passed and the result head required check is green",
@@ -412,6 +574,11 @@ def decide_next_action(snapshot: PipelineSnapshot) -> StageAction:
 
 _CARD_TARGETS = {
     ActionKind.CREATE_REVIEWER: (
+        PipelineStage.REVIEWER,
+        "reviewer",
+        "reviewer-verdict",
+    ),
+    ActionKind.CREATE_FRESH_REVIEWER: (
         PipelineStage.REVIEWER,
         "reviewer",
         "reviewer-verdict",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""INFINITY_FORGE label-mirror — GitHub 이슈 ↔ kanban 카드 동기화 (LLM 0, 2분 주기).
+"""INFINITY_FORGE label-mirror — GitHub 이슈 ↔ kanban 카드 동기화 (LLM 0, 1분 주기).
 D7: forge:* 라벨의 단독 작성자는 이 스크립트다.
 
 수입(Import): forge:need-execution 라벨이 달린 open 이슈 중 카드가 없는 것
@@ -30,6 +30,10 @@ from forge.ops.contracts import (
     validate_stage_result_binding,
 )
 from forge.ops.label_projection import ProjectionState, projected_label
+from forge.ops.stage_reconciler import (
+    REWORK_CHECK_CONCLUSIONS,
+    validate_stage_child_transition,
+)
 
 REPOS = ["immortal0900/INFINITY_FORGE"]
 HOME = os.path.expanduser("~")
@@ -79,12 +83,18 @@ CHECK_CONCLUSIONS = frozenset(
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ALLOWED_CHILDREN = {
-    PipelineStage.EXECUTOR: frozenset({PipelineStage.REVIEWER}),
-    PipelineStage.EXECUTOR_REWORK: frozenset({PipelineStage.REVIEWER}),
+    PipelineStage.EXECUTOR: frozenset(
+        {PipelineStage.REVIEWER, PipelineStage.EXECUTOR_REWORK}
+    ),
+    PipelineStage.EXECUTOR_REWORK: frozenset(
+        {PipelineStage.REVIEWER, PipelineStage.EXECUTOR_REWORK}
+    ),
     PipelineStage.REVIEWER: frozenset(
         {PipelineStage.CRITIC, PipelineStage.EXECUTOR_REWORK}
     ),
-    PipelineStage.CRITIC: frozenset({PipelineStage.EXECUTOR_REWORK}),
+    PipelineStage.CRITIC: frozenset(
+        {PipelineStage.REVIEWER, PipelineStage.EXECUTOR_REWORK}
+    ),
 }
 
 
@@ -384,39 +394,18 @@ def _validate_parent_transition(
     if result.pr_url != child_receipt["pr_url"]:
         raise ProjectionError("stage receipt PR does not match parent result")
 
-    expected_child: PipelineStage | None
-    expected_head: str | None = None
-    if isinstance(result, ExecutorResult):
-        expected_child = PipelineStage.REVIEWER
-    elif isinstance(result, ReviewerResult):
-        expected_head = result.head_sha
-        expected_child = (
-            PipelineStage.CRITIC
-            if result.verdict is StageOutcome.APPROVE
-            else PipelineStage.EXECUTOR_REWORK
+    try:
+        validate_stage_child_transition(
+            parent_stage=parent_stage,
+            parent_result=result,
+            child_stage=child_stage,
+            pr_url=str(child_receipt["pr_url"]),
+            bound_head_sha=str(child_receipt["bound_head_sha"]),
+            reflection=child_receipt["reflection"],
+            required_check_name="eval",
         )
-    else:
-        expected_head = result.result_head_sha
-        expected_child = (
-            PipelineStage.EXECUTOR_REWORK
-            if result.outcome is StageOutcome.DEFECT_FOUND
-            else None
-        )
-    if child_stage is not expected_child:
-        outcome = getattr(result, "verdict", getattr(result, "outcome", "complete"))
-        raise ProjectionError(
-            f"parent result {outcome} cannot transition to {child_stage.value}"
-        )
-    expected_reflection = (
-        result.reflection
-        if child_stage is PipelineStage.EXECUTOR_REWORK
-        and isinstance(result, (ReviewerResult, CriticResult))
-        else None
-    )
-    if child_receipt["reflection"] != expected_reflection:
-        raise ProjectionError("stage receipt reflection does not match parent result")
-    if expected_head is not None and child_receipt["bound_head_sha"] != expected_head:
-        raise ProjectionError("stage receipt HEAD does not match parent result")
+    except ContractError as error:
+        raise ProjectionError(f"stage transition is invalid: {error}") from error
 
     parent_run_id = parent_card.get("run_id")
     if child_receipt["source_run_id"] != parent_run_id:
@@ -443,6 +432,9 @@ def projection_targets(
     cards: Mapping[str, Mapping[str, object]],
     *,
     current_head_green: Callable[[Mapping[str, object]], bool],
+    current_head_failed: (
+        Callable[[Mapping[str, object], PipelineStage], bool] | None
+    ) = None,
     max_reworks: int = 3,
     repositories: tuple[str, ...] | None = None,
 ) -> dict[str, str]:
@@ -489,6 +481,7 @@ def projection_targets(
         status = _card_field(frontier_card, "status", str)
         outcome = _stage_outcome(stage, frontier_card, identity[0])
         green = False
+        failed = False
         if (
             stage is PipelineStage.CRITIC
             and status == "done"
@@ -497,8 +490,27 @@ def projection_targets(
             green = current_head_green(frontier_card)
             if not isinstance(green, bool):
                 raise ProjectionError("current HEAD gate must return a boolean")
+        if (
+            status == "done"
+            and not green
+            and (
+                stage in {PipelineStage.EXECUTOR, PipelineStage.EXECUTOR_REWORK}
+                or (stage is PipelineStage.CRITIC and outcome is StageOutcome.PASS)
+            )
+            and current_head_failed is not None
+        ):
+            failed = current_head_failed(frontier_card, stage)
+            if not isinstance(failed, bool):
+                raise ProjectionError("current HEAD failure gate must return a boolean")
         label = projected_label(
-            ProjectionState(stage, status, outcome, green, rework_count),
+            ProjectionState(
+                stage,
+                status,
+                outcome,
+                green,
+                rework_count,
+                current_head_failed=failed,
+            ),
             max_reworks=max_reworks,
         )
         if label is not None:
@@ -561,36 +573,11 @@ def _gh_json(args: list[str], *, label: str) -> Mapping[str, object]:
     return value
 
 
-def critic_current_head_green(card: Mapping[str, object]) -> bool:
-    """Verify a completed critic pass against its live PR HEAD and exact eval check."""
-
-    summary = card.get("summary")
-    metadata = card.get("metadata", {})
-    if not isinstance(summary, Mapping) or not isinstance(metadata, Mapping):
-        raise ProjectionError("critic result is missing")
-    try:
-        result = parse_stage_result(PipelineStage.CRITIC, summary, metadata)
-    except ContractError as error:
-        raise ProjectionError(f"critic result is invalid: {error}") from error
-    if not isinstance(result, CriticResult) or result.outcome is not StageOutcome.PASS:
-        raise ProjectionError("current HEAD gate requires a critic pass")
-
-    pr_match = PR_URL_RE.fullmatch(result.pr_url)
+def _live_pr(pr_url: str) -> tuple[str, str, bool, str]:
+    pr_match = PR_URL_RE.fullmatch(pr_url)
     if pr_match is None:
-        raise ProjectionError("critic PR URL is malformed")
+        raise ProjectionError("stage PR URL is malformed")
     repository = pr_match.group("repository")
-    binding = _stage_binding(card.get("body"))
-    try:
-        validate_stage_result_binding(
-            result,
-            expected_repository=repository,
-            expected_pr_url=binding.get("pr_url"),
-            expected_source_digest=binding.get("source_digest"),
-            expected_head_sha=binding.get("bound_head_sha"),
-        )
-    except ContractError as error:
-        raise ProjectionError(f"critic binding is invalid: {error}") from error
-
     pr = _gh_json(
         [GH, "api", f"repos/{repository}/pulls/{pr_match.group('number')}"],
         label="GitHub PR read",
@@ -602,28 +589,31 @@ def critic_current_head_green(card: Mapping[str, object]) -> bool:
         or isinstance(api_pr_number, bool)
         or api_pr_number != expected_pr_number
     ):
-        raise ProjectionError("GitHub PR number does not match critic result")
+        raise ProjectionError("GitHub PR number does not match stage result")
     head = pr.get("head")
-    if not isinstance(head, Mapping) or not isinstance(head.get("sha"), str):
+    if (
+        not isinstance(head, Mapping)
+        or not isinstance(head.get("sha"), str)
+        or GIT_SHA_RE.fullmatch(str(head["sha"])) is None
+    ):
         raise ProjectionError("GitHub PR head is malformed")
-    if pr.get("html_url") != result.pr_url:
-        raise ProjectionError("GitHub PR URL does not match critic result")
+    if pr.get("html_url") != pr_url:
+        raise ProjectionError("GitHub PR URL does not match stage result")
     state = pr.get("state")
     if state not in {"open", "closed"}:
         raise ProjectionError("GitHub PR state is malformed")
     draft = pr.get("draft")
     if not isinstance(draft, bool):
         raise ProjectionError("GitHub PR draft flag is malformed")
-    if state != "open" or draft:
-        return False
-    if head["sha"] != result.result_head_sha:
-        return False
+    return repository, state, draft, str(head["sha"])
 
+
+def _required_check(repository: str, head_sha: str) -> tuple[str, str | None]:
     checks_payload = _gh_json(
         [
             GH,
             "api",
-            f"repos/{repository}/commits/{result.result_head_sha}/check-runs?per_page=100",
+            f"repos/{repository}/commits/{head_sha}/check-runs?per_page=100",
         ],
         label="GitHub check-runs read",
     )
@@ -645,7 +635,7 @@ def critic_current_head_green(card: Mapping[str, object]) -> bool:
     if len(matches) != 1:
         raise ProjectionError(f"expected exactly one eval check; found {len(matches)}")
     check = matches[0]
-    if check.get("head_sha") != result.result_head_sha:
+    if check.get("head_sha") != head_sha:
         raise ProjectionError("eval check is bound to a different HEAD")
     status = check.get("status")
     if status not in CHECK_STATUSES:
@@ -656,7 +646,67 @@ def critic_current_head_green(card: Mapping[str, object]) -> bool:
             raise ProjectionError("eval check conclusion is malformed")
     elif conclusion is not None:
         raise ProjectionError("pending eval check cannot have a conclusion")
+    return str(status), conclusion if isinstance(conclusion, str) else None
+
+
+def critic_current_head_green(card: Mapping[str, object]) -> bool:
+    """Verify a completed critic pass against its live PR HEAD and exact eval check."""
+
+    summary = card.get("summary")
+    if not isinstance(summary, Mapping):
+        raise ProjectionError("critic result is missing")
+    pr_url = summary.get("pr_url")
+    match = PR_URL_RE.fullmatch(pr_url) if isinstance(pr_url, str) else None
+    if match is None:
+        raise ProjectionError("critic PR URL is malformed")
+    result = _completed_stage_result(
+        PipelineStage.CRITIC,
+        card,
+        match.group("repository"),
+    )
+    if not isinstance(result, CriticResult) or result.outcome is not StageOutcome.PASS:
+        raise ProjectionError("current HEAD gate requires a critic pass")
+    repository, state, draft, live_head = _live_pr(result.pr_url)
+    if state != "open" or draft or live_head != result.result_head_sha:
+        return False
+    status, conclusion = _required_check(repository, live_head)
     return status == "completed" and conclusion == "success"
+
+
+def stage_current_head_failed(
+    card: Mapping[str, object],
+    stage: PipelineStage,
+) -> bool:
+    """Return whether the live HEAD has a code-actionable required-check failure."""
+
+    if stage not in {
+        PipelineStage.EXECUTOR,
+        PipelineStage.EXECUTOR_REWORK,
+        PipelineStage.CRITIC,
+    }:
+        raise ProjectionError("current HEAD failure gate received an invalid stage")
+    summary = card.get("summary")
+    if not isinstance(summary, Mapping):
+        raise ProjectionError("stage result is missing")
+    pr_url = summary.get("pr_url")
+    match = PR_URL_RE.fullmatch(pr_url) if isinstance(pr_url, str) else None
+    if match is None:
+        raise ProjectionError("stage PR URL is malformed")
+    result = _completed_stage_result(stage, card, match.group("repository"))
+    if isinstance(result, CriticResult) and result.outcome is not StageOutcome.PASS:
+        raise ProjectionError("critic failure gate requires a pass result")
+    repository, state, draft, live_head = _live_pr(result.pr_url)
+    if state != "open" or draft:
+        return False
+    status, conclusion = _required_check(repository, live_head)
+    if status != "completed" or conclusion == "success":
+        return False
+    if conclusion in REWORK_CHECK_CONCLUSIONS:
+        return True
+    raise ProjectionError(
+        "required check completed with a non-actionable conclusion: "
+        f"{conclusion}"
+    )
 
 
 def notify_transitions(
@@ -814,6 +864,7 @@ def main() -> int:
         targets = projection_targets(
             cards,
             current_head_green=critic_current_head_green,
+            current_head_failed=stage_current_head_failed,
             repositories=tuple(REPOS),
         )
         existing_keys = set(cards)

@@ -18,6 +18,7 @@ from forge.ops.contracts import (
     TaskRecord,
     transition_digest,
 )
+from forge.ops.stage_reconciler import required_check_failure_reflection
 
 
 REPOSITORY = "owner/repo"
@@ -331,6 +332,7 @@ def test_executor_rework_is_bound_to_its_parent_receipt() -> None:
             source_task_id="reviewer",
             source_digest=rework_digest,
             source_run_id=13,
+            reflection="AC1 is incomplete",
         ),
         parent_id="reviewer",
         idempotency_key=(
@@ -440,17 +442,214 @@ def test_malformed_external_evidence_returns_exit_two_json_report(capsys) -> Non
 
 
 def _receipt_body(
-    *, source_task_id: str, source_digest: str, source_run_id: int = 12
+    *,
+    source_task_id: str,
+    source_digest: str,
+    source_run_id: int = 12,
+    bound_head_sha: str = HEAD_SHA,
+    reflection: str | None = None,
 ) -> str:
     payload = {
-        "bound_head_sha": HEAD_SHA,
+        "bound_head_sha": bound_head_sha,
         "pr_url": PR_URL,
-        "reflection": None,
+        "reflection": reflection,
         "source_digest": source_digest,
         "source_run_id": source_run_id,
         "source_task_id": source_task_id,
     }
     return f"```json\n{json.dumps(payload, sort_keys=True, separators=(',', ':'))}\n```"
+
+
+def test_root_ci_failure_rework_requires_canonical_reflection() -> None:
+    cli = _load_cli()
+    root = TaskRecord(
+        task_id="root",
+        title="root",
+        status="done",
+        idempotency_key=f"github-issue:{REPOSITORY}#{ISSUE_NUMBER}",
+    )
+    root_run = RunRecord(
+        run_id=12,
+        task_id="root",
+        status="completed",
+        outcome="success",
+        summary=_executor_summary(),
+        metadata={},
+    )
+    digest = transition_digest(
+        task_id="root",
+        run_id=12,
+        stage=PipelineStage.EXECUTOR,
+        summary=root_run.summary,
+        metadata=root_run.metadata,
+        pr_url=PR_URL,
+        head_sha=HEAD_SHA,
+    )
+
+    def report_for(reflection: str):
+        rework = TaskRecord(
+            task_id="rework",
+            title="rework",
+            status="todo",
+            body=_receipt_body(
+                source_task_id="root",
+                source_digest=digest,
+                reflection=reflection,
+            ),
+            parent_id="root",
+            idempotency_key=(
+                f"forge-stage:{REPOSITORY}#{ISSUE_NUMBER}:executor-rework:"
+                f"{digest[:16]}"
+            ),
+        )
+        store = _Store([root, rework], {"root": root_run})
+        return cli.reconcile_once(
+            store,
+            _UnexpectedGitHub(),
+            _Create(store),
+            cli.ReconcileConfig(repository=REPOSITORY),
+        )
+
+    valid = required_check_failure_reflection(
+        check_name="eval",
+        conclusion="failure",
+        head_sha=HEAD_SHA,
+    )
+
+    assert report_for(valid).ok is True
+    invalid = report_for("CI failed somehow")
+    assert invalid.ok is False
+    assert "transition" in invalid.errors[0] or "reflection" in invalid.errors[0]
+
+
+def test_stale_critic_pass_creates_one_fresh_reviewer() -> None:
+    cli = _load_cli()
+    reviewed_head = "b" * 40
+    critic_head = "c" * 40
+    root = TaskRecord(
+        task_id="root",
+        title="root",
+        status="done",
+        idempotency_key=f"github-issue:{REPOSITORY}#{ISSUE_NUMBER}",
+    )
+    root_run = RunRecord(
+        run_id=12,
+        task_id="root",
+        status="completed",
+        outcome="success",
+        summary=_executor_summary(),
+        metadata={},
+    )
+    reviewer_digest = transition_digest(
+        task_id="root",
+        run_id=12,
+        stage=PipelineStage.EXECUTOR,
+        summary=root_run.summary,
+        metadata=root_run.metadata,
+        pr_url=PR_URL,
+        head_sha=reviewed_head,
+    )
+    reviewer = TaskRecord(
+        task_id="reviewer",
+        title="reviewer",
+        status="done",
+        body=_receipt_body(
+            source_task_id="root",
+            source_digest=reviewer_digest,
+            bound_head_sha=reviewed_head,
+        ),
+        parent_id="root",
+        idempotency_key=(
+            f"forge-stage:{REPOSITORY}#{ISSUE_NUMBER}:reviewer:"
+            f"{reviewer_digest[:16]}"
+        ),
+    )
+    reviewer_summary = {
+        "schema_version": "forge-reviewer-result/v1",
+        "verdict": "approve",
+        "source_digest": reviewer_digest,
+        "pr_url": PR_URL,
+        "head_sha": reviewed_head,
+        "delta_check": {"implemented_verified": ["AC1"], "discrepancies": []},
+        "spec_check": {"met": ["AC1"], "unmet": []},
+    }
+    reviewer_run = RunRecord(
+        run_id=13,
+        task_id="reviewer",
+        status="completed",
+        outcome="success",
+        summary=reviewer_summary,
+        metadata={},
+    )
+    critic_digest = transition_digest(
+        task_id="reviewer",
+        run_id=13,
+        stage=PipelineStage.REVIEWER,
+        summary=reviewer_summary,
+        metadata={},
+        pr_url=PR_URL,
+        head_sha=reviewed_head,
+    )
+    critic = TaskRecord(
+        task_id="critic",
+        title="critic",
+        status="done",
+        body=_receipt_body(
+            source_task_id="reviewer",
+            source_digest=critic_digest,
+            source_run_id=13,
+            bound_head_sha=reviewed_head,
+        ),
+        parent_id="reviewer",
+        idempotency_key=(
+            f"forge-stage:{REPOSITORY}#{ISSUE_NUMBER}:critic:{critic_digest[:16]}"
+        ),
+    )
+    critic_summary = {
+        "schema_version": "forge-critic-result/v1",
+        "outcome": "pass",
+        "source_digest": critic_digest,
+        "pr_url": PR_URL,
+        "reviewed_head_sha": reviewed_head,
+        "result_head_sha": critic_head,
+        "added_tests": ["tests/test_edge.py"],
+        "scenarios": ["updated base"],
+    }
+    critic_run = RunRecord(
+        run_id=14,
+        task_id="critic",
+        status="completed",
+        outcome="success",
+        summary=critic_summary,
+        metadata={},
+    )
+    store = _Store(
+        [root, reviewer, critic],
+        {"root": root_run, "reviewer": reviewer_run, "critic": critic_run},
+    )
+    create = _Create(store)
+
+    first = cli.reconcile_once(
+        store,
+        _GitHub(),
+        create,
+        cli.ReconcileConfig(repository=REPOSITORY),
+    )
+    second = cli.reconcile_once(
+        store,
+        _UnexpectedGitHub(),
+        create,
+        cli.ReconcileConfig(repository=REPOSITORY),
+    )
+
+    assert first.created == 1
+    assert first.events[0]["action"] == "create-fresh-reviewer"
+    call = create.calls[0]
+    assert call[call.index("--parent") + 1] == "critic"
+    payload = json.loads(call[call.index("--body") + 1].splitlines()[1])
+    assert payload["bound_head_sha"] == HEAD_SHA
+    assert second.ok is True
+    assert len(create.calls) == 1
 
 
 def test_pipeline_graph_rejects_disallowed_root_to_critic_edge() -> None:

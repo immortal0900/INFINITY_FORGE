@@ -60,6 +60,43 @@ def test_critic_pass_green_current_head_projects_mergeable() -> None:
     assert projected_label(state) == "forge:mergeable"
 
 
+@pytest.mark.parametrize(
+    ("stage", "outcome"),
+    [
+        (PipelineStage.EXECUTOR_REWORK, None),
+        (PipelineStage.CRITIC, StageOutcome.PASS),
+    ],
+)
+def test_terminal_ci_failure_at_rework_limit_projects_failed(
+    stage: PipelineStage,
+    outcome: StageOutcome | None,
+) -> None:
+    state = ProjectionState(
+        stage,
+        "done",
+        outcome,
+        False,
+        3,
+        current_head_failed=True,
+    )
+
+    assert projected_label(state) == "forge:failed"
+
+
+def test_head_cannot_be_green_and_failed_at_once() -> None:
+    state = ProjectionState(
+        PipelineStage.CRITIC,
+        "done",
+        StageOutcome.PASS,
+        True,
+        3,
+        current_head_failed=True,
+    )
+
+    with pytest.raises(ValueError, match="green|failed"):
+        projected_label(state)
+
+
 @pytest.mark.parametrize("outcome", [StageOutcome.REJECT, StageOutcome.DEFECT_FOUND])
 def test_rework_limit_projects_failed(outcome: StageOutcome) -> None:
     state = ProjectionState(

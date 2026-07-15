@@ -16,6 +16,7 @@ class ProjectionState:
     outcome: StageOutcome | None
     current_head_green: bool
     rework_count: int
+    current_head_failed: bool = False
 
 
 def projected_label(snapshot: ProjectionState, max_reworks: int = 3) -> str | None:
@@ -41,6 +42,10 @@ def projected_label(snapshot: ProjectionState, max_reworks: int = 3) -> str | No
         raise ValueError("outcome must be a StageOutcome or None")
     if not isinstance(snapshot.current_head_green, bool):
         raise ValueError("current_head_green must be a boolean")
+    if not isinstance(snapshot.current_head_failed, bool):
+        raise ValueError("current_head_failed must be a boolean")
+    if snapshot.current_head_green and snapshot.current_head_failed:
+        raise ValueError("current HEAD cannot be both green and failed")
     if (
         not isinstance(snapshot.rework_count, int)
         or isinstance(snapshot.rework_count, bool)
@@ -55,6 +60,22 @@ def projected_label(snapshot: ProjectionState, max_reworks: int = 3) -> str | No
         return "forge:blocked"
     if status == "failed":
         return "forge:failed"
+
+    if snapshot.current_head_failed:
+        if status != "done" or snapshot.stage not in {
+            PipelineStage.EXECUTOR,
+            PipelineStage.EXECUTOR_REWORK,
+            PipelineStage.CRITIC,
+        }:
+            raise ValueError("current HEAD failure is invalid for this frontier")
+        if (
+            snapshot.stage is PipelineStage.CRITIC
+            and snapshot.outcome is not StageOutcome.PASS
+        ):
+            raise ValueError("current HEAD failure requires a critic pass")
+        if snapshot.rework_count >= max_reworks:
+            return "forge:failed"
+        return "forge:need-execution"
 
     needs_rework = snapshot.outcome in {
         StageOutcome.REJECT,

@@ -20,11 +20,12 @@ metadata:
    - `source_digest`, `pr_url`, `bound_head_sha`를 별도로 기록한다.
    - `gh pr view <pr_url> --json url,headRefOid,state,isDraft`로 PR이 open/non-draft이며 현재 HEAD가 `bound_head_sha`와 같은지 확인한다.
    - URL 또는 HEAD가 다르거나 영수증 필드가 없으면 품질 반려가 아니라 protocol violation이다. 사유를 남기고 `kanban_block`한다.
-2. **1차 임무 — 델타 대조**: 상위 executor의 핸드오프를 읽고 실제 diff(`gh pr diff <pr_url>` 또는 고정된 HEAD의 git diff)와 대조한다.
+2. **1차 임무 — 조상 델타 대조**: 카드의 `source_task_id`에서 parent chain을 루트 방향으로 따라가 **가장 가까운 executor 또는 executor-rework**의 exact 5-field 핸드오프(`pr_url`, `changed_files`, `implemented`, `not_implemented`, `verified_by`)를 읽고 실제 diff(`gh pr diff <pr_url>` 또는 고정된 HEAD의 git diff)와 대조한다. fresh reviewer의 직접 부모는 critic일 수 있으므로 직접 부모 summary를 executor handoff라고 가정하지 않는다.
    - implemented 항목이 diff에 실제로 존재하는가?
    - verified_by의 테스트 파일이 실존하고 해당 항목을 실제로 검증하는가?
    - diff에는 있는데 핸드오프에 없는 변경이 있는가?
    - 카드 AC 중 implemented와 not_implemented 양쪽에 모두 없는 항목은 반려 사유다.
+   - parent chain에서 가장 가까운 critic 조상(재작업 뒤에도 남은 모든 미해결 critic 조상 포함)의 `added_tests` 경로가 비어 있지 않고 **현재 HEAD에 모두 남아** 있으며 실제 테스트인지 확인한다. Update branch 또는 executor-rework 과정에서 테스트가 사라졌거나 무력화됐으면 reject한다.
 3. **2차 임무 — 스펙 대조**: PR diff를 카드의 수용 기준(AC)과 항목별로 대조한다.
 4. **바인딩 복사**: 카드의 `source_digest`와 `pr_url`을 결과의 같은 이름 필드에 그대로 복사하고, 카드의 `bound_head_sha`를 결과의 `head_sha`로 복사한다. 아래 예시 값을 그대로 쓰지 말고 카드 값을 한 글자도 바꾸지 않는다.
 5. **결과 제출**: summary에는 아래 exact field set 외의 필드를 넣지 않는다. `reject`도 정상적인 품질 판정이므로 `kanban_block`이 아니라 `kanban_complete`로 제출한다.
