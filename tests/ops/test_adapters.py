@@ -165,6 +165,31 @@ def test_store_ignores_only_exact_live_spec_002_legacy_stage_keys(
     assert store.ignored_legacy_count == 3
 
 
+def test_store_ignores_exact_live_spec_001_legacy_root_key(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    connection = _create_live_schema(db_path)
+    _insert_task(
+        connection,
+        task_id="legacy-root",
+        key="github-issue:immortal0900/INFINITY_FORGE#1",
+    )
+    _insert_task(
+        connection,
+        task_id="canonical-root",
+        key="github-issue:immortal0900/INFINITY_FORGE#2",
+    )
+    connection.commit()
+    connection.close()
+
+    store = HermesStore(db_path)
+    tasks = store.list_pipeline_tasks()
+
+    assert [task.task_id for task in tasks] == ["canonical-root"]
+    assert store.ignored_legacy_count == 1
+
+
 def test_store_preserves_canonical_parent_blocked_by_legacy_child(
     tmp_path: Path,
 ) -> None:
@@ -173,7 +198,7 @@ def test_store_preserves_canonical_parent_blocked_by_legacy_child(
     _insert_task(
         connection,
         task_id="root",
-        key="github-issue:immortal0900/INFINITY_FORGE#1",
+        key="github-issue:owner/repo#1",
     )
     _insert_task(
         connection,
