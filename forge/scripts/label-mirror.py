@@ -51,8 +51,9 @@ NOTIFY_LABEL = {
 ROOT_KEY_RE = re.compile(
     r"^github-issue:(?P<repository>[^#\s]+/[^#\s]+)#(?P<issue>[1-9][0-9]*)$"
 )
-LEGACY_ROOT_KEYS = frozenset(
+LEGACY_PIPELINE_KEYS = frozenset(
     {
+        "github-issue:immortal0900/INFINITY_FORGE#1",
         "github-issue:immortal0900/INFINITY_FORGE#3-exec",
         "github-issue:immortal0900/INFINITY_FORGE#3-review",
         "github-issue:immortal0900/INFINITY_FORGE#3-critic",
@@ -191,7 +192,7 @@ def cards_by_key() -> dict[str, dict[str, object]]:
     ) in rows:
         if not isinstance(key, str) or not key:
             raise ProjectionError("pipeline card has no idempotency key")
-        if key in LEGACY_ROOT_KEYS:
+        if key in LEGACY_PIPELINE_KEYS:
             continue
         if key in cards:
             raise ProjectionError(f"duplicate pipeline card key: {key}")

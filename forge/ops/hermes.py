@@ -21,8 +21,9 @@ class GateError(RuntimeError):
 _ROOT_KEY_RE = re.compile(
     r"^github-issue:[^/#:\s]+/[^/#:\s]+#[1-9][0-9]*$"
 )
-_LEGACY_STAGE_KEYS = frozenset(
+_LEGACY_PIPELINE_KEYS = frozenset(
     {
+        "github-issue:immortal0900/INFINITY_FORGE#1",
         "github-issue:immortal0900/INFINITY_FORGE#3-exec",
         "github-issue:immortal0900/INFINITY_FORGE#3-review",
         "github-issue:immortal0900/INFINITY_FORGE#3-critic",
@@ -98,7 +99,7 @@ class HermesStore:
         for row in rows:
             task_id = _require_text(row["id"], "task id")
             key = _require_text(row["idempotency_key"], "idempotency key")
-            if key in _LEGACY_STAGE_KEYS:
+            if key in _LEGACY_PIPELINE_KEYS:
                 ignored_legacy_ids.add(task_id)
                 if row["parent_id"] is not None:
                     topology_blocked_parent_ids.add(

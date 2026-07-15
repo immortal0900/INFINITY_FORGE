@@ -623,6 +623,14 @@ def test_cards_by_key_reads_root_stage_links_and_latest_run(tmp_path: Path) -> N
                 "github-issue:immortal0900/INFINITY_FORGE#3-review",
                 4,
             ),
+            (
+                "legacy-root",
+                "legacy-root",
+                None,
+                "done",
+                "github-issue:immortal0900/INFINITY_FORGE#1",
+                5,
+            ),
         ],
     )
     con.execute("INSERT INTO task_links VALUES ('root', 'reviewer')")
