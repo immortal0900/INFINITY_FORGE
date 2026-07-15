@@ -54,6 +54,16 @@ def test_original_notation_exception_is_limited_to_tokens_not_whole_prs() -> Non
     assert "본문 전체" not in line
 
 
+def test_original_notation_exception_does_not_override_title_or_body_rule() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    guideline = re.search(r"(?m)^자동 워커나 사람이 생성하는 PR 제목과 본문은 .+$", runbook)
+    assert guideline is not None
+    exception_clause = guideline.group(0).split("다만", maxsplit=1)[1]
+    assert "제목" not in exception_clause
+    assert "본문" not in exception_clause
+
+
 def test_github_submission_step_keeps_label_gate_after_language_rule() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
 
