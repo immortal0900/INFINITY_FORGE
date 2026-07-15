@@ -345,7 +345,7 @@ def _completed_stage_result(
     repository: str,
 ) -> StageResult:
     terminal_run = (card.get("run_status"), card.get("run_outcome"))
-    if terminal_run not in {("done", "completed"), ("completed", "success")}:
+    if terminal_run not in {("done", "completed"), ("completed", "completed")}:
         raise ProjectionError(
             f"{stage.value} result has no successful completed run"
         )
