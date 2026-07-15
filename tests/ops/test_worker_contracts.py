@@ -6,6 +6,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from forge.ops.contracts import (
     CRITIC_RESULT_OPTIONAL_FIELDS,
     CRITIC_RESULT_REQUIRED_FIELDS,
@@ -32,6 +34,30 @@ def _result_examples(skill: str, schema_version: str) -> list[dict[str, object]]
         if payload.get("schema_version") == schema_version:
             examples.append(payload)
     return examples
+
+
+def _json_examples(skill: str) -> list[dict[str, object]]:
+    return [
+        json.loads(block)
+        for block in re.findall(r"```json\s*(\{.*?\})\s*```", skill, flags=re.DOTALL)
+    ]
+
+
+def test_executor_example_matches_parser_exactly() -> None:
+    skill = _skill("kanban-codex-delegate")
+    expected = {
+        "pr_url",
+        "changed_files",
+        "implemented",
+        "not_implemented",
+        "verified_by",
+    }
+    examples = [value for value in _json_examples(skill) if set(value) == expected]
+
+    assert len(examples) == 1
+    parse_stage_result(PipelineStage.EXECUTOR, examples[0], {})
+    assert "PR URL 또는 null" not in skill
+    assert "JSON 앞뒤 산문" in skill
 
 
 def test_reviewer_examples_match_parser_exactly() -> None:
@@ -108,3 +134,31 @@ def test_rework_executor_injects_parent_reflection_into_codex_instruction() -> N
         skill,
         flags=re.IGNORECASE | re.DOTALL,
     )
+
+
+@pytest.mark.parametrize(
+    "skill_name",
+    ["critic-adversarial", "kanban-codex-delegate"],
+)
+def test_mutating_stage_uses_bound_head_task_worktree(skill_name: str) -> None:
+    skill = _skill(skill_name)
+
+    for required in (
+        "headRefName",
+        "headRefOid",
+        "worktree add",
+        "status --porcelain",
+        "merge-base --is-ancestor",
+        "result_head_sha",
+    ):
+        assert required in skill
+    assert "HEAD:<PR_HEAD_BRANCH>" in skill
+
+
+def test_rework_records_base_only_after_bound_checkout() -> None:
+    skill = _skill("kanban-codex-delegate")
+
+    checkout = skill.index("worktree add")
+    clean_check = skill.index("status --porcelain", checkout)
+    base_record = skill.index(".forge-base-sha", clean_check)
+    assert checkout < clean_check < base_record
