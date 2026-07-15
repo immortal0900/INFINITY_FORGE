@@ -63,9 +63,20 @@ metadata:
    ```
    지시문에는 다음을 반드시 포함한다: "작업 종료 전에 워크스페이스 루트에 `handoff.json`을 작성하라 — 정확히 5필드 pr_url/changed_files/implemented/not_implemented/verified_by만 사용하고, pr_url은 생성·수정한 GitHub PR URL이어야 한다."
    `executor-rework` 지시문에는 `git push origin HEAD:<PR_HEAD_BRANCH>`로 기존 PR branch에만 push하고 새 PR을 만들지 말라는 규칙도 포함한다.
+   완성한 지시문은 file write 도구로 `$PROMPT_FILE`에 먼저 기록한다. **지시문 본문을 tmux 명령 문자열에 삽입하지 않는다.** tmux는 명령을 새 shell에서 다시 해석하므로 Markdown 백틱·`$()`·따옴표가 명령으로 실행될 수 있다. Codex CLI의 `-` 입력을 사용해 prompt 파일을 stdin으로 전달한다.
    반드시 OPENAI/CODEX 계열 env를 제거하고 스폰한다(hermes가 주입한 env가 있으면 codex가 ChatGPT 로그인 대신 API키 모드로 빠져 401이 난다):
    ```bash
-   tmux new-session -d -s task-<카드ID> 'cd "$WORKSPACE" && env -u OPENAI_API_KEY -u OPENAI_BASE_URL -u OPENAI_ORG_ID -u CODEX_API_KEY codex exec --skip-git-repo-check "<지시문>" > ~/.hermes/kanban/logs/<카드ID>-codex.log 2>&1'
+   TASK_ID="<카드ID>"
+   case "$TASK_ID" in *[!A-Za-z0-9_-]*) echo "invalid task id" >&2; exit 2 ;; esac
+   PROMPT_FILE="/tmp/forge-${TASK_ID}-codex-prompt.txt"
+   LOG_FILE="/home/ubuntu/.hermes/kanban/logs/${TASK_ID}-codex.log"
+   test -s "$PROMPT_FILE"
+   test -d "$(dirname "$LOG_FILE")"
+   chmod 600 "$PROMPT_FILE"
+   printf -v TMUX_COMMAND \
+     'exec env -u OPENAI_API_KEY -u OPENAI_BASE_URL -u OPENAI_ORG_ID -u CODEX_API_KEY codex exec --skip-git-repo-check - < %q > %q 2>&1' \
+     "$PROMPT_FILE" "$LOG_FILE"
+   tmux new-session -d -s "task-${TASK_ID}" -c "$WORKSPACE" "$TMUX_COMMAND"
    ```
    스폰 전 `codex login status`가 "Logged in using ChatGPT"인지 확인하고, 401이 나면 로그의 인증 관련 줄을 comment로 남겨라.
    참고: VPS의 ~/.codex/config.toml에 `sandbox_mode = "danger-full-access"`가 설정되어 있어(2026-07-10 결정) 1차 시도부터 파일 쓰기가 된다. 샌드박스 오류가 다시 보이면 bypass 재시도로 토큰을 태우지 말고 오류 줄을 comment로 보고하라.
