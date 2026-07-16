@@ -1,6 +1,6 @@
 #!/bin/bash
 # INFINITY_FORGE spec-coverage — 스펙 레지스트리 ↔ GitHub 이슈 대조 (LLM 0)
-# 출력: "커버리지 N/M (미대응: ...)" 한 줄. canary·morning-report가 호출.
+# 출력: "커버리지 N/M (미대응: ...)" 한 줄. system check·morning report가 호출.
 # 레지스트리: 레포의 forge/spec-registry.md — "SPEC-NNN | 제목" 형식 행
 set -u
 REG=~/work/INFINITY_FORGE/forge/spec-registry.md

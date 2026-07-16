@@ -1,27 +1,206 @@
 #!/bin/bash
-# INFINITY_FORGE — VPS 쪽 배포 스크립트 (git pull → hermes 자산 반영)
-# 실행 위치: VPS의 레포 clone(~/work/INFINITY_FORGE). 크론/수동 모두 가능.
+# INFINITY_FORGE — 서버의 검증된 main 커밋과 Hermes 자산을 반영합니다.
+# 실행 위치: 서버의 INFINITY_FORGE clone. 로컬 변경은 운영자가 먼저 보관해야 합니다.
 set -euo pipefail
-# main 함수로 전체를 감싼다: git pull이 이 파일 자신을 덮어써도,
-# bash가 함수 정의를 먼저 통째로 파싱하므로 실행 중인 버전은 안 바뀐다(자기갱신 안전).
+# main 함수로 전체를 감싸서 fast-forward가 이 파일을 갱신해도 현재 실행을 안전하게 끝낸다.
 main() {
 REPO_DIR="${FORGE_REPO_DIR:-$HOME/work/INFINITY_FORGE}"
 cd "$REPO_DIR"
 
-# pull이 이 스크립트 자신을 갱신할 수 있으므로, pull 후 새 버전으로 재실행(exec).
-# --post-pull 플래그가 있으면 이미 새 버전이므로 배포 단계로 직행.
-if [ "${1:-}" != "--post-pull" ]; then
-  echo "[deploy] git pull..."
-  git pull --rebase --autostash
-  exec bash "$REPO_DIR/forge/scripts/deploy-vps.sh" --post-pull
+if ! printf '%s\n' "${FORGE_EXPECTED_COMMIT:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "[deploy] FORGE_EXPECTED_COMMIT must be a full Git commit ID" >&2
+  exit 1
 fi
 
-echo "[deploy] skills → hermes 프로필..."
-# 공용 스킬: 게이트웨이(기본) + 워커 4프로필
+CURRENT_BRANCH="$(git symbolic-ref --short HEAD)"
+if [ "$CURRENT_BRANCH" != "main" ]; then
+  echo "[deploy] server repository must be on main" >&2
+  exit 1
+fi
+WORKTREE_CHANGES="$(git status --porcelain=v1 --untracked-files=all)"
+if [ -n "$WORKTREE_CHANGES" ]; then
+  echo "[deploy] server repository is not clean; create a manual named stash before deployment" >&2
+  printf '%s\n' "$WORKTREE_CHANGES" >&2
+  exit 1
+fi
+
+# 요청된 origin/main 커밋만 fast-forward한 뒤 갱신된 스크립트를 한 번 재실행한다.
+if [ "${1:-}" != "--post-update" ]; then
+  git fetch origin main --quiet
+  FETCHED_MAIN="$(git rev-parse origin/main)"
+  if [ "$FETCHED_MAIN" != "$FORGE_EXPECTED_COMMIT" ]; then
+    echo "[deploy] requested commit is not the fetched origin/main" >&2
+    exit 1
+  fi
+  if ! git merge-base --is-ancestor HEAD "$FORGE_EXPECTED_COMMIT"; then
+    echo "[deploy] server main cannot fast-forward to the requested commit" >&2
+    exit 1
+  fi
+  git merge --ff-only "$FORGE_EXPECTED_COMMIT"
+  [ -z "$(git status --porcelain=v1 --untracked-files=all)" ] || {
+    echo "[deploy] repository changed unexpectedly during fast-forward" >&2
+    exit 1
+  }
+  exec bash "$REPO_DIR/forge/scripts/deploy-vps.sh" --post-update
+fi
+
+DEPLOYED_COMMIT="$(git rev-parse HEAD)"
+if [ "$DEPLOYED_COMMIT" != "$FORGE_EXPECTED_COMMIT" ]; then
+  echo "[deploy] expected commit is not checked out" >&2
+  exit 1
+fi
+
+HERMES_ROOT="$HOME/.hermes/hermes-agent"
+HERMES_PY="$HERMES_ROOT/venv/bin/python"
+HERMES_BIN="$HERMES_ROOT/venv/bin/hermes"
+GH_BIN="${INFINITY_FORGE_GH_PATH:-/usr/bin/gh}"
+[ -x "$HERMES_PY" ] || { echo "[deploy] Hermes Python is missing" >&2; exit 1; }
+[ -x "$HERMES_BIN" ] || { echo "[deploy] Hermes command is missing" >&2; exit 1; }
+[ -x "$GH_BIN" ] || { echo "[deploy] GitHub command is missing" >&2; exit 1; }
+
+REPOSITORY="${INFINITY_FORGE_REPOSITORY:-$($GH_BIN repo view --json nameWithOwner --jq .nameWithOwner)}"
+TASK_DATA_DIR="${INFINITY_FORGE_TASK_DATA_DIR:-$HOME/.hermes/infinity-forge}"
+TASK_SETTINGS_DB="$TASK_DATA_DIR/task-settings.db"
+CONFIRMED_TASKS_DB="$TASK_SETTINGS_DB.task-outbox.db"
+HERMES_DB="$HOME/.hermes/kanban.db"
+mkdir -p "$TASK_DATA_DIR"
+
+MANAGED_TIMERS="ledger stage mirror canary drift morning merge flush messages"
+ACTIVE_TIMERS=""
+ENABLED_TIMERS=""
+GATEWAY_WAS_ACTIVE=false
+if systemctl --user is-active hermes-gateway >/dev/null 2>&1; then
+  GATEWAY_WAS_ACTIVE=true
+fi
+CHANGE_PACKAGE_ROOT="$TASK_DATA_DIR/hermes-user-turn-changes"
+PACKAGE_TEMP=""
+HERMES_SOURCE_TEMP=""
+restore_runtime_after_error() {
+  STATUS=$?
+  if [ -n "$PACKAGE_TEMP" ]; then
+    case "$PACKAGE_TEMP" in
+      "$CHANGE_PACKAGE_ROOT"/.build-*) rm -rf -- "$PACKAGE_TEMP" ;;
+    esac
+  fi
+  if [ -n "$HERMES_SOURCE_TEMP" ]; then
+    case "$HERMES_SOURCE_TEMP" in
+      "$CHANGE_PACKAGE_ROOT"/.source-*) rm -rf -- "$HERMES_SOURCE_TEMP" ;;
+    esac
+  fi
+  if [ "$STATUS" -ne 0 ]; then
+    systemctl --user stop hermes-gateway >/dev/null 2>&1 || true
+    for T in $MANAGED_TIMERS; do
+      systemctl --user stop "forge-$T.timer" >/dev/null 2>&1 || true
+      case " $ENABLED_TIMERS " in
+        *" $T "*) systemctl --user enable "forge-$T.timer" >/dev/null 2>&1 || true ;;
+        *) systemctl --user disable "forge-$T.timer" >/dev/null 2>&1 || true ;;
+      esac
+    done
+    if [ "$GATEWAY_WAS_ACTIVE" = true ]; then
+      systemctl --user start hermes-gateway >/dev/null 2>&1 || true
+    fi
+    for T in $ACTIVE_TIMERS; do
+      systemctl --user start "forge-$T.timer" >/dev/null 2>&1 || true
+    done
+  fi
+  return "$STATUS"
+}
+trap restore_runtime_after_error EXIT
+for T in $MANAGED_TIMERS; do
+  if systemctl --user is-active "forge-$T.timer" >/dev/null 2>&1; then
+    ACTIVE_TIMERS="$ACTIVE_TIMERS $T"
+  fi
+  if systemctl --user is-enabled "forge-$T.timer" >/dev/null 2>&1; then
+    ENABLED_TIMERS="$ENABLED_TIMERS $T"
+  fi
+  systemctl --user stop "forge-$T.timer" >/dev/null 2>&1 || true
+  systemctl --user stop "forge-$T.service" >/dev/null 2>&1 || true
+done
+systemctl --user stop hermes-gateway >/dev/null 2>&1 || true
+
+# OLD_PROFILE_MIGRATION_BEGIN: workers are stopped before the final old-Task check.
+LEGACY_ACTIVE=$(HERMES_DB="$HERMES_DB" "$HERMES_PY" -c \
+  "import os, sqlite3; db=os.environ['HERMES_DB']; connection=sqlite3.connect(f'file:{db}?mode=ro', uri=True); print(connection.execute(\"SELECT count(*) FROM tasks WHERE status NOT IN ('done','failed','cancelled') AND (coalesce(idempotency_key,'') LIKE 'github-issue:%' OR coalesce(idempotency_key,'') LIKE 'forge-stage:%' OR assignee IN ('executor','critic','issuefinder'))\").fetchone()[0])")
+if [ "$LEGACY_ACTIVE" -ne 0 ]; then
+  echo "[deploy] old Tasks are still active; profile change stopped" >&2
+  exit 1
+fi
+# OLD_PROFILE_MIGRATION_END
+
+echo "[deploy] Hermes user-turn chooser..."
+HERMES_SOURCE_VERSION="$(git -C "$HERMES_ROOT" rev-parse HEAD)"
+if ! printf '%s\n' "$HERMES_SOURCE_VERSION" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "[deploy] Hermes source version is not a full Git commit ID" >&2
+  exit 1
+fi
+mkdir -p "$CHANGE_PACKAGE_ROOT"
+CHANGE_PACKAGE_VERSION="${FORGE_EXPECTED_COMMIT}-${HERMES_SOURCE_VERSION}"
+CHANGE_PACKAGE="$CHANGE_PACKAGE_ROOT/$CHANGE_PACKAGE_VERSION"
+if [ ! -f "$CHANGE_PACKAGE/installed-files-list.json" ]; then
+  if [ -e "$CHANGE_PACKAGE" ]; then
+    echo "[deploy] incomplete Hermes change package already exists" >&2
+    exit 1
+  fi
+  HERMES_SOURCE_TEMP="$(mktemp -d "$CHANGE_PACKAGE_ROOT/.source-$CHANGE_PACKAGE_VERSION.XXXXXX")"
+  git -C "$HERMES_ROOT" archive "$HERMES_SOURCE_VERSION" | tar -x -C "$HERMES_SOURCE_TEMP"
+  PACKAGE_TEMP="$(mktemp -d "$CHANGE_PACKAGE_ROOT/.build-$CHANGE_PACKAGE_VERSION.XXXXXX")"
+  "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" build \
+    --hermes-root "$HERMES_SOURCE_TEMP" \
+    --package "$PACKAGE_TEMP" \
+    --source-version "$CHANGE_PACKAGE_VERSION"
+  rm -rf -- "$HERMES_SOURCE_TEMP"
+  HERMES_SOURCE_TEMP=""
+  # 같은 파일시스템 안의 rename으로 완성된 패키지만 공개한다.
+  mv -T "$PACKAGE_TEMP" "$CHANGE_PACKAGE"
+  PACKAGE_TEMP=""
+fi
+EXPECTED_PACKAGE_VERSION="$CHANGE_PACKAGE_VERSION" CHANGE_PACKAGE="$CHANGE_PACKAGE" "$HERMES_PY" -c \
+  'import json, os, pathlib; payload=json.loads((pathlib.Path(os.environ["CHANGE_PACKAGE"]) / "installed-files-list.json").read_text(encoding="utf-8")); assert payload["source_version"] == os.environ["EXPECTED_PACKAGE_VERSION"]'
+"$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" install \
+  --hermes-root "$HERMES_ROOT" \
+  --package "$CHANGE_PACKAGE"
+PLUGIN_DIR="$HOME/.hermes/plugins/infinity-forge"
+mkdir -p "$PLUGIN_DIR"
+install -m 644 forge/hermes_plugin/infinity_forge/plugin.yaml "$PLUGIN_DIR/plugin.yaml"
+install -m 644 forge/hermes_plugin/infinity_forge/__init__.py "$PLUGIN_DIR/__init__.py"
+PYTHONPATH="$REPO_DIR" "$HERMES_PY" -m hermes_cli.main plugins enable infinity-forge
+TASK_SETTINGS_DB="$TASK_SETTINGS_DB" PYTHONPATH="$REPO_DIR" "$HERMES_PY" -c \
+  "import os; from forge.ops.task_settings import TaskSettingsStore; from forge.ops.task_outbox import TaskOutbox, task_outbox_path; store=TaskSettingsStore(os.environ['TASK_SETTINGS_DB']); TaskOutbox(task_outbox_path(store.database_path))"
+
+echo "[deploy] four Task profiles..."
+profile() { "$HERMES_PY" -m hermes_cli.main profile "$@"; }
+# OLD_PROFILE_MIGRATION_BEGIN: remove only the superseded profile IDs.
+if [ -d "$HOME/.hermes/profiles/executor" ] && [ ! -d "$HOME/.hermes/profiles/builder" ]; then
+  profile rename executor builder
+fi
+if [ -d "$HOME/.hermes/profiles/critic" ] && [ ! -d "$HOME/.hermes/profiles/deep_checker" ]; then
+  profile rename critic deep_checker
+fi
+if [ ! -d "$HOME/.hermes/profiles/builder" ]; then
+  profile create builder --clone-from reviewer --no-alias
+fi
+if [ ! -d "$HOME/.hermes/profiles/deep_checker" ]; then
+  profile create deep_checker --clone-from reviewer --no-alias
+fi
+if [ ! -d "$HOME/.hermes/profiles/fix" ]; then
+  profile create fix --clone-from builder --no-alias
+fi
+for OLD_PROFILE in executor critic issuefinder; do
+  if [ -d "$HOME/.hermes/profiles/$OLD_PROFILE" ]; then
+    profile delete "$OLD_PROFILE" --yes
+  fi
+done
+# OLD_PROFILE_MIGRATION_END
+for P in builder reviewer deep_checker fix; do
+  mkdir -p "$HOME/.hermes/profiles/$P/skills" "$HOME/.hermes/profiles/$P/home/.config"
+done
+
+echo "[deploy] skills → Hermes profiles..."
+# 공용 스킬: 게이트웨이(기본) + 네 작업 역할
 for S in forge-ops memex code-design-principles forge-labels; do
   [ -d "forge/skills/$S" ] || continue
   cp -r "forge/skills/$S" ~/.hermes/skills/
-  for P in issuefinder executor reviewer critic; do
+  for P in builder reviewer deep_checker fix; do
     cp -r "forge/skills/$S" ~/.hermes/profiles/$P/skills/
   done
 done
@@ -29,22 +208,22 @@ done
 for S in easy-answer code-problem-doc; do
   [ -d "forge/skills/$S" ] && cp -r "forge/skills/$S" ~/.hermes/skills/
 done
-# reviewer 추가 (반려 리포트 문서화)
+# reviewer 추가 (문제 리포트 문서화)
 [ -d forge/skills/code-problem-doc ] && cp -r forge/skills/code-problem-doc ~/.hermes/profiles/reviewer/skills/
 # 역할 전용 스킬
-[ -d forge/skills/kanban-codex-delegate ] && cp -r forge/skills/kanban-codex-delegate ~/.hermes/profiles/executor/skills/
-[ -d forge/skills/reviewer-verdict ]     && cp -r forge/skills/reviewer-verdict     ~/.hermes/profiles/reviewer/skills/
-[ -d forge/skills/critic-adversarial ]   && cp -r forge/skills/critic-adversarial   ~/.hermes/profiles/critic/skills/
-[ -d forge/skills/issue-finder-sot ]     && cp -r forge/skills/issue-finder-sot     ~/.hermes/profiles/issuefinder/skills/
+[ -d forge/skills/build-task ]  && cp -r forge/skills/build-task  ~/.hermes/profiles/builder/skills/
+[ -d forge/skills/review-task ] && cp -r forge/skills/review-task ~/.hermes/profiles/reviewer/skills/
+[ -d forge/skills/deep-check ]  && cp -r forge/skills/deep-check  ~/.hermes/profiles/deep_checker/skills/
+[ -d forge/skills/fix-task ]    && cp -r forge/skills/fix-task    ~/.hermes/profiles/fix/skills/
 
 echo "[deploy] 프로필 home 인증 링크 보정 (codex·gh·git)..."
 # hermes 프로필은 자체 HOME(~/.hermes/profiles/<P>/home)으로 실행되어
 # 실계정의 ~/.codex(코덱스 로그인)·~/.config/gh(gh 인증)·~/.gitconfig가 안 보인다 → symlink로 연결
-for P in issuefinder executor reviewer critic; do
+for P in builder reviewer deep_checker fix; do
   PH=~/.hermes/profiles/$P/home
   mkdir -p "$PH/.config"
   # 주의: 대상이 이미 '실제 디렉토리'면 ln -sfn이 그 안에 링크를 만들어버린다 → 치우고 링크
-  for PAIR in ".codex:/home/ubuntu/.codex" ".config/gh:/home/ubuntu/.config/gh" ".gitconfig:/home/ubuntu/.gitconfig"; do
+  for PAIR in ".codex:$HOME/.codex" ".config/gh:$HOME/.config/gh" ".gitconfig:$HOME/.gitconfig"; do
     DST="$PH/${PAIR%%:*}"; SRC="${PAIR#*:}"
     if [ -e "$DST" ] && [ ! -L "$DST" ]; then mv "$DST" "$DST.bak.$(date +%s)"; fi
     ln -sfn "$SRC" "$DST"
@@ -53,26 +232,28 @@ done
 
 echo "[deploy] hooks·scripts → ~/forge..."
 mkdir -p ~/forge/hooks
-[ -f forge/hooks/codex-stop-gate.sh ] && install -m 755 forge/hooks/codex-stop-gate.sh ~/forge/hooks/
-[ -f forge/scripts/flush-outbox.py ] && install -m 755 forge/scripts/flush-outbox.py ~/forge/
+[ -f forge/hooks/codex-work-check.sh ] && install -m 755 forge/hooks/codex-work-check.sh ~/forge/hooks/
 [ -f forge/scripts/nightly-backup.sh ] && install -m 755 forge/scripts/nightly-backup.sh ~/backups/
-for S in ledger-emit.py canary.sh drift-audit.sh spec-coverage.sh morning-report.sh; do
+for S in activity-log-writer.py send-pending-messages.py system-check.sh state-mismatch-check.sh spec-coverage.sh morning-report.sh; do
   [ -f "forge/scripts/$S" ] && install -m 755 "forge/scripts/$S" ~/forge/
 done
 
 echo "[deploy] systemd 타이머 설치..."
 UD=~/.config/systemd/user
 mkdir -p "$UD"
+systemctl --user disable --now forge-messages.timer >/dev/null 2>&1 || true
+rm -f "$UD/forge-messages.service" "$UD/forge-messages.timer"
 [ -x /usr/bin/flock ] || { echo "[deploy] /usr/bin/flock 누락" >&2; exit 1; }
-PIPELINE_LOCK="/usr/bin/flock --nonblock --conflict-exit-code 0 %t/forge-pipeline.lock"
-mkunit() { # $1=이름 $2=ExecStart $3=OnCalendar/OnUnitActiveSec 지시어 전체
+PROCESS_LOCK="/usr/bin/flock --nonblock --conflict-exit-code 0 %t/forge-pipeline.lock"
+mkunit() { # $1=기존 unit ID $2=ExecStart $3=일정 $4=쉬운 설명 $5=추가 Environment
   cat > "$UD/forge-$1.service" << UNIT
 [Unit]
-Description=INFINITY_FORGE $1
+Description=INFINITY_FORGE $4
 [Service]
 Type=oneshot
-Environment=PATH=/home/ubuntu/.hermes/node/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$HOME/.hermes/hermes-agent/venv/bin:$HOME/.hermes/hermes-agent/node_modules/.bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONPATH=$REPO_DIR
+${5:-}
 WorkingDirectory=$REPO_DIR
 ExecStart=$2
 UNIT
@@ -87,19 +268,55 @@ Persistent=true
 WantedBy=timers.target
 UNIT
 }
-mkunit ledger  "/usr/bin/python3 /home/ubuntu/forge/ledger-emit.py"   "OnCalendar=*:0/10"
-# 같은 oneshot unit은 systemd가 중첩 실행하지 않는다. 두 pipeline unit은 공유
-# runtime lock과 30초 간격을 쓰며 stage의 결정적 idempotency key가 replay를 막는다.
-mkunit stage  "$PIPELINE_LOCK /usr/bin/python3 $REPO_DIR/forge/scripts/stage-reconciler.py" "OnCalendar=*-*-* *:*:00"
-mkunit mirror  "$PIPELINE_LOCK /usr/bin/python3 $REPO_DIR/forge/scripts/label-mirror.py"    "OnCalendar=*-*-* *:*:30"
-mkunit canary  "/bin/bash /home/ubuntu/forge/canary.sh"               "OnCalendar=*-*-* 00/6:00:00 Asia/Seoul"
-mkunit drift   "/bin/bash /home/ubuntu/forge/drift-audit.sh"          "OnCalendar=hourly"
-mkunit morning "/bin/bash /home/ubuntu/forge/morning-report.sh"       "OnCalendar=*-*-* 07:30:00 Asia/Seoul"
+# RISK(race): 기존 unit ID를 유지하고 모든 외부 writer를 같은 process lock으로
+# 직렬화해 이전·새 unit의 중복 실행과 SQLite/GitHub write 경쟁을 막는다.
+mkunit ledger  "$PROCESS_LOCK $HERMES_PY $REPO_DIR/forge/scripts/activity-log-writer.py"    "OnCalendar=*:0/10"                    "Activity Log Writer"
+mkunit stage  "$PROCESS_LOCK $HERMES_PY $REPO_DIR/forge/scripts/task-flow-worker.py --db $HERMES_DB --hermes $HERMES_BIN --gh $GH_BIN --settings-db $TASK_SETTINGS_DB --outbox $CONFIRMED_TASKS_DB --repo $REPOSITORY --workspace dir:$REPO_DIR" "OnCalendar=*-*-* *:*:00" "Task Flow Worker"
+mkunit mirror  "$PROCESS_LOCK $HERMES_PY $REPO_DIR/forge/scripts/issue-status-sync.py --db $HERMES_DB --gh $GH_BIN --settings-db $TASK_SETTINGS_DB --outbox $CONFIRMED_TASKS_DB --repo $REPOSITORY" "OnCalendar=*-*-* *:*:30" "Issue Status Sync"
+mkunit canary  "/bin/bash $HOME/forge/system-check.sh"                                          "OnCalendar=*-*-* 00/6:00:00 Asia/Seoul" "System Check"
+mkunit drift   "/bin/bash $HOME/forge/state-mismatch-check.sh"                                  "OnCalendar=hourly"                    "State Mismatch Check"
+mkunit morning "/bin/bash $HOME/forge/morning-report.sh"                                        "OnCalendar=*-*-* 07:30:00 Asia/Seoul" "Morning Report"
+mkunit merge  "$PROCESS_LOCK $HERMES_PY $REPO_DIR/forge/scripts/merge-worker.py --settings-db $TASK_SETTINGS_DB --outbox $CONFIRMED_TASKS_DB --hermes-db $HERMES_DB --gh $GH_BIN --repo $REPOSITORY --required-check eval --hermes $HERMES_BIN --workspace dir:$REPO_DIR" "OnCalendar=*-*-* *:*:15" "Merge Worker" "Environment=AUTO_MERGE_ENABLED=false"
+mkunit flush  "$PROCESS_LOCK $HERMES_PY $REPO_DIR/forge/scripts/send-pending-messages.py"   "OnCalendar=*-*-* *:*:45"             "Send Pending Messages"
 systemctl --user daemon-reload
-for T in ledger stage mirror canary drift morning; do systemctl --user enable --now "forge-$T.timer" > /dev/null; done
+for T in ledger stage mirror canary drift morning merge flush; do systemctl --user enable --now "forge-$T.timer" > /dev/null; done
+
+echo "[deploy] remove replaced files and skills..."
+# OLD_INSTALLATION_CLEANUP_BEGIN: fixed allowlist, safe to repeat.
+rm -f \
+  "$HOME/forge/canary.sh" \
+  "$HOME/forge/drift-audit.sh" \
+  "$HOME/forge/ledger-emit.py" \
+  "$HOME/forge/flush-outbox.py" \
+  "$HOME/forge/label-mirror.py" \
+  "$HOME/forge/hooks/codex-stop-gate.sh"
+for P in "$HOME/.hermes" \
+  "$HOME/.hermes/profiles/builder" \
+  "$HOME/.hermes/profiles/reviewer" \
+  "$HOME/.hermes/profiles/deep_checker" \
+  "$HOME/.hermes/profiles/fix"; do
+  rm -rf \
+    "$P/skills/kanban-codex-delegate" \
+    "$P/skills/reviewer-verdict" \
+    "$P/skills/critic-adversarial" \
+    "$P/skills/issue-finder-sot"
+done
+# OLD_INSTALLATION_CLEANUP_END
 
 echo "[deploy] 게이트웨이 스킬 리로드..."
+DROP_IN="$HOME/.config/systemd/user/hermes-gateway.service.d"
+mkdir -p "$DROP_IN"
+cat > "$DROP_IN/infinity-forge.conf" << UNIT
+[Service]
+Environment=PYTHONPATH=$REPO_DIR
+Environment=INFINITY_FORGE_REPOSITORY=$REPOSITORY
+Environment=INFINITY_FORGE_TASK_SETTINGS_DB=$TASK_SETTINGS_DB
+Environment=INFINITY_FORGE_GH_PATH=$GH_BIN
+UNIT
+systemctl --user daemon-reload
 systemctl --user restart hermes-gateway
+GATEWAY_WAS_ACTIVE=false
+trap - EXIT
 echo "[deploy] done: $(git rev-parse --short HEAD)"
 }
 main "$@"

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infinity-forge.local/schemas/deep-check-result-v1.schema.json",
+  "title": "Forge Deep Check Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {"const": "forge-deep-check-result/v1"},
+    "task_settings_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "result": {"enum": ["pass", "problems_found"]},
+    "source_result_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "pr_url": {
+      "type": "string",
+      "pattern": "^https://github\\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$"
+    },
+    "reviewed_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "tested_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "added_tests": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+    },
+    "tested_cases": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+    },
+    "fix_notes": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "pattern": "\\S"}
+      ]
+    }
+  },
+  "required": [
+    "format_version",
+    "task_settings_hash",
+    "result",
+    "source_result_hash",
+    "pr_url",
+    "reviewed_commit",
+    "tested_commit",
+    "added_tests",
+    "tested_cases",
+    "fix_notes"
+  ],
+  "allOf": [
+    {
+      "if": {"properties": {"result": {"const": "problems_found"}}},
+      "then": {
+        "properties": {
+          "fix_notes": {"type": "string", "minLength": 1, "pattern": "\\S"}
+        }
+      },
+      "else": {"properties": {"fix_notes": {"type": "null"}}}
+    }
+  ]
+}

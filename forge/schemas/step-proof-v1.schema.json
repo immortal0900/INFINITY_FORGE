@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infinity-forge.local/schemas/step-proof-v1.schema.json",
+  "title": "Forge Step Proof v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {"const": "forge-step-proof/v1"},
+    "tested_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "pr_url": {
+      "type": "string",
+      "pattern": "^https://github\\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$"
+    },
+    "fix_notes": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "pattern": "\\S"}
+      ]
+    },
+    "source_result_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source_run_id": {"type": "integer", "minimum": 1},
+    "source_task_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "task_settings_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "required": [
+    "format_version",
+    "tested_commit",
+    "pr_url",
+    "fix_notes",
+    "source_result_hash",
+    "source_run_id",
+    "source_task_id",
+    "task_settings_hash"
+  ]
+}

@@ -1,517 +1,315 @@
+from __future__ import annotations
+
 import json
-from dataclasses import fields
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
+import forge.ops as forge_ops
+import forge.ops.contracts as contracts
 from forge.ops.contracts import (
-    CheckRun,
+    BUILD_RESULT_REQUIRED_FIELDS,
+    DEEP_CHECK_RESULT_REQUIRED_FIELDS,
+    REVIEW_RESULT_REQUIRED_FIELDS,
+    STEP_PROOF_REQUIRED_FIELDS,
+    BuildResult,
     ContractError,
-    CRITIC_RESULT_OPTIONAL_FIELDS,
-    CRITIC_RESULT_REQUIRED_FIELDS,
-    CriticResult,
-    ExecutorResult,
-    PipelineStage,
-    PullRequestSnapshot,
-    REVIEWER_RESULT_OPTIONAL_FIELDS,
-    REVIEWER_RESULT_REQUIRED_FIELDS,
-    ReviewerResult,
-    RunRecord,
-    StageOutcome,
-    TaskRecord,
-    parse_stage_result,
-    transition_digest,
-    validate_stage_result_binding,
+    DeepCheckDecision,
+    DeepCheckResult,
+    ReviewDecision,
+    ReviewResult,
+    StepProof,
+    parse_build_result,
+    parse_deep_check_result,
+    parse_review_result,
+    parse_step_proof,
+    parse_task_result,
+    source_result_hash,
+    task_result_payload,
+    validate_task_result_binding,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PR_URL = "https://github.com/owner/repo/pull/7"
-SOURCE_DIGEST = "a" * 64
-HEAD_SHA = "b" * 40
-RESULT_HEAD_SHA = "c" * 40
+SETTINGS_HASH = "a" * 64
+SOURCE_HASH = "b" * 64
+PR_URL = "https://github.com/owner/repo/pull/17"
+BUILT_COMMIT = "c" * 40
+BUILT_BASE_COMMIT = "e" * 40
+TESTED_COMMIT = "d" * 40
 
 
-def executor_summary(**overrides: object) -> dict[str, object]:
+def build_summary(**overrides: object) -> dict[str, object]:
     summary: dict[str, object] = {
+        "format_version": "forge-build-result/v1",
+        "task_settings_hash": SETTINGS_HASH,
         "pr_url": PR_URL,
-        "changed_files": ["forge/ops/contracts.py"],
-        "implemented": ["AC1"],
-        "not_implemented": [],
-        "verified_by": {"AC1": "tests/ops/test_contracts.py"},
+        "built_base_commit": BUILT_BASE_COMMIT,
+        "built_commit": BUILT_COMMIT,
+        "changed_files": ["forge/ops/task_flow.py"],
+        "completed_items": ["AC1"],
+        "remaining_items": [],
+        "checks_by_item": {"AC1": "tests/ops/test_task_flow.py::test_ac1"},
     }
     summary.update(overrides)
     return summary
 
 
-def reviewer_summary(**overrides: object) -> dict[str, object]:
+def review_summary(**overrides: object) -> dict[str, object]:
     summary: dict[str, object] = {
-        "schema_version": "forge-reviewer-result/v1",
-        "verdict": "approve",
-        "source_digest": SOURCE_DIGEST,
+        "format_version": "forge-review-result/v1",
+        "task_settings_hash": SETTINGS_HASH,
+        "result": "approve",
+        "source_result_hash": SOURCE_HASH,
         "pr_url": PR_URL,
-        "head_sha": HEAD_SHA,
-        "delta_check": {
-            "implemented_verified": ["AC1"],
-            "discrepancies": [],
-        },
-        "spec_check": {"met": ["AC1"], "unmet": []},
+        "reviewed_commit": BUILT_COMMIT,
+        "change_check": {"confirmed_work": ["AC1"], "problems": []},
+        "requirements_check": {"completed": ["AC1"], "missing": []},
+        "fix_notes": None,
     }
     summary.update(overrides)
     return summary
 
 
-def critic_summary(**overrides: object) -> dict[str, object]:
+def deep_check_summary(**overrides: object) -> dict[str, object]:
     summary: dict[str, object] = {
-        "schema_version": "forge-critic-result/v1",
-        "outcome": "pass",
-        "source_digest": SOURCE_DIGEST,
+        "format_version": "forge-deep-check-result/v1",
+        "task_settings_hash": SETTINGS_HASH,
+        "result": "pass",
+        "source_result_hash": SOURCE_HASH,
         "pr_url": PR_URL,
-        "reviewed_head_sha": HEAD_SHA,
-        "result_head_sha": RESULT_HEAD_SHA,
-        "added_tests": ["tests/test_edge_case.py"],
-        "scenarios": ["empty input", "retry", "contract mismatch"],
+        "reviewed_commit": BUILT_COMMIT,
+        "tested_commit": TESTED_COMMIT,
+        "added_tests": ["tests/ops/test_task_flow.py"],
+        "tested_cases": ["empty input"],
+        "fix_notes": None,
     }
     summary.update(overrides)
     return summary
 
 
-def test_public_record_types_are_dataclasses() -> None:
-    assert {field.name for field in fields(TaskRecord)} >= {"task_id", "status"}
-    assert {field.name for field in fields(RunRecord)} >= {
-        "run_id",
-        "task_id",
-        "summary",
-        "metadata",
+def step_proof_summary(**overrides: object) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "format_version": "forge-step-proof/v1",
+        "tested_commit": TESTED_COMMIT,
+        "pr_url": PR_URL,
+        "fix_notes": None,
+        "source_result_hash": SOURCE_HASH,
+        "source_run_id": 12,
+        "source_task_id": "t_build_12",
+        "task_settings_hash": SETTINGS_HASH,
     }
-    assert {field.name for field in fields(PullRequestSnapshot)} >= {
-        "pr_url",
-        "head_sha",
-        "checks",
+    summary.update(overrides)
+    return summary
+
+
+def test_parsers_accept_only_the_new_exact_result_shapes() -> None:
+    build = parse_build_result(build_summary())
+    review = parse_review_result(review_summary())
+    deep_check = parse_deep_check_result(deep_check_summary())
+    proof = parse_step_proof(step_proof_summary())
+
+    assert isinstance(build, BuildResult)
+    assert build.built_base_commit == BUILT_BASE_COMMIT
+    assert build.built_commit == BUILT_COMMIT
+    assert isinstance(review, ReviewResult)
+    assert review.result is ReviewDecision.APPROVE
+    assert isinstance(deep_check, DeepCheckResult)
+    assert deep_check.result is DeepCheckDecision.PASS
+    assert isinstance(proof, StepProof)
+    assert proof.source_run_id == 12
+
+
+def test_old_stage_symbols_are_not_part_of_any_public_export() -> None:
+    old_symbols = {
+        "PipelineStage",
+        "StageOutcome",
+        "StageResult",
+        "ExecutorResult",
+        "ReviewerResult",
+        "CriticResult",
+        "parse_stage_result",
+        "validate_stage_result_binding",
     }
-    assert {field.name for field in fields(CheckRun)} == {
-        "name",
-        "status",
-        "conclusion",
-        "head_sha",
-    }
+
+    assert old_symbols.isdisjoint(contracts.__all__)
+    assert old_symbols.isdisjoint(forge_ops.__all__)
+    assert all(not hasattr(contracts, name) for name in old_symbols)
+    assert all(not hasattr(forge_ops, name) for name in old_symbols)
 
 
-def test_pipeline_stage_and_outcome_values_are_stable() -> None:
-    assert [stage.value for stage in PipelineStage] == [
-        "executor",
-        "reviewer",
-        "critic",
-        "executor-rework",
-    ]
-    assert {outcome.value for outcome in StageOutcome} == {
-        "approve",
-        "reject",
-        "pass",
-        "defect_found",
-    }
+def test_old_pull_request_snapshot_is_removed() -> None:
+    assert "PullRequestSnapshot" not in contracts.__all__
+    assert "PullRequestSnapshot" not in forge_ops.__all__
+    assert not hasattr(contracts, "PullRequestSnapshot")
+    assert not hasattr(forge_ops, "PullRequestSnapshot")
 
 
-def test_executor_result_requires_strict_handoff_fields() -> None:
-    result = parse_stage_result(
-        PipelineStage.EXECUTOR,
-        {
-            "pr_url": PR_URL,
-            "changed_files": ["forge/ops/contracts.py"],
-            "implemented": ["AC1"],
-            "not_implemented": [],
-            "verified_by": {"AC1": "tests/ops/test_contracts.py"},
-        },
-        {},
-    )
-
-    assert isinstance(result, ExecutorResult)
-    assert result.implemented == ("AC1",)
-
-
-def test_executor_rework_uses_the_executor_contract() -> None:
-    with pytest.raises(ContractError, match="implemented"):
-        parse_stage_result(
-            PipelineStage.EXECUTOR_REWORK,
-            {
-                "pr_url": PR_URL,
-                "changed_files": [],
-                "implemented": [],
-                "not_implemented": [],
-                "verified_by": {"AC1": "tests/ops/test_contracts.py"},
-            },
-            {},
-        )
-
-
-def test_reviewer_reject_requires_reflection() -> None:
-    with pytest.raises(ContractError, match="reflection"):
-        parse_stage_result(
-            PipelineStage.REVIEWER,
-            {"schema_version": "forge-reviewer-result/v1", "verdict": "reject"},
-            {},
-        )
-
-
-def test_reviewer_result_is_bound_to_source_pr_and_head() -> None:
-    result = parse_stage_result(PipelineStage.REVIEWER, reviewer_summary(), {})
-
-    assert isinstance(result, ReviewerResult)
-    assert result.verdict is StageOutcome.APPROVE
-    assert result.source_digest == SOURCE_DIGEST
-    assert result.pr_url == PR_URL
-    assert result.head_sha == HEAD_SHA
-    assert result.reflection is None
-
-
-def test_reviewer_reject_accepts_non_empty_reflection() -> None:
-    result = parse_stage_result(
-        PipelineStage.REVIEWER,
-        reviewer_summary(verdict="reject", reflection="AC2 implementation missing"),
-        {},
-    )
-
-    assert isinstance(result, ReviewerResult)
-    assert result.verdict is StageOutcome.REJECT
-    assert result.reflection == "AC2 implementation missing"
-
-
-def test_reviewer_rejects_unbound_source_digest() -> None:
-    summary = reviewer_summary()
-    del summary["source_digest"]
-
-    with pytest.raises(ContractError, match="source_digest"):
-        parse_stage_result(PipelineStage.REVIEWER, summary, {})
-
-
-def test_stage_result_rejects_unexpected_fields() -> None:
+@pytest.mark.parametrize(
+    ("parser", "summary"),
+    [
+        (parse_build_result, build_summary(extra="old")),
+        (parse_review_result, review_summary(verdict="approve")),
+        (parse_deep_check_result, deep_check_summary(outcome="pass")),
+        (parse_step_proof, step_proof_summary(receipt="old")),
+    ],
+)
+def test_parsers_reject_extra_or_old_fields(parser: object, summary: object) -> None:
     with pytest.raises(ContractError, match="unexpected fields"):
-        parse_stage_result(
-            PipelineStage.REVIEWER,
-            reviewer_summary(undeclared=True),
-            {},
-        )
-
-
-def test_critic_pass_requires_added_tests_and_result_head() -> None:
-    with pytest.raises(ContractError, match="added_tests"):
-        parse_stage_result(
-            PipelineStage.CRITIC,
-            {"schema_version": "forge-critic-result/v1", "outcome": "pass"},
-            {},
-        )
-
-
-def test_critic_defect_requires_reflection() -> None:
-    with pytest.raises(ContractError, match="reflection"):
-        parse_stage_result(
-            PipelineStage.CRITIC,
-            critic_summary(outcome="defect_found"),
-            {},
-        )
-
-
-def test_critic_result_binds_reviewed_and_result_heads() -> None:
-    result = parse_stage_result(PipelineStage.CRITIC, critic_summary(), {})
-
-    assert isinstance(result, CriticResult)
-    assert result.outcome is StageOutcome.PASS
-    assert result.reviewed_head_sha == HEAD_SHA
-    assert result.result_head_sha == RESULT_HEAD_SHA
-    assert result.added_tests == ("tests/test_edge_case.py",)
-
-
-def test_stage_schema_version_must_match_stage() -> None:
-    with pytest.raises(ContractError, match="schema_version"):
-        parse_stage_result(
-            PipelineStage.REVIEWER,
-            reviewer_summary(schema_version="forge-critic-result/v1"),
-            {},
-        )
+        parser(summary)  # type: ignore[operator]
 
 
 @pytest.mark.parametrize(
-    "stage",
-    [PipelineStage.EXECUTOR, PipelineStage.EXECUTOR_REWORK],
+    ("parser", "summary", "field"),
+    [
+        (parse_build_result, build_summary(), "built_commit"),
+        (parse_build_result, build_summary(), "built_base_commit"),
+        (parse_review_result, review_summary(), "reviewed_commit"),
+        (parse_deep_check_result, deep_check_summary(), "tested_commit"),
+        (parse_step_proof, step_proof_summary(), "source_run_id"),
+    ],
 )
-def test_executor_binding_rejects_cross_repository_pr(stage: PipelineStage) -> None:
-    result = parse_stage_result(
-        stage,
-        executor_summary(pr_url="https://github.com/attacker/repo/pull/7"),
-        {},
+def test_parsers_reject_missing_fields(
+    parser: object, summary: dict[str, object], field: str
+) -> None:
+    del summary[field]
+
+    with pytest.raises(ContractError, match="missing required field"):
+        parser(summary)  # type: ignore[operator]
+
+
+@pytest.mark.parametrize("old_step", ["executor", "reviewer", "critic", "stage"])
+def test_task_result_dispatch_rejects_old_step_names(old_step: str) -> None:
+    with pytest.raises(ContractError, match="step must be"):
+        parse_task_result(old_step, build_summary())
+
+
+def test_task_result_dispatches_only_new_result_names() -> None:
+    assert isinstance(parse_task_result("build", build_summary()), BuildResult)
+    assert isinstance(parse_task_result("review", review_summary()), ReviewResult)
+    assert isinstance(
+        parse_task_result("deep_check", deep_check_summary()), DeepCheckResult
     )
 
-    with pytest.raises(ContractError, match="repository"):
-        validate_stage_result_binding(
-            result,
-            expected_repository="owner/repo",
-        )
+    with pytest.raises(ContractError, match="step must be"):
+        parse_task_result("fix", step_proof_summary())
 
 
 @pytest.mark.parametrize(
-    "stage",
-    [PipelineStage.EXECUTOR, PipelineStage.EXECUTOR_REWORK],
+    ("parser", "summary"),
+    [
+        (
+            parse_review_result,
+            review_summary(result="changes_needed", fix_notes=None),
+        ),
+        (
+            parse_review_result,
+            review_summary(result="approve", fix_notes="change it"),
+        ),
+        (
+            parse_deep_check_result,
+            deep_check_summary(result="problems_found", fix_notes="  "),
+        ),
+        (
+            parse_deep_check_result,
+            deep_check_summary(result="pass", fix_notes="change it"),
+        ),
+    ],
 )
-def test_executor_binding_accepts_same_repository_without_exact_transition_fields(
-    stage: PipelineStage,
-) -> None:
-    result = parse_stage_result(stage, executor_summary(), {})
+def test_fix_notes_must_match_the_result(parser: object, summary: object) -> None:
+    with pytest.raises(ContractError, match="fix_notes"):
+        parser(summary)  # type: ignore[operator]
 
-    validate_stage_result_binding(
+
+@pytest.mark.parametrize("source_run_id", [0, -1, True, "12"])
+def test_step_proof_requires_a_positive_integer_run_id(source_run_id: object) -> None:
+    with pytest.raises(ContractError, match="source_run_id"):
+        parse_step_proof(step_proof_summary(source_run_id=source_run_id))
+
+
+def test_source_result_hash_is_canonical_and_result_bound() -> None:
+    parsed = parse_review_result(review_summary())
+    first = source_result_hash(parsed)
+    payload = task_result_payload(parsed)
+    reordered = dict(reversed(list(payload.items())))
+
+    assert source_result_hash(parse_review_result(reordered)) == first
+    assert len(first) == 64
+    changed = deepcopy(payload)
+    changed["result"] = "changes_needed"
+    changed["fix_notes"] = "missing AC2"
+    assert source_result_hash(parse_review_result(changed)) != first
+
+
+@pytest.mark.parametrize(
+    ("result", "current_commit"),
+    [
+        (parse_build_result(build_summary()), BUILT_COMMIT),
+        (parse_review_result(review_summary()), BUILT_COMMIT),
+        (parse_deep_check_result(deep_check_summary()), TESTED_COMMIT),
+    ],
+)
+def test_result_binding_accepts_exact_settings_pr_and_current_commit(
+    result: BuildResult | ReviewResult | DeepCheckResult,
+    current_commit: str,
+) -> None:
+    validate_task_result_binding(
         result,
-        expected_repository="owner/repo",
-    )
-
-
-def test_executor_binding_rejects_inapplicable_exact_transition_fields() -> None:
-    result = parse_stage_result(PipelineStage.EXECUTOR, executor_summary(), {})
-
-    with pytest.raises(ContractError, match="repository-only"):
-        validate_stage_result_binding(
-            result,
-            expected_repository="owner/repo",
-            expected_pr_url=PR_URL,
-            expected_source_digest=SOURCE_DIGEST,
-            expected_head_sha=HEAD_SHA,
-        )
-
-
-@pytest.mark.parametrize(
-    ("stage", "summary"),
-    [
-        (
-            PipelineStage.REVIEWER,
-            reviewer_summary(pr_url="https://github.com/attacker/repo/pull/7"),
-        ),
-        (
-            PipelineStage.CRITIC,
-            critic_summary(pr_url="https://github.com/attacker/repo/pull/7"),
-        ),
-    ],
-)
-def test_stage_binding_rejects_cross_repository_pr(
-    stage: PipelineStage,
-    summary: dict[str, object],
-) -> None:
-    result = parse_stage_result(stage, summary, {})
-
-    with pytest.raises(ContractError, match="repository"):
-        validate_stage_result_binding(
-            result,
-            expected_repository="owner/repo",
-            expected_pr_url=PR_URL,
-            expected_source_digest=SOURCE_DIGEST,
-            expected_head_sha=HEAD_SHA,
-        )
-
-
-@pytest.mark.parametrize(
-    ("stage", "summary"),
-    [
-        (
-            PipelineStage.REVIEWER,
-            reviewer_summary(pr_url="https://github.com/owner/repo/pull/8"),
-        ),
-        (
-            PipelineStage.CRITIC,
-            critic_summary(pr_url="https://github.com/owner/repo/pull/8"),
-        ),
-    ],
-)
-def test_stage_binding_rejects_different_pr(
-    stage: PipelineStage,
-    summary: dict[str, object],
-) -> None:
-    result = parse_stage_result(stage, summary, {})
-
-    with pytest.raises(ContractError, match="pr_url"):
-        validate_stage_result_binding(
-            result,
-            expected_repository="owner/repo",
-            expected_pr_url=PR_URL,
-            expected_source_digest=SOURCE_DIGEST,
-            expected_head_sha=HEAD_SHA,
-        )
-
-
-@pytest.mark.parametrize(
-    ("stage", "summary"),
-    [
-        (
-            PipelineStage.REVIEWER,
-            reviewer_summary(source_digest="d" * 64),
-        ),
-        (
-            PipelineStage.CRITIC,
-            critic_summary(source_digest="d" * 64),
-        ),
-    ],
-)
-def test_stage_binding_rejects_different_source_digest(
-    stage: PipelineStage,
-    summary: dict[str, object],
-) -> None:
-    result = parse_stage_result(stage, summary, {})
-
-    with pytest.raises(ContractError, match="source_digest"):
-        validate_stage_result_binding(
-            result,
-            expected_repository="owner/repo",
-            expected_pr_url=PR_URL,
-            expected_source_digest=SOURCE_DIGEST,
-            expected_head_sha=HEAD_SHA,
-        )
-
-
-@pytest.mark.parametrize(
-    ("stage", "summary"),
-    [
-        (
-            PipelineStage.REVIEWER,
-            reviewer_summary(head_sha="d" * 40),
-        ),
-        (
-            PipelineStage.CRITIC,
-            critic_summary(reviewed_head_sha="d" * 40),
-        ),
-    ],
-)
-def test_stage_binding_rejects_stale_reviewed_head(
-    stage: PipelineStage,
-    summary: dict[str, object],
-) -> None:
-    result = parse_stage_result(stage, summary, {})
-
-    with pytest.raises(ContractError, match="head"):
-        validate_stage_result_binding(
-            result,
-            expected_repository="owner/repo",
-            expected_pr_url=PR_URL,
-            expected_source_digest=SOURCE_DIGEST,
-            expected_head_sha=HEAD_SHA,
-        )
-
-
-@pytest.mark.parametrize(
-    ("stage", "summary"),
-    [
-        (PipelineStage.REVIEWER, reviewer_summary()),
-        (PipelineStage.CRITIC, critic_summary()),
-    ],
-)
-def test_stage_binding_accepts_exact_source_pr_and_reviewed_head(
-    stage: PipelineStage,
-    summary: dict[str, object],
-) -> None:
-    result = parse_stage_result(stage, summary, {})
-
-    validate_stage_result_binding(
-        result,
-        expected_repository="owner/repo",
+        expected_task_settings_hash=SETTINGS_HASH,
         expected_pr_url=PR_URL,
-        expected_source_digest=SOURCE_DIGEST,
-        expected_head_sha=HEAD_SHA,
+        current_base_commit=BUILT_BASE_COMMIT,
+        current_commit=current_commit,
     )
 
 
 @pytest.mark.parametrize(
-    ("schema_name", "required_fields", "optional_fields"),
+    ("field", "value", "match"),
     [
+        ("expected_task_settings_hash", "e" * 64, "task_settings_hash"),
         (
-            "reviewer-result-v1.schema.json",
-            REVIEWER_RESULT_REQUIRED_FIELDS,
-            REVIEWER_RESULT_OPTIONAL_FIELDS,
+            "expected_pr_url",
+            "https://github.com/owner/repo/pull/18",
+            "pr_url",
         ),
-        (
-            "critic-result-v1.schema.json",
-            CRITIC_RESULT_REQUIRED_FIELDS,
-            CRITIC_RESULT_OPTIONAL_FIELDS,
-        ),
+        ("current_base_commit", "f" * 40, "base commit"),
+        ("current_commit", "e" * 40, "current commit"),
+    ],
+)
+def test_result_binding_rejects_any_binding_mismatch(
+    field: str, value: str, match: str
+) -> None:
+    arguments = {
+        "expected_task_settings_hash": SETTINGS_HASH,
+        "expected_pr_url": PR_URL,
+        "current_base_commit": BUILT_BASE_COMMIT,
+        "current_commit": BUILT_COMMIT,
+    }
+    arguments[field] = value
+
+    with pytest.raises(ContractError, match=match):
+        validate_task_result_binding(
+            parse_build_result(build_summary()),
+            **arguments,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("schema_name", "required_fields"),
+    [
+        ("build-result-v1.schema.json", BUILD_RESULT_REQUIRED_FIELDS),
+        ("review-result-v1.schema.json", REVIEW_RESULT_REQUIRED_FIELDS),
+        ("deep-check-result-v1.schema.json", DEEP_CHECK_RESULT_REQUIRED_FIELDS),
+        ("step-proof-v1.schema.json", STEP_PROOF_REQUIRED_FIELDS),
     ],
 )
 def test_json_schema_field_sets_match_parser_field_sets(
-    schema_name: str,
-    required_fields: frozenset[str],
-    optional_fields: frozenset[str],
+    schema_name: str, required_fields: frozenset[str]
 ) -> None:
     schema = json.loads(
         (REPO_ROOT / "forge" / "schemas" / schema_name).read_text(encoding="utf-8")
     )
 
     assert schema["additionalProperties"] is False
-    assert set(schema["properties"]) == required_fields | optional_fields
+    assert set(schema["properties"]) == required_fields
     assert set(schema["required"]) == required_fields
-
-
-@pytest.mark.parametrize(
-    ("schema_name", "string_paths"),
-    [
-        (
-            "reviewer-result-v1.schema.json",
-            [
-                ("delta_check", "implemented_verified", "items"),
-                ("delta_check", "discrepancies", "items"),
-                ("spec_check", "met", "items"),
-                ("spec_check", "unmet", "items"),
-                ("reflection",),
-            ],
-        ),
-        (
-            "critic-result-v1.schema.json",
-            [
-                ("added_tests", "items"),
-                ("scenarios", "items"),
-                ("reflection",),
-            ],
-        ),
-    ],
-)
-def test_json_schema_rejects_whitespace_only_strings_where_parser_does(
-    schema_name: str,
-    string_paths: list[tuple[str, ...]],
-) -> None:
-    schema = json.loads(
-        (REPO_ROOT / "forge" / "schemas" / schema_name).read_text(encoding="utf-8")
-    )
-
-    for path in string_paths:
-        node = schema["properties"]
-        for segment in path:
-            node = node[segment]
-            if segment not in {"items"} and "properties" in node:
-                node = node["properties"]
-        assert node.get("pattern") == r"\S", ".".join(path)
-
-
-def test_transition_digest_is_canonical_and_evidence_bound() -> None:
-    first = transition_digest(
-        task_id="t_123",
-        run_id=12,
-        stage=PipelineStage.REVIEWER,
-        summary={"verdict": "approve", "nested": {"b": 2, "a": 1}},
-        metadata={"worker": "codex", "attempt": 1},
-        pr_url=PR_URL,
-        head_sha=HEAD_SHA,
-    )
-    reordered = transition_digest(
-        task_id="t_123",
-        run_id=12,
-        stage=PipelineStage.REVIEWER,
-        summary={"nested": {"a": 1, "b": 2}, "verdict": "approve"},
-        metadata={"attempt": 1, "worker": "codex"},
-        pr_url=PR_URL,
-        head_sha=HEAD_SHA,
-    )
-    changed = transition_digest(
-        task_id="t_123",
-        run_id=12,
-        stage=PipelineStage.REVIEWER,
-        summary={"verdict": "approve", "nested": {"a": 1, "b": 2}},
-        metadata={"attempt": 2, "worker": "codex"},
-        pr_url=PR_URL,
-        head_sha=HEAD_SHA,
-    )
-
-    assert first == reordered
-    assert first == "c22bbb1b8df23be8f23f508f456b53b3a71122cf46e6a5ca729698ef18a04139"
-    assert first != changed

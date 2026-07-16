@@ -64,10 +64,12 @@ def test_original_notation_exception_does_not_override_title_or_body_rule() -> N
     assert "본문" not in exception_clause
 
 
-def test_github_submission_step_keeps_label_gate_after_language_rule() -> None:
+def test_task_confirmation_gate_stays_before_the_language_rule() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
 
-    label_gate = runbook.index("라벨을 붙이는 8단계가 실제 작업 투입 승인이다")
+    confirmation_gate = runbook.index(
+        "미리보기에서 모든 선택과 내용을 다시 읽고 최종 확인한다"
+    )
     guideline = runbook.index("자동 워커나 사람이 생성하는 PR 제목과 본문은")
     next_section = runbook.index("### 6.2 좋은 수용 기준 예시")
-    assert label_gate < guideline < next_section
+    assert confirmation_gate < guideline < next_section
