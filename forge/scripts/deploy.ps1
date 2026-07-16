@@ -37,6 +37,35 @@ if ($Commit -ne $ProductionCommit) {
   throw "서버 배포는 origin/main의 검증된 commit만 허용합니다. PR을 병합한 뒤 다시 실행하세요."
 }
 
+function Invoke-RemoteBashScript {
+  param(
+    [Parameter(Mandatory = $true)][string]$HostName,
+    [Parameter(Mandatory = $true)][string]$Script,
+    [Parameter(Mandatory = $true)][string[]]$Arguments,
+    [Parameter(Mandatory = $true)][string]$FailureMessage
+  )
+
+  foreach ($Argument in $Arguments) {
+    if ($Argument -notmatch '^[A-Za-z0-9_./:@+-]+$') {
+      throw "원격 Bash 인자에 허용되지 않은 문자가 있습니다."
+    }
+  }
+  # PowerShell native pipeline은 Windows에서 마지막 줄에 CRLF를 덧붙일 수
+  # 있다. UTF-8/LF bytes를 base64로 전달해 Bash가 동일한 script를 받게 한다.
+  $NormalizedScript = $Script.Replace("`r`n", "`n").Replace("`r", "`n")
+  $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+  $EncodedScript = [Convert]::ToBase64String(
+    $Utf8NoBom.GetBytes($NormalizedScript)
+  )
+  $QuotedArguments = @($Arguments | ForEach-Object { "'$_'" })
+  $RemoteCommand = (
+    "printf '%s' '$EncodedScript' | base64 --decode | bash -s -- " +
+    ($QuotedArguments -join " ")
+  )
+  ssh $HostName $RemoteCommand
+  if ($LASTEXITCODE -ne 0) { throw $FailureMessage }
+}
+
 function Invoke-ForgeServerDeploy {
   param(
     [Parameter(Mandatory = $true)][string]$Name,
@@ -71,8 +100,11 @@ git merge --ff-only "$EXPECTED_COMMIT"
 test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 '@
-  $RemotePrepareScript | ssh $HostName bash -s -- $RemoteRepo $Commit
-  if ($LASTEXITCODE -ne 0) { throw "$Name 저장소를 요청한 main commit으로 이동하지 못했습니다." }
+  Invoke-RemoteBashScript `
+    -HostName $HostName `
+    -Script $RemotePrepareScript `
+    -Arguments @($RemoteRepo, $Commit) `
+    -FailureMessage "$Name 저장소를 요청한 main commit으로 이동하지 못했습니다."
 
   ssh $HostName env "FORGE_EXPECTED_COMMIT=$Commit" "FORGE_REPO_DIR=$RemoteRepo" bash "$RemoteRepo/forge/scripts/deploy-vps.sh" --post-update
   if ($LASTEXITCODE -ne 0) { throw "$Name 배포가 실패했습니다." }
@@ -154,10 +186,11 @@ PYTHONPATH="$REPO_DIR" "$HERMES_PY" "$REPO_DIR/forge/scripts/merge-worker.py" --
 PYTHONPATH="$REPO_DIR" "$HERMES_PY" "$REPO_DIR/forge/scripts/task-flow-worker.py" --db "$HERMES_DB" --hermes "$HERMES_BIN" --gh "$GH_BIN" --settings-db "$TASK_SETTINGS_DB" --outbox "$CONFIRMED_TASKS_DB" --repo "$REPOSITORY" --workspace "dir:$REPO_DIR" --dry-run
 PYTHONPATH="$REPO_DIR" "$HERMES_PY" "$REPO_DIR/forge/scripts/issue-status-sync.py" --db "$HERMES_DB" --gh "$GH_BIN" --settings-db "$TASK_SETTINGS_DB" --outbox "$CONFIRMED_TASKS_DB" --repo "$REPOSITORY" --dry-run
 '@
-  $VerificationScript | ssh $HostName bash -s -- $RemoteRepo $Commit
-  if ($LASTEXITCODE -ne 0) {
-    throw "$Name의 배포 후 실행 상태 검증이 실패했습니다."
-  }
+  Invoke-RemoteBashScript `
+    -HostName $HostName `
+    -Script $VerificationScript `
+    -Arguments @($RemoteRepo, $Commit) `
+    -FailureMessage "$Name의 배포 후 실행 상태 검증이 실패했습니다."
   Write-Host "[deploy] $Name 확인 완료: $($Commit.Substring(0, 8))"
 }
 
