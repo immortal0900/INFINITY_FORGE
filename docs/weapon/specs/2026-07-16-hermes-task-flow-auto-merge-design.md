@@ -190,6 +190,8 @@ Task 설정 저장소는 SQLite를 사용하며 Forge task service와 merge work
 }
 ```
 
+Task 설정의 공개 필드는 위 13개로 고정한다. `status`의 허용 값은 `prepared|active|cancelled|expired|merged`이며, 위 JSON은 이 중 활성 상태를 보여 준다. 새 필드나 이전 형식 필드가 추가되면 data-format 오류로 중단한다.
+
 `task_settings_hash`는 `task_settings_hash` 자신과 lifecycle `status`를 제외한 위 필드를 key 정렬한 UTF-8 JSON으로 만든 SHA-256이다. `task_content_hash`는 이슈의 제목, 설명, Acceptance Criteria만 key 정렬한 UTF-8 JSON의 SHA-256이다. 표시용 설정 블록은 두 hash 계산에서 제외한다.
 
 설정의 repository, issue number, Task 내용, `task_flow`, `merge_mode`, 확인 사용자, 확인 시각, 자동 병합 만료 시각은 활성화 뒤 수정할 수 없다. 취소, 만료, 병합 성공 같은 lifecycle 변화는 별도 event 행으로 append한다. 설정 값을 바꾸려면 새 `request_id`로 전체 선택과 미리보기 확인을 다시 수행한다.

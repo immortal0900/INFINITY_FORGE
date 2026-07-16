@@ -198,6 +198,7 @@ Task 설정은 `task_settings_log`에 다음 공식 필드로 저장한다.
 
 ```json
 {
+  "format_version": "forge-task-settings/v1",
   "request_id": "UUID",
   "repository": "OWNER/REPO",
   "issue_number": 123,
@@ -209,7 +210,7 @@ Task 설정은 `task_settings_log`에 다음 공식 필드로 저장한다.
   "confirmed_by": "사용자 식별자",
   "confirmed_at": "RFC 3339 시각",
   "auto_merge_expires_at": "RFC 3339 시각 또는 null",
-  "status": "prepared 또는 active 또는 cancelled"
+  "status": "prepared 또는 active 또는 cancelled 또는 expired 또는 merged"
 }
 ```
 
