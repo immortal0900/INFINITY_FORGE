@@ -163,7 +163,7 @@ PLUGIN_DIR="$HOME/.hermes/plugins/infinity-forge"
 mkdir -p "$PLUGIN_DIR"
 install -m 644 forge/hermes_plugin/infinity_forge/plugin.yaml "$PLUGIN_DIR/plugin.yaml"
 install -m 644 forge/hermes_plugin/infinity_forge/__init__.py "$PLUGIN_DIR/__init__.py"
-PYTHONPATH="$REPO_DIR" "$HERMES_PY" -m hermes_cli.main plugins enable infinity-forge
+PYTHONPATH="$REPO_DIR" "$HERMES_PY" -m hermes_cli.main plugins enable infinity-forge --no-allow-tool-override
 TASK_SETTINGS_DB="$TASK_SETTINGS_DB" PYTHONPATH="$REPO_DIR" "$HERMES_PY" -c \
   "import os; from forge.ops.task_settings import TaskSettingsStore; from forge.ops.task_outbox import TaskOutbox, task_outbox_path; store=TaskSettingsStore(os.environ['TASK_SETTINGS_DB']); TaskOutbox(task_outbox_path(store.database_path))"
 
