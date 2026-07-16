@@ -22,9 +22,16 @@ from forge.ops.safe_files import (
     AUTO_MERGE_ALLOWED as SAFE_FILES_ALLOWED,
     CHECK_ERROR as SAFE_FILES_ERROR,
     MANUAL_MERGE_REQUIRED as SAFE_FILES_MANUAL,
+    SafeFilesEvidence,
     SafeFilesResult,
 )
 from forge.ops.task_options import MergeMode, TaskFlow
+from forge.ops.task_flow import (
+    TaskFlowState,
+    TaskFlowStatus,
+    TaskStep,
+    required_steps,
+)
 from forge.ops.task_settings import (
     TaskContent,
     TaskSettings,
@@ -33,7 +40,10 @@ from forge.ops.task_settings import (
 
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+BASE = "0" * 40
 HEAD = "a" * 40
+MERGE_COMMIT = "c" * 40
+PR_URL = "https://github.com/openai/infinity-forge/pull/9"
 
 
 def _settings(
@@ -61,8 +71,36 @@ def _settings(
     )
 
 
-def _safe_result(code: str = SAFE_FILES_ALLOWED) -> SafeFilesResult:
-    return SafeFilesResult(code=code, reason="fixture", paths=("docs/guide.md",))
+def _safe_evidence(
+    code: str = SAFE_FILES_ALLOWED,
+    *,
+    base_commit: str = BASE,
+    head_commit: str = HEAD,
+) -> SafeFilesEvidence:
+    return SafeFilesEvidence(
+        base_commit=base_commit,
+        head_commit=head_commit,
+        result=SafeFilesResult(
+            code=code,
+            reason="fixture",
+            paths=("docs/guide.md",),
+        ),
+    )
+
+
+def _flow_state(settings: TaskSettings) -> TaskFlowState:
+    assert settings.task_settings_hash is not None
+    return TaskFlowState(
+        task_flow=settings.task_flow,
+        task_settings_hash=settings.task_settings_hash,
+        pr_url=PR_URL,
+        current_base_commit=BASE,
+        current_commit=HEAD,
+        current_step=None,
+        status=TaskFlowStatus.READY_TO_MERGE,
+        step_running=False,
+        completed_steps=required_steps(settings.task_flow),
+    )
 
 
 def _context(
@@ -78,17 +116,18 @@ def _context(
         "repository": settings.repository,
         "issue_number": settings.issue_number,
         "task_content_hash": settings.task_content_hash,
-        "proof_settings_hashes": (settings.task_settings_hash,),
-        "flow_completed": True,
-        "final_tested_commit": HEAD,
+        "task_flow_state": _flow_state(settings),
         "pull_request": MergePullRequest(
-            pr_url="https://github.com/openai/infinity-forge/pull/9",
+            pr_url=PR_URL,
             repository=settings.repository,
+            base_commit=BASE,
             head_commit=HEAD,
             is_open=True,
             is_draft=False,
             is_merged=False,
             merged_commit=None,
+            merged_base_commit=None,
+            merged_head_commit=None,
             has_conflict=False,
             base_is_current=True,
             rules_allow_merge=True,
@@ -98,7 +137,7 @@ def _context(
             eval_check_count=1,
         ),
         "displayed_status": "forge:ready-to-merge",
-        "safe_files": _safe_result(safe_code),
+        "safe_files": _safe_evidence(safe_code),
         "now": NOW,
         "branch_refresh_count": 0,
     }
@@ -160,20 +199,83 @@ def test_full_auto_ignores_file_risk_only_not_common_checks() -> None:
     assert decision.code == AUTO_MERGE_ALLOWED
 
 
+def test_full_auto_does_not_require_safe_file_evidence() -> None:
+    decision = decide_merge(
+        _context(merge_mode=MergeMode.FULL_AUTO, safe_files=None)
+    )
+
+    assert decision.code == AUTO_MERGE_ALLOWED
+
+
 @pytest.mark.parametrize(
     "changes",
     [
         {"repository": "other/repository"},
         {"issue_number": 8},
         {"task_content_hash": "b" * 64},
-        {"proof_settings_hashes": ("b" * 64,)},
-        {"flow_completed": False},
     ],
 )
-def test_settings_content_and_proof_mismatch_stop_automatic_merge(
+def test_settings_and_content_mismatch_stop_automatic_merge(
     changes: dict[str, object],
 ) -> None:
     assert decide_merge(_context(**changes)).code == CHECK_ERROR
+
+
+def test_task_flow_must_match_settings_hash_flow_and_pull_request() -> None:
+    context = _context()
+    different_flow = replace(
+        context.task_flow_state,
+        task_flow=TaskFlow.BUILD,
+    )
+    different_hash = replace(
+        context.task_flow_state,
+        task_settings_hash="b" * 64,
+    )
+    different_pr = replace(
+        context.task_flow_state,
+        pr_url="https://github.com/openai/infinity-forge/pull/10",
+    )
+
+    assert (
+        decide_merge(replace(context, task_flow_state=different_flow)).code
+        == CHECK_ERROR
+    )
+    assert (
+        decide_merge(replace(context, task_flow_state=different_hash)).code
+        == CHECK_ERROR
+    )
+    assert (
+        decide_merge(replace(context, task_flow_state=different_pr)).code
+        == CHECK_ERROR
+    )
+
+
+@pytest.mark.parametrize(
+    "flow_change",
+    [
+        {"status": TaskFlowStatus.RUNNING},
+        {"completed_steps": (TaskStep.BUILD,)},
+        {
+            "completed_steps": (
+                TaskStep.BUILD,
+                TaskStep.REVIEW,
+                TaskStep.REVIEW,
+            )
+        },
+        {"current_step": TaskStep.BUILD},
+        {"step_running": True},
+    ],
+)
+def test_only_an_exact_ready_to_merge_flow_can_merge(
+    flow_change: dict[str, object],
+) -> None:
+    context = _context()
+    incomplete = replace(context.task_flow_state, **flow_change)
+
+    assert (
+        decide_merge(replace(context, task_flow_state=incomplete)).code
+        == CHECK_ERROR
+    )
 
 
 def test_changed_pr_commit_restarts_the_selected_flow() -> None:
@@ -186,6 +288,35 @@ def test_changed_pr_commit_restarts_the_selected_flow() -> None:
     decision = decide_merge(_context(pull_request=pr))
 
     assert decision.code == RESTART_FLOW
+
+
+def test_changed_pr_base_restarts_the_selected_flow() -> None:
+    pr = replace(_context().pull_request, base_commit="b" * 40)
+
+    decision = decide_merge(_context(pull_request=pr))
+
+    assert decision.code == RESTART_FLOW
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        _safe_evidence(base_commit="b" * 40),
+        _safe_evidence(head_commit="b" * 40),
+        None,
+    ],
+)
+def test_safe_auto_requires_file_evidence_for_the_exact_base_and_head(
+    evidence: SafeFilesEvidence | None,
+) -> None:
+    decision = decide_merge(
+        _context(
+            merge_mode=MergeMode.SAFE_AUTO,
+            safe_files=evidence,
+        )
+    )
+
+    assert decision.code == CHECK_ERROR
 
 
 def test_pending_eval_waits_but_duplicate_or_wrong_commit_is_an_error() -> None:
@@ -204,6 +335,11 @@ def test_expired_permission_and_conflict_fall_back_to_a_person() -> None:
         base_context.settings,
         auto_merge_expires_at=NOW,
     )
+    assert expired_settings.task_settings_hash is not None
+    expired_flow = replace(
+        base_context.task_flow_state,
+        task_settings_hash=expired_settings.task_settings_hash,
+    )
     conflict = replace(base_context.pull_request, has_conflict=True)
 
     assert (
@@ -211,7 +347,7 @@ def test_expired_permission_and_conflict_fall_back_to_a_person() -> None:
             replace(
                 base_context,
                 settings=expired_settings,
-                proof_settings_hashes=(expired_settings.task_settings_hash,),
+                task_flow_state=expired_flow,
             )
         ).code
         == MANUAL_MERGE_REQUIRED
@@ -280,13 +416,47 @@ def test_same_commit_already_merged_is_idempotent() -> None:
         _context().pull_request,
         is_open=False,
         is_merged=True,
-        merged_commit=HEAD,
+        merged_commit=MERGE_COMMIT,
+        merged_base_commit=BASE,
+        merged_head_commit=HEAD,
     )
 
     decision = decide_merge(_context(pull_request=merged))
 
     assert decision.code == AUTO_MERGE_ALLOWED
     assert decision.already_merged is True
+
+
+def test_already_merged_requires_the_recorded_head_not_merge_result_commit() -> None:
+    wrong_head = replace(
+        _context().pull_request,
+        is_open=False,
+        is_merged=True,
+        merged_commit=MERGE_COMMIT,
+        merged_base_commit=BASE,
+        merged_head_commit="b" * 40,
+    )
+
+    decision = decide_merge(_context(pull_request=wrong_head))
+
+    assert decision.code == CHECK_ERROR
+    assert "merged head" in decision.reason
+
+
+def test_already_merged_requires_the_recorded_base_commit() -> None:
+    wrong_base = replace(
+        _context().pull_request,
+        is_open=False,
+        is_merged=True,
+        merged_commit=MERGE_COMMIT,
+        merged_base_commit="b" * 40,
+        merged_head_commit=HEAD,
+    )
+
+    decision = decide_merge(_context(pull_request=wrong_base))
+
+    assert decision.code == CHECK_ERROR
+    assert "merged base" in decision.reason
 
 
 @pytest.mark.parametrize(

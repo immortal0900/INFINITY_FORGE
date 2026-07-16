@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infinity-forge.local/schemas/build-result-v1.schema.json",
+  "title": "Forge Build Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {"const": "forge-build-result/v1"},
+    "task_settings_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "pr_url": {
+      "type": "string",
+      "pattern": "^https://github\\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$"
+    },
+    "built_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "changed_files": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+    },
+    "completed_items": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+    },
+    "remaining_items": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+    },
+    "checks_by_item": {
+      "type": "object",
+      "propertyNames": {"minLength": 1, "pattern": "\\S"},
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    }
+  },
+  "required": [
+    "format_version",
+    "task_settings_hash",
+    "pr_url",
+    "built_commit",
+    "changed_files",
+    "completed_items",
+    "remaining_items",
+    "checks_by_item"
+  ]
+}

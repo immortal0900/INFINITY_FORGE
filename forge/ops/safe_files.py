@@ -11,6 +11,7 @@ AUTO_MERGE_ALLOWED = "AUTO_MERGE_ALLOWED"
 MANUAL_MERGE_REQUIRED = "MANUAL_MERGE_REQUIRED"
 CHECK_ERROR = "CHECK_ERROR"
 
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _KNOWN_STATUSES = frozenset(
     {"added", "modified", "removed", "renamed", "copied", "changed", "unchanged"}
 )
@@ -134,6 +135,35 @@ class SafeFilesResult:
     @property
     def allowed(self) -> bool:
         return self.code == AUTO_MERGE_ALLOWED
+
+
+@dataclass(frozen=True)
+class SafeFilesEvidence:
+    """One safe-file result bound to the exact inspected base and head."""
+
+    base_commit: str
+    head_commit: str
+    result: SafeFilesResult
+
+    def __post_init__(self) -> None:
+        # RISK(security): an unbound file result could approve a different PR
+        # revision, so both commits and the typed result are mandatory.
+        if (
+            not isinstance(self.base_commit, str)
+            or _GIT_SHA_RE.fullmatch(self.base_commit) is None
+        ):
+            raise ValueError(
+                "base_commit must be a lowercase 40-character Git SHA"
+            )
+        if (
+            not isinstance(self.head_commit, str)
+            or _GIT_SHA_RE.fullmatch(self.head_commit) is None
+        ):
+            raise ValueError(
+                "head_commit must be a lowercase 40-character Git SHA"
+            )
+        if not isinstance(self.result, SafeFilesResult):
+            raise TypeError("result must be a SafeFilesResult")
 
 
 SafeFilesDecision = SafeFilesResult

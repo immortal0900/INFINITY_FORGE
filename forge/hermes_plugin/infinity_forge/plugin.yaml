@@ -1,0 +1,6 @@
+name: infinity-forge
+version: 1.0.0
+description: "Choose Chat or a fully specified Infinity Forge Task before a Hermes user turn."
+author: "Infinity Forge"
+hooks:
+  - pre_user_turn

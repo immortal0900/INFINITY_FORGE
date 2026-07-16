@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infinity-forge.local/schemas/review-result-v1.schema.json",
+  "title": "Forge Review Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {"const": "forge-review-result/v1"},
+    "task_settings_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "result": {"enum": ["approve", "changes_needed"]},
+    "source_result_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "pr_url": {
+      "type": "string",
+      "pattern": "^https://github\\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$"
+    },
+    "reviewed_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "change_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "confirmed_work": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+        },
+        "problems": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+        }
+      },
+      "required": ["confirmed_work", "problems"]
+    },
+    "requirements_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "completed": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+        },
+        "missing": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+        }
+      },
+      "required": ["completed", "missing"]
+    },
+    "fix_notes": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "pattern": "\\S"}
+      ]
+    }
+  },
+  "required": [
+    "format_version",
+    "task_settings_hash",
+    "result",
+    "source_result_hash",
+    "pr_url",
+    "reviewed_commit",
+    "change_check",
+    "requirements_check",
+    "fix_notes"
+  ],
+  "allOf": [
+    {
+      "if": {"properties": {"result": {"const": "changes_needed"}}},
+      "then": {
+        "properties": {
+          "fix_notes": {"type": "string", "minLength": 1, "pattern": "\\S"}
+        }
+      },
+      "else": {"properties": {"fix_notes": {"type": "null"}}}
+    }
+  ]
+}

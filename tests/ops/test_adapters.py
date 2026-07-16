@@ -7,14 +7,23 @@ from pathlib import Path
 
 import pytest
 
-from forge.ops.contracts import PipelineStage
 from forge.ops.github import GitHubClient
-from forge.ops.hermes import GateError, HermesStore, build_create_argv
-from forge.ops.stage_reconciler import StageCardSpec
+from forge.ops.hermes import (
+    GateError,
+    HermesStore,
+    build_create_argv,
+    parse_task_card_key,
+    step_card_key,
+    task_card_key,
+)
+from forge.ops.task_flow import TaskCardSpec, TaskStep
 
 
 PR_URL = "https://github.com/owner/repo/pull/17"
 HEAD_SHA = "a" * 40
+TASK_SETTINGS_HASH = "a" * 64
+SOURCE_RESULT_HASH = "b" * 64
+ROOT_KEY = f"forge-task:owner/repo#7:{TASK_SETTINGS_HASH[:16]}"
 
 
 def _create_live_schema(db_path: Path) -> sqlite3.Connection:
@@ -80,25 +89,25 @@ def test_store_reads_live_schema_and_resolves_parent(tmp_path: Path) -> None:
     _insert_task(
         connection,
         task_id="root",
-        key="github-issue:owner/repo#7",
+        key=ROOT_KEY,
     )
     _insert_task(
         connection,
-        task_id="reviewer",
-        key=f"forge-stage:owner/repo#7:reviewer:{'b' * 16}",
+        task_id="review",
+        key=f"forge-step:owner/repo#7:review:{SOURCE_RESULT_HASH[:16]}",
     )
     connection.execute(
         "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
-        ("root", "reviewer"),
+        ("root", "review"),
     )
     connection.commit()
     connection.close()
 
-    tasks = HermesStore(db_path).list_pipeline_tasks()
+    tasks = HermesStore(db_path).list_task_cards()
 
-    assert [task.task_id for task in tasks] == ["reviewer", "root"]
-    reviewer = next(task for task in tasks if task.task_id == "reviewer")
-    assert reviewer.parent_id == "root"
+    assert [task.task_id for task in tasks] == ["review", "root"]
+    review = next(task for task in tasks if task.task_id == "review")
+    assert review.parent_id == "root"
 
 
 def test_store_opens_sqlite_with_read_only_uri(
@@ -116,7 +125,7 @@ def test_store_opens_sqlite_with_read_only_uri(
 
     monkeypatch.setattr("forge.ops.hermes.sqlite3.connect", recording_connect)
 
-    HermesStore(db_path).list_pipeline_tasks()
+    HermesStore(db_path).list_task_cards()
 
     assert calls
     assert str(calls[0][0]).endswith("?mode=ro")
@@ -126,86 +135,71 @@ def test_store_opens_sqlite_with_read_only_uri(
 def test_store_rejects_duplicate_pipeline_idempotency_key(tmp_path: Path) -> None:
     db_path = tmp_path / "kanban.db"
     connection = _create_live_schema(db_path)
-    key = "github-issue:owner/repo#7"
+    key = ROOT_KEY
     _insert_task(connection, task_id="first", key=key)
     _insert_task(connection, task_id="second", key=key)
     connection.commit()
     connection.close()
 
     with pytest.raises(GateError, match="duplicate.*idempotency"):
-        HermesStore(db_path).list_pipeline_tasks()
+        HermesStore(db_path).list_task_cards()
 
 
-def test_store_ignores_only_exact_live_spec_002_legacy_stage_keys(
-    tmp_path: Path,
-) -> None:
+def test_store_reads_only_new_task_and_step_keys(tmp_path: Path) -> None:
     db_path = tmp_path / "kanban.db"
     connection = _create_live_schema(db_path)
     _insert_task(
         connection,
         task_id="root",
-        key="github-issue:owner/repo#7",
+        key=ROOT_KEY,
     )
-    for suffix in ("exec", "review", "critic"):
-        _insert_task(
-            connection,
-            task_id=f"legacy-{suffix}",
-            key=(
-                "github-issue:immortal0900/INFINITY_FORGE#3-"
-                f"{suffix}"
-            ),
-        )
-    connection.commit()
-    connection.close()
-
-    store = HermesStore(db_path)
-    tasks = store.list_pipeline_tasks()
-
-    assert [task.task_id for task in tasks] == ["root"]
-    assert store.ignored_legacy_count == 3
-
-
-def test_store_preserves_canonical_parent_blocked_by_legacy_child(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "kanban.db"
-    connection = _create_live_schema(db_path)
+    _insert_task(connection, task_id="old-root", key="github-issue:owner/repo#7")
     _insert_task(
         connection,
-        task_id="root",
-        key="github-issue:immortal0900/INFINITY_FORGE#1",
-    )
-    _insert_task(
-        connection,
-        task_id="legacy",
-        key="github-issue:immortal0900/INFINITY_FORGE#3-review",
-    )
-    connection.execute(
-        "INSERT INTO task_links (parent_id, child_id) VALUES ('root', 'legacy')"
+        task_id="old-stage",
+        key=f"forge-stage:owner/repo#7:reviewer:{SOURCE_RESULT_HASH[:16]}",
     )
     connection.commit()
     connection.close()
 
-    store = HermesStore(db_path)
-    tasks = store.list_pipeline_tasks()
+    tasks = HermesStore(db_path).list_task_cards()
 
     assert [task.task_id for task in tasks] == ["root"]
-    assert store.topology_blocked_parent_ids == frozenset({"root"})
 
 
-def test_store_rejects_unknown_malformed_pipeline_key(tmp_path: Path) -> None:
+def test_store_rejects_malformed_new_task_key(tmp_path: Path) -> None:
     db_path = tmp_path / "kanban.db"
     connection = _create_live_schema(db_path)
     _insert_task(
         connection,
         task_id="malformed",
-        key="github-issue:owner/repo#7-other",
+        key="forge-task:owner/repo#7:short",
     )
     connection.commit()
     connection.close()
 
     with pytest.raises(GateError, match="malformed.*identity"):
-        HermesStore(db_path).list_pipeline_tasks()
+        HermesStore(db_path).list_task_cards()
+
+
+@pytest.mark.parametrize(
+    "old_key",
+    [
+        "github-issue:owner/repo#7",
+        f"forge-stage:owner/repo#7:reviewer:{SOURCE_RESULT_HASH[:16]}",
+        f"forge-step:owner/repo#7:critic:{SOURCE_RESULT_HASH[:16]}",
+    ],
+)
+def test_card_key_parser_explicitly_rejects_old_keys(old_key: str) -> None:
+    with pytest.raises(GateError, match="new forge-task or forge-step"):
+        parse_task_card_key(old_key)
+
+
+def test_card_key_builders_use_full_hashes_and_exact_new_names() -> None:
+    assert task_card_key("owner/repo", 7, TASK_SETTINGS_HASH) == ROOT_KEY
+    assert step_card_key(
+        "owner/repo", 7, TaskStep.DEEP_CHECK, SOURCE_RESULT_HASH
+    ) == f"forge-step:owner/repo#7:deep_check:{SOURCE_RESULT_HASH[:16]}"
 
 
 def test_latest_completed_run_uses_newest_run_and_parses_json(tmp_path: Path) -> None:
@@ -214,7 +208,7 @@ def test_latest_completed_run_uses_newest_run_and_parses_json(tmp_path: Path) ->
     _insert_task(
         connection,
         task_id="root",
-        key="github-issue:owner/repo#7",
+        key=ROOT_KEY,
     )
     for run_id, status, outcome in (
         (1, "done", "completed"),
@@ -255,7 +249,7 @@ def test_latest_completed_run_rejects_non_object_json(tmp_path: Path) -> None:
     _insert_task(
         connection,
         task_id="root",
-        key="github-issue:owner/repo#7",
+        key=ROOT_KEY,
     )
     connection.execute(
         """
@@ -270,35 +264,38 @@ def test_latest_completed_run_rejects_non_object_json(tmp_path: Path) -> None:
         HermesStore(db_path).latest_completed_run("root")
 
 
-def test_stage_create_argv_binds_parent_skill_and_idempotency() -> None:
-    spec = StageCardSpec(
-        target_stage=PipelineStage.REVIEWER,
-        title="Forge reviewer: owner/repo#7",
+def test_task_create_argv_binds_parent_role_skill_and_idempotency() -> None:
+    spec = TaskCardSpec(
+        step=TaskStep.REVIEW,
+        title="Forge review: owner/repo#7",
         body="```json\n{}\n```",
         parent_id="root",
-        assignee="reviewer",
-        skill="reviewer-verdict",
-        idempotency_key=f"forge-stage:owner/repo#7:reviewer:{'b' * 16}",
+        skill="review-result",
+        idempotency_key=(
+            f"forge-step:owner/repo#7:review:{SOURCE_RESULT_HASH[:16]}"
+        ),
     )
 
     argv = build_create_argv(spec, "dir:/home/user/work/repo")
 
     assert argv[:3] == ("kanban", "create", spec.title)
     assert argv[argv.index("--parent") + 1] == "root"
-    assert argv[argv.index("--skill") + 1] == "reviewer-verdict"
+    assert argv[argv.index("--assignee") + 1] == "reviewer"
+    assert argv[argv.index("--skill") + 1] == "review-result"
     assert argv[argv.index("--idempotency-key") + 1] == spec.idempotency_key
     assert argv[argv.index("--max-retries") + 1] == "4"
 
 
-def test_stage_create_argv_uses_explicit_repository_workspace() -> None:
-    spec = StageCardSpec(
-        target_stage=PipelineStage.CRITIC,
-        title="Forge critic: owner/repo#7",
+def test_task_create_argv_uses_explicit_repository_workspace() -> None:
+    spec = TaskCardSpec(
+        step=TaskStep.DEEP_CHECK,
+        title="Forge deep check: owner/repo#7",
         body="```json\n{}\n```",
-        parent_id="reviewer",
-        assignee="critic",
-        skill="critic-adversarial",
-        idempotency_key=f"forge-stage:owner/repo#7:critic:{'c' * 16}",
+        parent_id="review",
+        skill="deep-check-result",
+        idempotency_key=(
+            f"forge-step:owner/repo#7:deep_check:{SOURCE_RESULT_HASH[:16]}"
+        ),
     )
 
     argv = build_create_argv(spec, workspace="dir:/home/user/work/repo")

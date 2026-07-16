@@ -10,9 +10,11 @@ from .safe_files import (
     AUTO_MERGE_ALLOWED as SAFE_FILES_ALLOWED,
     CHECK_ERROR as SAFE_FILES_ERROR,
     MANUAL_MERGE_REQUIRED as SAFE_FILES_MANUAL,
+    SafeFilesEvidence,
     SafeFilesResult,
 )
 from .task_options import MergeMode
+from .task_flow import TaskFlowState, TaskFlowStatus, required_steps
 from .task_settings import TaskSettings, TaskSettingsStatus
 
 
@@ -41,11 +43,15 @@ _BLOCKED_STATUSES = frozenset(
 class MergePullRequest:
     pr_url: str
     repository: str
+    # RISK(breaking): adapters must provide both current and merged base commits.
+    base_commit: str
     head_commit: str
     is_open: bool
     is_draft: bool
     is_merged: bool
     merged_commit: str | None
+    merged_base_commit: str | None
+    merged_head_commit: str | None
     has_conflict: bool
     base_is_current: bool
     rules_allow_merge: bool
@@ -55,18 +61,18 @@ class MergePullRequest:
     eval_check_count: int
 
 
+# RISK(breaking): loose completion/hash fields were intentionally replaced by
+# one complete TaskFlowState, so old MergeContext constructors must be updated.
 @dataclass(frozen=True, slots=True)
 class MergeContext:
     settings: TaskSettings
     repository: str
     issue_number: int | None
     task_content_hash: str
-    proof_settings_hashes: tuple[str | None, ...]
-    flow_completed: bool
-    final_tested_commit: str
+    task_flow_state: TaskFlowState
     pull_request: MergePullRequest
     displayed_status: str
-    safe_files: SafeFilesResult | None
+    safe_files: SafeFilesEvidence | None
     now: datetime
     branch_refresh_count: int
 
@@ -119,18 +125,26 @@ def decide_merge(context: MergeContext) -> MergeDecision:
         return _check_error("issue does not match Task settings")
     if context.task_content_hash != settings.task_content_hash:
         return _check_error("Task content hash does not match")
-    if not context.proof_settings_hashes or any(
-        value != settings.task_settings_hash
-        for value in context.proof_settings_hashes
-    ):
-        return _check_error("step proof settings hash does not match")
-    if not isinstance(context.flow_completed, bool) or not context.flow_completed:
-        return _check_error("selected Task flow is not complete")
+    flow = context.task_flow_state
+    if not isinstance(flow, TaskFlowState):
+        return _check_error("Task flow state has an unexpected type")
+    if flow.task_flow is not settings.task_flow:
+        return _check_error("Task flow does not match Task settings")
+    if flow.task_settings_hash != settings.task_settings_hash:
+        return _check_error("Task flow settings hash does not match")
+    if flow.status is not TaskFlowStatus.READY_TO_MERGE:
+        return _check_error("selected Task flow is not ready to merge")
+    if flow.completed_steps != required_steps(settings.task_flow):
+        return _check_error("selected Task flow steps are not exactly complete")
+    if flow.current_step is not None:
+        return _check_error("selected Task flow still has a current step")
+    if flow.step_running is not False:
+        return _check_error("selected Task flow still has a running step")
     if (
-        not isinstance(context.final_tested_commit, str)
-        or _COMMIT_PATTERN.fullmatch(context.final_tested_commit) is None
+        _COMMIT_PATTERN.fullmatch(flow.current_base_commit) is None
+        or _COMMIT_PATTERN.fullmatch(flow.current_commit) is None
     ):
-        return _check_error("final tested commit is invalid")
+        return _check_error("Task flow base or head commit is invalid")
     if not isinstance(pr, MergePullRequest):
         return _check_error("pull request data has an unexpected type")
     if any(
@@ -157,10 +171,24 @@ def decide_merge(context: MergeContext) -> MergeDecision:
         or _COMMIT_PATTERN.fullmatch(pr.merged_commit) is None
     ):
         return _check_error("pull request merged commit is invalid")
+    if pr.merged_base_commit is not None and (
+        not isinstance(pr.merged_base_commit, str)
+        or _COMMIT_PATTERN.fullmatch(pr.merged_base_commit) is None
+    ):
+        return _check_error("pull request merged base is invalid")
+    if pr.merged_head_commit is not None and (
+        not isinstance(pr.merged_head_commit, str)
+        or _COMMIT_PATTERN.fullmatch(pr.merged_head_commit) is None
+    ):
+        return _check_error("pull request merged head is invalid")
     if pr.is_merged and pr.is_open:
         return _check_error("pull request open and merged flags conflict")
-    if not pr.is_merged and pr.merged_commit is not None:
-        return _check_error("unmerged pull request has a merged commit")
+    if not pr.is_merged and (
+        pr.merged_commit is not None
+        or pr.merged_base_commit is not None
+        or pr.merged_head_commit is not None
+    ):
+        return _check_error("unmerged pull request has merged commit data")
     pr_match = (
         _PR_URL_PATTERN.fullmatch(pr.pr_url)
         if isinstance(pr.pr_url, str)
@@ -168,8 +196,15 @@ def decide_merge(context: MergeContext) -> MergeDecision:
     )
     if pr_match is None or pr_match.group("repository") != context.repository:
         return _check_error("pull request URL does not match repository")
+    if flow.pr_url != pr.pr_url:
+        return _check_error("Task flow pull request does not match")
     if pr.repository != context.repository:
         return _check_error("pull request repository does not match")
+    if (
+        not isinstance(pr.base_commit, str)
+        or _COMMIT_PATTERN.fullmatch(pr.base_commit) is None
+    ):
+        return _check_error("pull request base commit is invalid")
     if (
         not isinstance(pr.head_commit, str)
         or _COMMIT_PATTERN.fullmatch(pr.head_commit) is None
@@ -189,21 +224,35 @@ def decide_merge(context: MergeContext) -> MergeDecision:
     ):
         return _check_error("branch refresh count is invalid")
 
-    if pr.head_commit != context.final_tested_commit:
+    if pr.is_merged:
+        if pr.merged_commit is None:
+            return _check_error("merged pull request has no result commit")
+        if pr.merged_base_commit != flow.current_base_commit:
+            return _check_error(
+                "pull request merged base does not match tested base"
+            )
+        if pr.merged_head_commit != flow.current_commit:
+            return _check_error(
+                "pull request merged head does not match tested commit"
+            )
+        return _decision(
+            AUTO_MERGE_ALLOWED,
+            "the tested pull request base and head are already merged",
+            commit=flow.current_commit,
+            already_merged=True,
+        )
+
+    if pr.base_commit != flow.current_base_commit:
+        return _decision(
+            RESTART_FLOW,
+            "pull request base changed after the selected Task flow",
+            commit=pr.head_commit,
+        )
+    if pr.head_commit != flow.current_commit:
         return _decision(
             RESTART_FLOW,
             "pull request commit changed after the selected Task flow",
             commit=pr.head_commit,
-        )
-
-    if pr.is_merged:
-        if pr.merged_commit != context.final_tested_commit:
-            return _check_error("pull request merged commit does not match tested commit")
-        return _decision(
-            AUTO_MERGE_ALLOWED,
-            "the tested pull request commit is already merged",
-            commit=context.final_tested_commit,
-            already_merged=True,
         )
 
     if not pr.is_open:
@@ -265,9 +314,19 @@ def decide_merge(context: MergeContext) -> MergeDecision:
         )
 
     if settings.merge_mode is MergeMode.SAFE_AUTO:
-        result = context.safe_files
+        evidence = context.safe_files
+        if not isinstance(evidence, SafeFilesEvidence):
+            return _check_error("safe files evidence is unavailable")
+        if (
+            evidence.base_commit != pr.base_commit
+            or evidence.head_commit != pr.head_commit
+        ):
+            return _check_error(
+                "safe files evidence does not match the tested base and head"
+            )
+        result = evidence.result
         if not isinstance(result, SafeFilesResult):
-            return _check_error("safe files result is unavailable")
+            return _check_error("safe files result has an unexpected type")
         if result.code == SAFE_FILES_ERROR:
             return _check_error("safe files check could not be completed")
         if result.code == SAFE_FILES_MANUAL:

@@ -10,9 +10,14 @@ from forge.ops.safe_files import (
     MANUAL_MERGE_REQUIRED,
     ChangedFile,
     SafeFilesDecision,
+    SafeFilesEvidence,
     SafeFilesResult,
     check_safe_files,
 )
+
+
+BASE_COMMIT = "0" * 40
+HEAD_COMMIT = "a" * 40
 
 
 def changed(
@@ -318,3 +323,47 @@ def test_result_is_deterministic_and_does_not_mutate_input() -> None:
     assert first == second
     assert files == before
     assert first.paths == ("docs/z.md", "docs/a.md")
+
+
+def test_safe_file_result_is_bound_to_the_exact_base_and_head_commits() -> None:
+    result = check_safe_files(
+        [changed("docs/guide.md")],
+        pagination_complete=True,
+    )
+
+    evidence = SafeFilesEvidence(
+        base_commit=BASE_COMMIT,
+        head_commit=HEAD_COMMIT,
+        result=result,
+    )
+
+    assert evidence.base_commit == BASE_COMMIT
+    assert evidence.head_commit == HEAD_COMMIT
+    assert evidence.result is result
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("base_commit", "not-a-commit"),
+        ("head_commit", "b" * 39),
+        ("result", object()),
+    ],
+)
+def test_safe_file_evidence_rejects_unbound_or_malformed_input(
+    field: str,
+    value: object,
+) -> None:
+    values: dict[str, object] = {
+        "base_commit": BASE_COMMIT,
+        "head_commit": HEAD_COMMIT,
+        "result": SafeFilesResult(
+            code=AUTO_MERGE_ALLOWED,
+            reason="fixture",
+            paths=("docs/guide.md",),
+        ),
+    }
+    values[field] = value
+
+    with pytest.raises((TypeError, ValueError)):
+        SafeFilesEvidence(**values)  # type: ignore[arg-type]
