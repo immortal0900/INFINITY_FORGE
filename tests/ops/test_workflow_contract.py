@@ -196,6 +196,16 @@ def test_local_deploy_uses_absolute_remote_paths_and_requires_clean_main() -> No
     assert 'deploy-vps.sh" --post-update' in deploy
 
 
+def test_local_deploy_sends_remote_bash_without_windows_line_endings() -> None:
+    deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+
+    assert "function Invoke-RemoteBashScript" in deploy
+    assert "[Convert]::ToBase64String" in deploy
+    assert "base64 --decode | bash -s --" in deploy
+    assert "$RemotePrepareScript | ssh" not in deploy
+    assert "$VerificationScript | ssh" not in deploy
+
+
 def test_local_deploy_verifies_complete_runtime_and_smokes_workers() -> None:
     deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
 
