@@ -145,6 +145,20 @@ def test_runtime_is_stopped_before_legacy_recheck_and_restored_on_error() -> Non
     assert 'trap restore_runtime_after_error EXIT' in deploy
 
 
+def test_deploy_enables_plugin_without_waiting_for_operator_input() -> None:
+    deploy = DEPLOY.read_text(encoding="utf-8")
+
+    command = (
+        '"$HERMES_PY" -m hermes_cli.main plugins enable '
+        'infinity-forge --no-allow-tool-override'
+    )
+    assert command in deploy
+    assert (
+        '"$HERMES_PY" -m hermes_cli.main plugins enable infinity-forge\n'
+        not in deploy
+    )
+
+
 def test_hermes_change_package_is_version_bound_and_committed_atomically() -> None:
     deploy = DEPLOY.read_text(encoding="utf-8")
 
