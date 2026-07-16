@@ -1,6 +1,6 @@
 # plan.md 7절 ⑤ + 14절 Phase 3: Capability eval + 회귀 + 감시.
 # 결정론 검사만 수행한다(7절: CI에 LLM을 올리지 않는다).
-# LLM 층의 능력 점검은 VPS canary(6시간 주기, 정답이 알려진 더미 태스크)가 담당한다.
+# LLM 층의 능력 점검은 VPS system check(6시간 주기, 정답이 알려진 입력)가 담당한다.
 # pull_request/push 트리거: PR에 status check를 실제로 생성한다 (2026-07-12 실측:
 # PR #2·#4에 check 0개 — 주간 스케줄만으로는 머지 시점 검증이 없던 구멍의 봉쇄).
 # ruleset required status context: eval (보호 규칙 활성화 뒤 이 job 이름을 바꾸지 않는다).

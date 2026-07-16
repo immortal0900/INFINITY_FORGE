@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""INFINITY_FORGE local-sync — 로컬(Windows) hermes 장부의 진행 공유 + 로컬 DB 오프박스 백업.
+"""INFINITY_FORGE local-sync — 로컬 Hermes 작업 공유와 원격 DB 백업.
 5분 주기 (--loop):
-  1) 로컬 kanban.db에서 멱등키 github-issue:* 카드의 상태 전이 감지
+  1) 로컬 kanban.db에서 forge-task:* 작업의 상태 전이 감지
      → GitHub 이슈 코멘트([Forge-Local] ...) + Slack #forge-local 알림
-     ※ forge:* 라벨은 만지지 않는다 — 라벨 단일 작성자는 클라우드 미러(D7)
-  2) 일 1회: kanban.db·state.db를 sqlite backup API로 스냅샷 → VPS ~/backups/local-hermes/로 scp
-     (로컬 장부의 오프박스 사본 — pull-backup의 역방향)
+     ※ forge:* 라벨은 issue-status-sync만 변경한다.
+  2) 일 1회: kanban.db·state.db를 SQLite backup API로 복사해 VPS에 보관
 """
 import json, os, sqlite3, subprocess, sys, time, datetime, urllib.request
 
@@ -56,6 +55,18 @@ def slack(text):
     except Exception:
         pass
 
+def task_reference(key):
+    """Return OWNER/REPO and issue number from one new root Task key."""
+    if not isinstance(key, str) or not key.startswith("forge-task:"):
+        raise ValueError("Task key must start with forge-task")
+    identity, settings_short_hash = key.removeprefix("forge-task:").rsplit(":", 1)
+    if len(settings_short_hash) != 16:
+        raise ValueError("Task key settings value is invalid")
+    repository, issue_number = identity.rsplit("#", 1)
+    if "/" not in repository or not issue_number.isdigit():
+        raise ValueError("Task key project or issue is invalid")
+    return repository, issue_number
+
 def cycle():
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     prev = {}
@@ -66,13 +77,13 @@ def cycle():
     if os.path.exists(DB):
         con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
         for key, status, title, cid in con.execute(
-                "SELECT idempotency_key, status, title, id FROM tasks WHERE idempotency_key LIKE 'github-issue:%'"):
+                "SELECT idempotency_key, status, title, id FROM tasks WHERE idempotency_key LIKE 'forge-task:%'"):
             cards[key] = {"status": status, "title": title, "id": cid}
         con.close()
     for key, c in cards.items():
         if prev.get(key) != c["status"] and c["status"] in NOTIFY:
-            ref = key.replace("github-issue:", "")           # OWNER/REPO#N
-            repo, num = ref.rsplit("#", 1)
+            repo, num = task_reference(key)
+            ref = f"{repo}#{num}"
             body = f"[Forge-Local] {NOTIFY[c['status']]} — 카드 {c['id']} (로컬 머신 실행)"
             ok = gh_comment(repo, num, body)
             slack(f"{NOTIFY[c['status']]} [local:{ref}] {c['title']} ({'이슈 코멘트됨' if ok else '코멘트 실패'})")

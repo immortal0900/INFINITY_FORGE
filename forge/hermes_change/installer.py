@@ -165,7 +165,35 @@ _CONVERSATION_HOOK = f'''
             _handled_result = _handled_pre_user_turn_results[0]
             _response = _handled_result.get("text")
             _choices = _handled_result.get("choices", [])
-            if not isinstance(_response, str) or not isinstance(_choices, list):
+            # RISK(breaking): every user surface relies on stable text IDs and
+            # labels; malformed or ambiguous choice objects must stop closed.
+            _valid_choices = (
+                isinstance(_choices, list)
+                and all(
+                    isinstance(_choice, dict)
+                    and isinstance(_choice.get("id"), str)
+                    and bool(_choice["id"].strip())
+                    and isinstance(_choice.get("label"), str)
+                    and bool(_choice["label"].strip())
+                    for _choice in _choices
+                )
+            )
+            _choice_ids = (
+                [_choice["id"] for _choice in _choices]
+                if _valid_choices
+                else []
+            )
+            _choice_labels = (
+                [_choice["label"] for _choice in _choices]
+                if _valid_choices
+                else []
+            )
+            if (
+                not isinstance(_response, str)
+                or not _valid_choices
+                or len(set(_choice_ids)) != len(_choice_ids)
+                or len(set(_choice_labels)) != len(_choice_labels)
+            ):
                 return _finish_pre_user_turn(
                     "Hermes user-turn plugin results conflict. No model request was made."
                 )
@@ -323,6 +351,42 @@ def change_run_agent_source(source: str) -> str:
     )
 
 
+def _choice_display_lines(result_name: str, response_name: str) -> tuple[str, ...]:
+    """Return fail-closed source lines that make structured choices visible."""
+
+    return (
+        "# RISK(breaking): structured chooser options must survive this user-surface boundary.",
+        (
+            f'_pre_user_turn_choices = {result_name}.get("choices", []) '
+            f"if isinstance({result_name}, dict) else []"
+        ),
+        "if _pre_user_turn_choices:",
+        "    _pre_user_turn_labels = [",
+        '        _choice["label"]',
+        "        for _choice in _pre_user_turn_choices",
+        (
+            "        if isinstance(_choice, dict) "
+            'and isinstance(_choice.get("label"), str)'
+        ),
+        "    ]",
+        "    if len(_pre_user_turn_labels) != len(_pre_user_turn_choices):",
+        "        _pre_user_turn_choices = []",
+        f'        {response_name} = "Hermes user-turn plugin results conflict. No model request was made."',
+        f'        {result_name}["choices"] = []',
+        f'        {result_name}["final_response"] = {response_name}',
+        (
+            "    elif any("
+            f"_label not in {response_name} for _label in _pre_user_turn_labels"
+            "):"
+        ),
+        (
+            f'        {response_name} = f"{{{response_name}}}\\n\\nAvailable choices:\\n" '
+            '+ "\\n".join(f"- {_label}" for _label in _pre_user_turn_labels)'
+        ),
+        f'        {result_name}["final_response"] = {response_name}',
+    )
+
+
 def change_cli_source(source: str) -> str:
     """Mark classic CLI input as a user turn and skip handled-turn title calls."""
 
@@ -336,11 +400,17 @@ def change_cli_source(source: str) -> str:
         max_lines=12,
         label="cli.py user-turn call",
     )
-    return _replace_unique_line(
+    source = _replace_unique_line(
         source,
         'if response and result and not result.get("failed") and not result.get("partial"):',
         'if response and result and not result.get("failed") and not result.get("partial") and not result.get("handled"):',
         label="cli.py handled title guard",
+    )
+    return _insert_after_unique_line(
+        source,
+        'response = result.get("final_response", "") if result else ""',
+        _choice_display_lines("result", "response"),
+        label="cli.py chooser display",
     )
 
 
@@ -364,7 +434,7 @@ def change_tui_gateway_source(source: str) -> str:
         'if status == "complete" and isinstance(raw, str) and raw.strip() and not (isinstance(result, dict) and result.get("handled")):',
         label="tui gateway handled goal guard",
     )
-    return _insert_in_unique_sequence(
+    source = _insert_in_unique_sequence(
         source,
         (
             "if (",
@@ -378,6 +448,20 @@ def change_tui_gateway_source(source: str) -> str:
         after=1,
         addition='and not (isinstance(result, dict) and result.get("handled"))',
         label="tui gateway handled title guard",
+    )
+    return _insert_after_unique_line(
+        source,
+        'payload = {"text": raw, "usage": _get_usage(agent), "status": status}',
+        (
+            "# RISK(breaking): Desktop choice buttons depend on this additive payload field.",
+            (
+                '_pre_user_turn_choices = result.get("choices", []) '
+                "if isinstance(result, dict) else []"
+            ),
+            "if _pre_user_turn_choices:",
+            '    payload["choices"] = list(_pre_user_turn_choices)',
+        ),
+        label="tui gateway chooser payload",
     )
 
 
@@ -406,14 +490,21 @@ def change_gateway_source(source: str) -> str:
         '"last_reasoning": result.get("last_reasoning"),',
         (
             '"handled": result_holder[0].get("handled", False) if result_holder[0] else False,',
+            '"choices": result_holder[0].get("choices", []) if result_holder[0] else [],',
         ),
         label="gateway handled result forwarding",
     )
-    return _replace_unique_line(
+    source = _replace_unique_line(
         source,
         "if _final_text.strip():",
         'if _final_text.strip() and not (isinstance(_agent_result, dict) and _agent_result.get("handled")):',
         label="gateway handled goal guard",
+    )
+    return _insert_after_unique_line(
+        source,
+        'response = agent_result.get("final_response") or ""',
+        _choice_display_lines("agent_result", "response"),
+        label="gateway chooser display",
     )
 
 

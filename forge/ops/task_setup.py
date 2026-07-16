@@ -23,16 +23,54 @@ _ACCEPTANCE_CRITERION = re.compile(
     r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(?P<text>\S.*)$"
 )
 _FLOW_PATHS = {
-    TaskFlow.BUILD: "Build → current commit CI",
-    TaskFlow.BUILD_REVIEW: "Build → Review → current commit CI",
+    TaskFlow.BUILD: "Build → Automated Tests",
+    TaskFlow.BUILD_REVIEW: "Build → Review → Automated Tests",
     TaskFlow.BUILD_REVIEW_DEEP_CHECK: (
-        "Build → Review → Deep Check → current commit CI"
+        "Build → Review → Deep Check → Automated Tests"
     ),
 }
 _MERGE_RESULTS = {
-    MergeMode.MANUAL: "Human merge after validation",
-    MergeMode.SAFE_AUTO: "Auto-merge safe files after validation",
-    MergeMode.FULL_AUTO: "Auto-merge any validated pull request",
+    MergeMode.MANUAL: "Human merges after all checks pass",
+    MergeMode.SAFE_AUTO: (
+        "System merges safe-file changes after all checks pass"
+    ),
+    MergeMode.FULL_AUTO: (
+        "System merges any pull request after all checks pass"
+    ),
+}
+_MODE_LABELS = {
+    Mode.CHAT: "Chat",
+    Mode.TASK: "Task",
+}
+_FLOW_LABELS = {
+    TaskFlow.BUILD: "Build",
+    TaskFlow.BUILD_REVIEW: "Build + Review",
+    TaskFlow.BUILD_REVIEW_DEEP_CHECK: "Build + Review + Deep Check",
+}
+_MERGE_LABELS = {
+    MergeMode.MANUAL: "Manual Merge",
+    MergeMode.SAFE_AUTO: "Safe Files Auto-Merge",
+    MergeMode.FULL_AUTO: "All Validated PRs Auto-Merge",
+}
+_MODE_DETAILS = {
+    Mode.CHAT: "normal questions and design discussion; creates no work item",
+    Mode.TASK: "implementation; asks for checks and a merge choice before creating work",
+}
+_FLOW_DETAILS = {
+    TaskFlow.BUILD: "build the change and run automated tests",
+    TaskFlow.BUILD_REVIEW: "build, run automated tests, and add a separate review",
+    TaskFlow.BUILD_REVIEW_DEEP_CHECK: (
+        "build, review, and test additional failure and edge cases"
+    ),
+}
+_MERGE_DETAILS = {
+    MergeMode.MANUAL: "a person merges after every required check passes",
+    MergeMode.SAFE_AUTO: (
+        "the system merges only low-risk file changes after every required check passes"
+    ),
+    MergeMode.FULL_AUTO: (
+        "the system merges any pull request after every required check passes"
+    ),
 }
 
 
@@ -325,9 +363,8 @@ class TaskSetup:
         choice: str,
         now: datetime,
     ) -> TurnResult:
-        try:
-            task_flow = TaskFlow(choice)
-        except ValueError:
+        task_flow = self._selected_value(choice, _FLOW_LABELS)
+        if task_flow is None:
             self._store_draft(key, self._refresh(draft, now), now)
             return self._task_flow_prompt("Choose one listed Task flow.")
 
@@ -351,9 +388,8 @@ class TaskSetup:
         now: datetime,
         repository: str | None,
     ) -> TurnResult:
-        try:
-            merge_mode = MergeMode(choice)
-        except ValueError:
+        merge_mode = self._selected_value(choice, _MERGE_LABELS)
+        if merge_mode is None:
             self._store_draft(key, self._refresh(draft, now), now)
             return self._merge_mode_prompt("Choose one listed merge mode.")
 
@@ -487,6 +523,16 @@ class TaskSetup:
         return request_id
 
     @staticmethod
+    def _selected_value(choice: str, labels: dict[Enum, str]) -> Enum | None:
+        """Match a visible label while retaining stable internal storage values."""
+
+        normalized = choice.strip().casefold()
+        for value, label in labels.items():
+            if normalized in {label.casefold(), str(value.value).casefold()}:
+                return value
+        return None
+
+    @staticmethod
     def _normalized_utc(value: datetime) -> datetime:
         if not isinstance(value, datetime) or value.tzinfo is None:
             raise RuntimeError("Task confirmation time must include a timezone")
@@ -513,7 +559,11 @@ class TaskSetup:
 
     @staticmethod
     def _mode_prompt(prefix: str | None = None) -> TurnResult:
-        text = prefix or "Choose Chat for a normal conversation or Task for implementation."
+        text = TaskSetup._prompt_text(
+            prefix or "Choose Chat for a normal conversation or Task for implementation.",
+            _MODE_LABELS,
+            _MODE_DETAILS,
+        )
         return TurnResult.handled(
             text,
             choices=tuple(mode.value for mode in Mode),
@@ -522,7 +572,11 @@ class TaskSetup:
 
     @staticmethod
     def _task_flow_prompt(prefix: str | None = None) -> TurnResult:
-        text = prefix or "Choose the checks for this Task."
+        text = TaskSetup._prompt_text(
+            prefix or "Choose the checks for this Task.",
+            _FLOW_LABELS,
+            _FLOW_DETAILS,
+        )
         return TurnResult.handled(
             text,
             choices=tuple(flow.value for flow in TaskFlow),
@@ -531,7 +585,11 @@ class TaskSetup:
 
     @staticmethod
     def _merge_mode_prompt(prefix: str | None = None) -> TurnResult:
-        text = prefix or "Choose how a validated pull request may be merged."
+        text = TaskSetup._prompt_text(
+            prefix or "Choose how a validated pull request may be merged.",
+            _MERGE_LABELS,
+            _MERGE_DETAILS,
+        )
         return TurnResult.handled(
             text,
             choices=tuple(mode.value for mode in MergeMode),
@@ -580,14 +638,14 @@ class TaskSetup:
             else TaskSetup._format_timestamp(settings.auto_merge_expires_at)
         )
         details = (
-            f"Repository: {request.repository}\n"
-            f"Request ID: {request.request_id}\n"
+            f"Project: {request.repository}\n"
+            f"Task ID: {request.request_id}\n"
             f"Title: {request.content.title}\n"
             f"Description:\n{request.content.description}\n"
             f"Acceptance criteria:\n{criteria}\n"
-            f"Task flow: {request.task_flow.value}\n"
-            f"Execution path: {_FLOW_PATHS[request.task_flow]}\n"
-            f"Merge mode: {request.merge_mode.value}\n"
+            f"Checks selected: {_FLOW_LABELS[request.task_flow]}\n"
+            f"Checks: {_FLOW_PATHS[request.task_flow]}\n"
+            f"Merge choice: {_MERGE_LABELS[request.merge_mode]}\n"
             f"Merge result: {_MERGE_RESULTS[request.merge_mode]}\n"
             f"Automatic merge permission until: {expiry}\n"
             f"Confirmed by: {request.confirmed_by}\n"
@@ -605,6 +663,19 @@ class TaskSetup:
     @staticmethod
     def _format_timestamp(value: datetime) -> str:
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _prompt_text(
+        intro: str,
+        labels: dict[Enum, str],
+        details: dict[Enum, str],
+    ) -> str:
+        if labels.keys() != details.keys():
+            raise RuntimeError("Task prompt labels and descriptions do not match")
+        options = "\n".join(
+            f"- {label} — {details[value]}" for value, label in labels.items()
+        )
+        return f"{intro}\n\nOptions:\n{options}"
 
 
 def begin_task_setup(

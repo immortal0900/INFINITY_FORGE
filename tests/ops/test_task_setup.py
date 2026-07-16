@@ -16,6 +16,64 @@ REPOSITORY = "owner/repo"
 REQUEST_ID = "12345678-1234-4123-8123-123456789abc"
 
 
+def test_chooser_shows_plain_human_readable_english_options() -> None:
+    from forge.hermes_plugin.infinity_forge import _hook_result
+
+    setup = TaskSetup()
+
+    mode = setup.handle("s1", "u1", "첫 입력", NOW)
+    flow = setup.handle("s1", "u1", "Task", NOW + timedelta(seconds=1))
+    merge = setup.handle(
+        "s1", "u1", "Build + Review", NOW + timedelta(seconds=2)
+    )
+
+    assert [choice["label"] for choice in _hook_result(mode)["choices"]] == [
+        "Chat",
+        "Task",
+    ]
+    assert [choice["label"] for choice in _hook_result(flow)["choices"]] == [
+        "Build",
+        "Build + Review",
+        "Build + Review + Deep Check",
+    ]
+    assert [choice["label"] for choice in _hook_result(merge)["choices"]] == [
+        "Manual Merge",
+        "Safe Files Auto-Merge",
+        "All Validated PRs Auto-Merge",
+    ]
+
+
+def test_each_prompt_names_every_option_for_text_only_surfaces() -> None:
+    setup = TaskSetup()
+
+    mode = setup.handle("s1", "u1", "first request", NOW)
+    flow = setup.handle("s1", "u1", "task", NOW + timedelta(seconds=1))
+    merge = setup.handle(
+        "s1", "u1", "build_review", NOW + timedelta(seconds=2)
+    )
+
+    assert mode.text is not None
+    assert all(label in mode.text for label in ("Chat", "Task"))
+    assert flow.text is not None
+    assert all(
+        label in flow.text
+        for label in (
+            "Build",
+            "Build + Review",
+            "Build + Review + Deep Check",
+        )
+    )
+    assert merge.text is not None
+    assert all(
+        label in merge.text
+        for label in (
+            "Manual Merge",
+            "Safe Files Auto-Merge",
+            "All Validated PRs Auto-Merge",
+        )
+    )
+
+
 def test_chat_replays_first_message_exactly_once_without_external_writes() -> None:
     setup = TaskSetup()
     first_input = "  설명해줘\n둘째 줄도 그대로  "
@@ -205,10 +263,12 @@ def test_preview_builds_exact_task_request_and_keeps_it_through_confirm() -> Non
         "토큰을 로그에 남기지 않는다",
     )
     assert confirmed.task_request is request
-    assert f"Repository: {REPOSITORY}" in (preview.text or "")
-    assert f"Request ID: {REQUEST_ID}" in (preview.text or "")
-    assert "Execution path: Build → Review → current commit CI" in (preview.text or "")
-    assert "Merge result: Auto-merge safe files after validation" in (preview.text or "")
+    assert f"Project: {REPOSITORY}" in (preview.text or "")
+    assert f"Task ID: {REQUEST_ID}" in (preview.text or "")
+    assert "Checks: Build → Review → Automated Tests" in (preview.text or "")
+    assert "Merge result: System merges safe-file changes after all checks pass" in (
+        preview.text or ""
+    )
     assert "2026-07-16T21:00:02Z" in (preview.text or "")
 
 
@@ -235,18 +295,18 @@ def test_task_content_fallback_is_exact_raw_text_and_title_is_capped() -> None:
 @pytest.mark.parametrize(
     ("task_flow", "merge_mode", "expected_path", "expected_merge"),
     [
-        ("build", "manual", "Build → current commit CI", "Human merge after validation"),
+        ("build", "manual", "Build → Automated Tests", "Human merges after all checks pass"),
         (
             "build_review",
             "safe_auto",
-            "Build → Review → current commit CI",
-            "Auto-merge safe files after validation",
+            "Build → Review → Automated Tests",
+            "System merges safe-file changes after all checks pass",
         ),
         (
             "build_review_deep_check",
             "full_auto",
-            "Build → Review → Deep Check → current commit CI",
-            "Auto-merge any validated pull request",
+            "Build → Review → Deep Check → Automated Tests",
+            "System merges any pull request after all checks pass",
         ),
     ],
 )
@@ -268,7 +328,7 @@ def test_preview_shows_actual_flow_and_merge_result(
         repository=REPOSITORY,
     )
 
-    assert f"Execution path: {expected_path}" in (preview.text or "")
+    assert f"Checks: {expected_path}" in (preview.text or "")
     assert f"Merge result: {expected_merge}" in (preview.text or "")
 
 

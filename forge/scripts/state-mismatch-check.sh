@@ -1,5 +1,5 @@
 #!/bin/bash
-# INFINITY_FORGE drift-audit — 불변식·체류·신선도 감시 (LLM 0, 60분 주기)
+# INFINITY_FORGE state mismatch check — 저장 상태·체류·신선도 감시 (LLM 0, 60분 주기)
 # 위반 시에만 Slack 알림 (정상이면 침묵)
 set -u
 V=""
@@ -18,9 +18,10 @@ STUCK=$(sqlite3 "file:$HOME/.hermes/kanban.db?mode=ro" \
 # 4. 디스크
 DUSE=$(df --output=pcent / | tail -1 | tr -dc '0-9')
 [ "${DUSE:-0}" -gt 85 ] && V="$V [디스크 ${DUSE}%]"
-# 5. outbox 적체 (>20)
-OB=$(ls ~/forge/outbox/*.md 2>/dev/null | wc -l)
-[ "${OB:-0}" -gt 20 ] && V="$V [outbox 적체 ${OB}건]"
+# 5. pending MEMEX messages (>20). The existing data directory is retained
+# until the dirty memex skill can be migrated in a separate change.
+PENDING_COUNT=$(ls ~/forge/outbox/*.md 2>/dev/null | wc -l)
+[ "${PENDING_COUNT:-0}" -gt 20 ] && V="$V [pending messages ${PENDING_COUNT} items]"
 # 6. 라벨 불변식: open 이슈의 forge:* 라벨은 정확히 0 또는 1개 (0 = 미투입 이슈라 허용)
 DUP=$(/usr/bin/gh api "repos/immortal0900/INFINITY_FORGE/issues?state=open&per_page=50" \
   --jq '[.[] | select(has("pull_request") | not) | [.labels[].name | select(startswith("forge:"))] | select(length > 1)] | length' 2>/dev/null || echo 0)
@@ -30,8 +31,8 @@ if [ -n "$V" ]; then
   TOKEN=$(grep '^SLACK_BOT_TOKEN=' ~/.hermes/.env 2>/dev/null | cut -d= -f2)
   [ -n "$TOKEN" ] && curl -s -m 10 -X POST https://slack.com/api/chat.postMessage \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d "{\"channel\":\"#forge-cloud\",\"text\":\"⚠️ [INFINITY_FORGE] drift-audit 위반:$V\"}" > /dev/null
-  echo "DRIFT:$V" >&2
+    -d "{\"channel\":\"#forge-cloud\",\"text\":\"⚠️ [INFINITY_FORGE] 상태 불일치:$V\"}" > /dev/null
+  echo "STATE_MISMATCH:$V" >&2
   exit 1
 fi
-echo "drift-audit ok"
+echo "STATE_MATCH_OK"

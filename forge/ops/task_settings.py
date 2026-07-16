@@ -23,7 +23,11 @@ TASK_SETTINGS_SCHEMA_VERSION = 1
 MAX_AUTO_MERGE_DURATION = timedelta(hours=12)
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _REPOSITORY_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
+_PULL_REQUEST_URL_PATTERN = re.compile(
+    r"^https://github\.com/(?P<repository>[^/\s]+/[^/\s]+)/pull/[1-9][0-9]*$"
+)
 _AUTO_EXPIRY_UNSET = object()
 
 _TASK_SETTINGS_TABLE_SQL = """
@@ -85,6 +89,42 @@ CREATE TABLE task_settings_events (
 )
 """
 
+_BRANCH_REFRESH_INTENTS_TABLE_SQL = """
+CREATE TABLE task_branch_refresh_intents (
+    request_id TEXT NOT NULL
+        REFERENCES task_settings(request_id),
+    refresh_number INTEGER NOT NULL
+        CHECK (refresh_number BETWEEN 1 AND 3),
+    pr_url TEXT NOT NULL,
+    expected_base_commit TEXT NOT NULL,
+    expected_head_commit TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    current_base_commit TEXT,
+    current_head_commit TEXT,
+    completed_at TEXT,
+    PRIMARY KEY (request_id, refresh_number),
+    UNIQUE (request_id, expected_base_commit, expected_head_commit),
+    CHECK (
+        (
+            current_base_commit IS NULL
+            AND current_head_commit IS NULL
+            AND completed_at IS NULL
+        )
+        OR
+        (
+            current_base_commit IS NOT NULL
+            AND current_head_commit IS NOT NULL
+            AND completed_at IS NOT NULL
+        )
+    ),
+    CHECK (
+        current_base_commit IS NULL
+        OR current_base_commit <> expected_base_commit
+        OR current_head_commit <> expected_head_commit
+    )
+)
+"""
+
 _TERMINAL_EVENT_INDEX_SQL = """
 CREATE UNIQUE INDEX task_settings_one_terminal_event
     ON task_settings_events (request_id)
@@ -94,6 +134,7 @@ CREATE UNIQUE INDEX task_settings_one_terminal_event
 _EXPECTED_SCHEMA_OBJECTS = {
     ("table", "task_settings"): _TASK_SETTINGS_TABLE_SQL,
     ("table", "task_settings_events"): _TASK_SETTINGS_EVENTS_TABLE_SQL,
+    ("table", "task_branch_refresh_intents"): _BRANCH_REFRESH_INTENTS_TABLE_SQL,
     ("index", "task_settings_one_terminal_event"): _TERMINAL_EVENT_INDEX_SQL,
 }
 
@@ -391,6 +432,158 @@ class TaskSettingsEvent:
     task_settings_hash: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class BranchRefreshIntent:
+    """One durable, replayable permission to refresh an exact PR state."""
+
+    request_id: str
+    refresh_number: int
+    pr_url: str
+    expected_base_commit: str
+    expected_head_commit: str
+    created_at: datetime
+    current_base_commit: str | None
+    current_head_commit: str | None
+    completed_at: datetime | None
+
+    def __post_init__(self) -> None:
+        try:
+            parsed_request_id = UUID(self.request_id)
+        except (AttributeError, ValueError) as error:
+            raise TaskSettingsError(
+                "branch refresh request_id must be a canonical UUID string"
+            ) from error
+        if str(parsed_request_id) != self.request_id:
+            raise TaskSettingsError(
+                "branch refresh request_id must be a canonical UUID string"
+            )
+        if type(self.refresh_number) is not int or not 1 <= self.refresh_number <= 3:
+            raise TaskSettingsError("branch refresh number must be between 1 and 3")
+        if not isinstance(self.pr_url, str) or not _PULL_REQUEST_URL_PATTERN.fullmatch(
+            self.pr_url
+        ):
+            raise TaskSettingsError("branch refresh pull request URL is invalid")
+        for field_name, value in (
+            ("expected_base_commit", self.expected_base_commit),
+            ("expected_head_commit", self.expected_head_commit),
+        ):
+            if not isinstance(value, str) or not _COMMIT_PATTERN.fullmatch(value):
+                raise TaskSettingsError(f"branch refresh {field_name} is invalid")
+        object.__setattr__(
+            self,
+            "created_at",
+            _normalize_datetime(self.created_at, "created_at"),
+        )
+        result_values = (
+            self.current_base_commit,
+            self.current_head_commit,
+            self.completed_at,
+        )
+        if all(value is None for value in result_values):
+            return
+        if any(value is None for value in result_values):
+            raise TaskSettingsError("branch refresh result must be complete")
+        assert self.current_base_commit is not None
+        assert self.current_head_commit is not None
+        assert self.completed_at is not None
+        if not _COMMIT_PATTERN.fullmatch(self.current_base_commit):
+            raise TaskSettingsError("branch refresh current_base_commit is invalid")
+        if not _COMMIT_PATTERN.fullmatch(self.current_head_commit):
+            raise TaskSettingsError("branch refresh current_head_commit is invalid")
+        if (
+            self.current_base_commit == self.expected_base_commit
+            and self.current_head_commit == self.expected_head_commit
+        ):
+            raise TaskSettingsError("branch refresh result did not change the pull request")
+        object.__setattr__(
+            self,
+            "completed_at",
+            _normalize_datetime(self.completed_at, "completed_at"),
+        )
+
+    @property
+    def completed(self) -> bool:
+        return self.completed_at is not None
+
+
+class ActiveTaskGuard:
+    """Hold one Task active while an external write is completed."""
+
+    def __init__(
+        self,
+        store: TaskSettingsStore,
+        connection: sqlite3.Connection,
+        settings: TaskSettings,
+    ) -> None:
+        self._store = store
+        self._connection = connection
+        self.settings = settings
+
+    def finish(
+        self,
+        status: TaskSettingsStatus,
+        *,
+        occurred_at: datetime | None = None,
+    ) -> TaskSettings:
+        """End the guarded Task in the same transaction as the active check."""
+
+        if (
+            not isinstance(status, TaskSettingsStatus)
+            or status not in _TERMINAL_STATUSES
+        ):
+            raise TaskSettingsError(
+                "lifecycle status must be cancelled, expired, or merged"
+            )
+        current = self._store._load_settings(
+            self._connection,
+            self.settings.request_id,
+        )
+        if current.status is status:
+            self.settings = current
+            return current
+        if current.status in _TERMINAL_STATUSES:
+            raise TaskSettingsError("lifecycle status is immutable")
+        if current != self.settings or current.status is not TaskSettingsStatus.ACTIVE:
+            raise TaskSettingsError("guarded Task settings changed")
+        self._connection.execute(
+            """
+            INSERT INTO task_settings_events (
+                request_id, event_type, occurred_at
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                current.request_id,
+                _STATUS_TO_EVENT[status].value,
+                _format_timestamp(_event_time(occurred_at)),
+            ),
+        )
+        self.settings = self._store._load_settings(
+            self._connection,
+            current.request_id,
+        )
+        return self.settings
+
+    def complete_branch_refresh(
+        self,
+        intent: BranchRefreshIntent,
+        *,
+        current_base_commit: str,
+        current_head_commit: str,
+        occurred_at: datetime | None = None,
+    ) -> BranchRefreshIntent:
+        """Persist refresh readback without opening a second DB connection."""
+
+        if intent.request_id != self.settings.request_id:
+            raise TaskSettingsError("branch refresh intent does not match guarded Task")
+        return self._store._complete_branch_refresh_on_connection(
+            self._connection,
+            intent,
+            current_base_commit=current_base_commit,
+            current_head_commit=current_head_commit,
+            occurred_at=occurred_at,
+        )
+
+
 class TaskSettingsStore:
     """Persist immutable settings plus append-only lifecycle events."""
 
@@ -429,6 +622,7 @@ class TaskSettingsStore:
                     )
                 connection.execute(_TASK_SETTINGS_TABLE_SQL)
                 connection.execute(_TASK_SETTINGS_EVENTS_TABLE_SQL)
+                connection.execute(_BRANCH_REFRESH_INTENTS_TABLE_SQL)
                 connection.execute(_TERMINAL_EVENT_INDEX_SQL)
                 connection.execute(
                     f"PRAGMA user_version = {TASK_SETTINGS_SCHEMA_VERSION}"
@@ -635,6 +829,31 @@ class TaskSettingsStore:
             settings = self._load_settings(connection, request_id)
         return settings if settings.status is TaskSettingsStatus.ACTIVE else None
 
+    @contextmanager
+    def guard_active(self, expected: TaskSettings) -> Iterator[ActiveTaskGuard]:
+        """Serialize an external write against cancel, expiry, and merge."""
+
+        if not isinstance(expected, TaskSettings):
+            raise TaskSettingsError("expected settings must be TaskSettings")
+        if expected.status is not TaskSettingsStatus.ACTIVE:
+            raise TaskSettingsError("expected Task settings must be active")
+        with (
+            _normalize_database_errors(),
+            closing(self._connect()) as connection,
+        ):
+            try:
+                _begin_write(connection)
+                current = self._load_settings(connection, expected.request_id)
+                if current.status is not TaskSettingsStatus.ACTIVE:
+                    raise TaskSettingsError("Task settings are no longer active")
+                if current != expected:
+                    raise TaskSettingsError("Task settings changed before external write")
+                yield ActiveTaskGuard(self, connection, current)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
     def list_events(self, request_id: str) -> tuple[TaskSettingsEvent, ...]:
         with (
             _normalize_database_errors(),
@@ -643,6 +862,189 @@ class TaskSettingsStore:
         ):
             self._load_settings(connection, request_id)
             return self._load_events(connection, request_id)
+
+    def reserve_branch_refresh(
+        self,
+        request_id: str,
+        *,
+        pr_url: str,
+        expected_base_commit: str,
+        expected_head_commit: str,
+        applied_refresh_count: int,
+        occurred_at: datetime | None = None,
+    ) -> BranchRefreshIntent:
+        """Spend the next refresh number before any GitHub write."""
+
+        if type(applied_refresh_count) is not int or applied_refresh_count < 0:
+            raise TaskSettingsError("applied branch refresh count is invalid")
+        event_time = _event_time(occurred_at)
+        with (
+            _normalize_database_errors(),
+            closing(self._connect()) as connection,
+            connection,
+        ):
+            _begin_write(connection)
+            settings = self._load_settings(connection, request_id)
+            _require_active_refresh_settings(settings, pr_url)
+            intents = self._load_branch_refresh_intents(connection, request_id)
+            replay = _branch_refresh_replay(intents, applied_refresh_count)
+            if replay is not None:
+                if _branch_refresh_expected_identity(replay) != (
+                    request_id,
+                    pr_url,
+                    expected_base_commit,
+                    expected_head_commit,
+                ):
+                    raise TaskSettingsError(
+                        "reserved branch refresh has a different pull request state"
+                    )
+                return replay
+            if applied_refresh_count >= 3:
+                raise TaskSettingsError("branch refresh limit was reached")
+
+            intent = BranchRefreshIntent(
+                request_id=request_id,
+                refresh_number=applied_refresh_count + 1,
+                pr_url=pr_url,
+                expected_base_commit=expected_base_commit,
+                expected_head_commit=expected_head_commit,
+                created_at=event_time,
+                current_base_commit=None,
+                current_head_commit=None,
+                completed_at=None,
+            )
+            connection.execute(
+                """
+                INSERT INTO task_branch_refresh_intents (
+                    request_id,
+                    refresh_number,
+                    pr_url,
+                    expected_base_commit,
+                    expected_head_commit,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent.request_id,
+                    intent.refresh_number,
+                    intent.pr_url,
+                    intent.expected_base_commit,
+                    intent.expected_head_commit,
+                    _format_timestamp(intent.created_at),
+                ),
+            )
+            return self._load_branch_refresh_intents(connection, request_id)[-1]
+
+    def get_branch_refresh_replay(
+        self,
+        request_id: str,
+        *,
+        applied_refresh_count: int,
+    ) -> BranchRefreshIntent | None:
+        """Return the one intent not yet represented in the Hermes proof chain."""
+
+        if type(applied_refresh_count) is not int or applied_refresh_count < 0:
+            raise TaskSettingsError("applied branch refresh count is invalid")
+        with (
+            _normalize_database_errors(),
+            closing(self._connect()) as connection,
+            connection,
+        ):
+            settings = self._load_settings(connection, request_id)
+            if settings.status is not TaskSettingsStatus.ACTIVE:
+                raise TaskSettingsError("Task settings are no longer active")
+            intents = self._load_branch_refresh_intents(connection, request_id)
+            return _branch_refresh_replay(intents, applied_refresh_count)
+
+    def complete_branch_refresh(
+        self,
+        intent: BranchRefreshIntent,
+        *,
+        current_base_commit: str,
+        current_head_commit: str,
+        occurred_at: datetime | None = None,
+    ) -> BranchRefreshIntent:
+        """Persist the exact readback for one previously reserved refresh."""
+
+        with (
+            _normalize_database_errors(),
+            closing(self._connect()) as connection,
+            connection,
+        ):
+            _begin_write(connection)
+            return self._complete_branch_refresh_on_connection(
+                connection,
+                intent,
+                current_base_commit=current_base_commit,
+                current_head_commit=current_head_commit,
+                occurred_at=occurred_at,
+            )
+
+    def _complete_branch_refresh_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        intent: BranchRefreshIntent,
+        *,
+        current_base_commit: str,
+        current_head_commit: str,
+        occurred_at: datetime | None,
+    ) -> BranchRefreshIntent:
+        if not isinstance(intent, BranchRefreshIntent):
+            raise TaskSettingsError("intent must be a BranchRefreshIntent")
+        event_time = _event_time(occurred_at)
+        candidate = replace(
+            intent,
+            current_base_commit=current_base_commit,
+            current_head_commit=current_head_commit,
+            completed_at=event_time,
+        )
+        settings = self._load_settings(connection, intent.request_id)
+        _require_active_refresh_settings(settings, intent.pr_url)
+        intents = self._load_branch_refresh_intents(
+            connection,
+            intent.request_id,
+        )
+        if intent.refresh_number > len(intents):
+            raise TaskSettingsError("branch refresh intent was not reserved")
+        stored = intents[intent.refresh_number - 1]
+        if _branch_refresh_expected_identity(stored) != (
+            intent.request_id,
+            intent.pr_url,
+            intent.expected_base_commit,
+            intent.expected_head_commit,
+        ):
+            raise TaskSettingsError("stored branch refresh intent does not match")
+        if stored.completed:
+            if (
+                stored.current_base_commit != current_base_commit
+                or stored.current_head_commit != current_head_commit
+            ):
+                raise TaskSettingsError(
+                    "completed branch refresh has a different result"
+                )
+            return stored
+        connection.execute(
+            """
+            UPDATE task_branch_refresh_intents
+            SET current_base_commit = ?,
+                current_head_commit = ?,
+                completed_at = ?
+            WHERE request_id = ?
+              AND refresh_number = ?
+              AND completed_at IS NULL
+            """,
+            (
+                candidate.current_base_commit,
+                candidate.current_head_commit,
+                _format_timestamp(event_time),
+                candidate.request_id,
+                candidate.refresh_number,
+            ),
+        )
+        return self._load_branch_refresh_intents(
+            connection,
+            intent.request_id,
+        )[intent.refresh_number - 1]
 
     def replace(self, request_id: str, **changes: object) -> Never:
         del request_id, changes
@@ -738,6 +1140,102 @@ class TaskSettingsStore:
                 )
             )
         return tuple(events)
+
+    def _load_branch_refresh_intents(
+        self,
+        connection: sqlite3.Connection,
+        request_id: str,
+    ) -> tuple[BranchRefreshIntent, ...]:
+        rows = connection.execute(
+            """
+            SELECT
+                request_id,
+                refresh_number,
+                pr_url,
+                expected_base_commit,
+                expected_head_commit,
+                created_at,
+                current_base_commit,
+                current_head_commit,
+                completed_at
+            FROM task_branch_refresh_intents
+            WHERE request_id = ?
+            ORDER BY refresh_number
+            """,
+            (request_id,),
+        ).fetchall()
+        intents = tuple(
+            BranchRefreshIntent(
+                request_id=row["request_id"],
+                refresh_number=row["refresh_number"],
+                pr_url=row["pr_url"],
+                expected_base_commit=row["expected_base_commit"],
+                expected_head_commit=row["expected_head_commit"],
+                created_at=_parse_timestamp(row["created_at"], "created_at"),
+                current_base_commit=row["current_base_commit"],
+                current_head_commit=row["current_head_commit"],
+                completed_at=(
+                    None
+                    if row["completed_at"] is None
+                    else _parse_timestamp(row["completed_at"], "completed_at")
+                ),
+            )
+            for row in rows
+        )
+        if tuple(intent.refresh_number for intent in intents) != tuple(
+            range(1, len(intents) + 1)
+        ):
+            raise TaskSettingsError("stored branch refresh sequence is not contiguous")
+        return intents
+
+
+def _require_active_refresh_settings(
+    settings: TaskSettings,
+    pr_url: str,
+) -> None:
+    if settings.status is not TaskSettingsStatus.ACTIVE:
+        raise TaskSettingsError("Task settings are no longer active")
+    match = (
+        _PULL_REQUEST_URL_PATTERN.fullmatch(pr_url)
+        if isinstance(pr_url, str)
+        else None
+    )
+    if match is None or match.group("repository") != settings.repository:
+        raise TaskSettingsError(
+            "branch refresh pull request does not match Task settings"
+        )
+
+
+def _branch_refresh_expected_identity(
+    intent: BranchRefreshIntent,
+) -> tuple[str, str, str, str]:
+    return (
+        intent.request_id,
+        intent.pr_url,
+        intent.expected_base_commit,
+        intent.expected_head_commit,
+    )
+
+
+def _branch_refresh_replay(
+    intents: tuple[BranchRefreshIntent, ...],
+    applied_refresh_count: int,
+) -> BranchRefreshIntent | None:
+    if applied_refresh_count > len(intents):
+        raise TaskSettingsError(
+            "Hermes branch refresh count has no durable proof"
+        )
+    if len(intents) > applied_refresh_count + 1:
+        raise TaskSettingsError(
+            "durable branch refresh count is more than one step ahead"
+        )
+    if any(not intent.completed for intent in intents[:applied_refresh_count]):
+        raise TaskSettingsError(
+            "Hermes branch refresh count has no completed durable proof"
+        )
+    if applied_refresh_count == len(intents):
+        return None
+    return intents[applied_refresh_count]
 
 
 def _base_row_values(settings: TaskSettings) -> tuple[object, ...]:

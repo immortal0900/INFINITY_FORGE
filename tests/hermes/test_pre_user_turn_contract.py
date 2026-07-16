@@ -54,6 +54,36 @@ def test_handled_returns_without_running_the_original_turn(monkeypatch) -> None:
     assert result["handled"] is True
 
 
+def test_handled_preserves_valid_structured_choices(monkeypatch) -> None:
+    choices = [
+        {"id": "chat", "label": "Chat"},
+        {"id": "task", "label": "Task"},
+    ]
+
+    result = _run_changed_source(
+        monkeypatch,
+        {"action": "handled", "text": "Choose one", "choices": choices},
+    )
+
+    assert result["choices"] == choices
+
+
+def test_malformed_choice_objects_fail_closed(monkeypatch) -> None:
+    result = _run_changed_source(
+        monkeypatch,
+        {
+            "action": "handled",
+            "text": "Choose one",
+            "choices": [{"id": "chat"}],
+        },
+    )
+
+    assert result["handled"] is True
+    assert result["api_calls"] == 0
+    assert result["choices"] == []
+    assert "conflict" in result["final_response"].lower()
+
+
 def test_replace_passes_the_replacement_to_the_original_turn(monkeypatch) -> None:
     result = _run_changed_source(
         monkeypatch,

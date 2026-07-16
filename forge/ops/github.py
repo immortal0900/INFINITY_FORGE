@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .contracts import CheckRun, PullRequestSnapshot
+from .contracts import CheckRun
 from .hermes import GateError
 from .safe_files import (
     ChangedFile,
@@ -222,114 +222,6 @@ class GitHubClient:
         if not isinstance(payload, list) or not payload:
             raise GateError(f"GitHub {label} pagination response is invalid")
         return payload
-
-    def get_pr_snapshot(
-        self,
-        pr_url: str,
-        required_check_names: Sequence[str],
-    ) -> PullRequestSnapshot:
-        match = _PR_URL_RE.fullmatch(pr_url)
-        if match is None:
-            raise GateError("GitHub PR URL has an invalid format")
-        repository = match.group("repository")
-        pr_number = int(match.group("number"))
-        required_names = tuple(required_check_names)
-        if (
-            not required_names
-            or any(not isinstance(name, str) or not name.strip() for name in required_names)
-            or len(set(required_names)) != len(required_names)
-        ):
-            raise GateError("required check names must be unique non-empty strings")
-
-        pr_payload = self._get_json(
-            f"repos/{repository}/pulls/{pr_number}",
-            "pull request",
-        )
-        api_pr_number = pr_payload.get("number")
-        if (
-            not isinstance(api_pr_number, int)
-            or isinstance(api_pr_number, bool)
-            or api_pr_number != pr_number
-        ):
-            raise GateError("GitHub PR number does not match requested URL")
-        if pr_payload.get("html_url") != pr_url:
-            raise GateError("GitHub PR URL does not match requested URL")
-        state = pr_payload.get("state")
-        if state not in {"open", "closed"}:
-            raise GateError("GitHub PR state is invalid")
-        draft = pr_payload.get("draft")
-        if not isinstance(draft, bool):
-            raise GateError("GitHub PR draft flag is invalid")
-        head = _require_object(pr_payload.get("head"), "PR head")
-        head_sha = _require_text(head.get("sha"), "PR head SHA")
-        if _GIT_SHA_RE.fullmatch(head_sha) is None:
-            raise GateError("GitHub PR head SHA has an invalid format")
-
-        check_payload = self._get_json(
-            f"repos/{repository}/commits/{head_sha}/check-runs?per_page=100",
-            "check-runs",
-        )
-        raw_checks = check_payload.get("check_runs")
-        if not isinstance(raw_checks, list):
-            raise GateError("GitHub check-runs must be an array")
-        total_count = check_payload.get("total_count")
-        if (
-            not isinstance(total_count, int)
-            or isinstance(total_count, bool)
-            or total_count != len(raw_checks)
-        ):
-            raise GateError(
-                "GitHub check-runs total_count does not match the complete payload"
-            )
-
-        checks: list[CheckRun] = []
-        for required_name in required_names:
-            matches = [
-                raw
-                for raw in raw_checks
-                if isinstance(raw, dict) and raw.get("name") == required_name
-            ]
-            if len(matches) != 1:
-                raise GateError(
-                    f"required check {required_name} must appear exactly one time"
-                )
-            raw = matches[0]
-            status = raw.get("status")
-            if status not in _CHECK_STATUSES:
-                raise GateError(f"required check {required_name} has invalid status")
-            conclusion = raw.get("conclusion")
-            if status == "completed":
-                if conclusion not in _CHECK_CONCLUSIONS:
-                    raise GateError(
-                        f"required check {required_name} has invalid conclusion"
-                    )
-            elif conclusion is not None:
-                raise GateError(
-                    f"pending required check {required_name} has a conclusion"
-                )
-            check_head_sha = raw.get("head_sha")
-            if check_head_sha != head_sha:
-                raise GateError(
-                    f"required check {required_name} is not bound to current HEAD"
-                )
-            checks.append(
-                CheckRun(
-                    name=required_name,
-                    status=status,
-                    conclusion=conclusion,
-                    head_sha=head_sha,
-                )
-            )
-
-        return PullRequestSnapshot(
-            pr_url=pr_url,
-            repository=repository,
-            pr_number=pr_number,
-            head_sha=head_sha,
-            is_open=state == "open",
-            is_draft=draft,
-            checks=tuple(checks),
-        )
 
     def _read_pull_request(
         self,

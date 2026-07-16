@@ -95,6 +95,7 @@ TUI_GATEWAY_SOURCE = '''def process(agent, history, _stream, session, text, raw,
         "stream_callback": _stream,
     }
     result = agent.run_conversation(text, **run_kwargs)
+    payload = {"text": raw, "usage": _get_usage(agent), "status": status}
     if status == "complete" and isinstance(raw, str) and raw.strip():
         evaluate_goal()
     if (
@@ -105,10 +106,14 @@ TUI_GATEWAY_SOURCE = '''def process(agent, history, _stream, session, text, raw,
         and text.strip()
     ):
         maybe_auto_title()
-    return result
+    return payload
 '''
 
-GATEWAY_SOURCE = '''def handle(self, event, source):
+GATEWAY_SOURCE = '''def deliver(agent_result):
+    response = agent_result.get("final_response") or ""
+    return response
+
+def handle(self, event, source):
     _agent_result = self._handle_message_with_agent(event, source)
     _final_text = str(_agent_result.get("final_response") or "")
     if _final_text.strip():
@@ -185,6 +190,99 @@ def test_user_surfaces_opt_in_and_handled_turns_skip_model_followups() -> None:
 
     for changed in (changed_forwarder, changed_cli, changed_tui, changed_gateway):
         compile(changed, "<changed Hermes source>", "exec")
+
+
+def test_cli_displays_choice_labels_without_changing_stable_ids() -> None:
+    namespace: dict[str, object] = {"maybe_auto_title": lambda: None}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    choices = [
+        {"id": "chat", "label": "Chat"},
+        {"id": "task", "label": "Task"},
+    ]
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**kwargs):
+            assert kwargs["is_user_turn"] is True
+            return {
+                "final_response": "Choose one.",
+                "choices": choices,
+                "handled": True,
+            }
+
+    cli = type(
+        "CLI",
+        (),
+        {
+            "agent": Agent(),
+            "conversation_history": ["current"],
+            "session_id": "session-1",
+        },
+    )()
+    result = namespace["process"](cli, "request", "request", None)
+
+    assert result["choices"] == choices
+    assert "- Chat" in result["final_response"]
+    assert "- Task" in result["final_response"]
+
+
+def test_tui_transports_choice_objects_in_message_payload() -> None:
+    namespace: dict[str, object] = {
+        "evaluate_goal": lambda: None,
+        "maybe_auto_title": lambda: None,
+        "_get_usage": lambda agent: {},
+    }
+    exec(installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE), namespace)
+    choices = [
+        {"id": "build", "label": "Build"},
+        {"id": "build_review", "label": "Build + Review"},
+    ]
+
+    class Agent:
+        @staticmethod
+        def run_conversation(text, **kwargs):
+            assert kwargs["is_user_turn"] is True
+            return {"final_response": "Choose checks.", "choices": choices}
+
+    payload = namespace["process"](
+        Agent(), [], None, {}, "request", "Choose checks.", "handled"
+    )
+
+    assert payload["choices"] == choices
+
+
+def test_gateway_displays_choice_labels_without_changing_stable_ids() -> None:
+    namespace: dict[str, object] = {}
+    exec(installer.change_gateway_source(GATEWAY_SOURCE), namespace)
+    choices = [
+        {"id": "manual", "label": "Manual Merge"},
+        {"id": "safe_auto", "label": "Safe Files Auto-Merge"},
+    ]
+
+    class Agent:
+        @staticmethod
+        def run_conversation(message, **kwargs):
+            assert kwargs["is_user_turn"] is True
+            return {
+                "final_response": "Choose one.",
+                "choices": choices,
+                "handled": True,
+            }
+
+    gateway = type("Gateway", (), {"_session_db": False})()
+    result = namespace["run"](
+        gateway,
+        Agent(),
+        [],
+        "session-1",
+        "Choose one.",
+    )
+
+    response = namespace["deliver"](result)
+
+    assert result["choices"] == choices
+    assert "- Manual Merge" in response
+    assert "- Safe Files Auto-Merge" in response
 
 
 def test_build_install_and_restore_round_trip(tmp_path: Path) -> None:

@@ -19,7 +19,6 @@ __all__ = [
     "DEEP_CHECK_RESULT_REQUIRED_FIELDS",
     "DeepCheckDecision",
     "DeepCheckResult",
-    "PullRequestSnapshot",
     "REVIEW_RESULT_REQUIRED_FIELDS",
     "ReviewDecision",
     "ReviewResult",
@@ -44,8 +43,6 @@ _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _GITHUB_PR_RE = re.compile(
     r"^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$"
 )
-_GITHUB_REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
-
 # RISK(public-api): These exact fields are the clean-break worker contract.
 # Accepting aliases can attach proof to the wrong Task or pull request.
 BUILD_RESULT_REQUIRED_FIELDS = frozenset(
@@ -53,6 +50,7 @@ BUILD_RESULT_REQUIRED_FIELDS = frozenset(
         "format_version",
         "task_settings_hash",
         "pr_url",
+        "built_base_commit",
         "built_commit",
         "changed_files",
         "completed_items",
@@ -100,34 +98,6 @@ STEP_PROOF_REQUIRED_FIELDS = frozenset(
     }
 )
 
-# Isolated compatibility data for the old modules pending their Task 8 removal.
-REVIEWER_RESULT_REQUIRED_FIELDS = frozenset(
-    {
-        "schema_version",
-        "verdict",
-        "source_digest",
-        "pr_url",
-        "head_sha",
-        "delta_check",
-        "spec_check",
-    }
-)
-REVIEWER_RESULT_OPTIONAL_FIELDS = frozenset({"reflection"})
-CRITIC_RESULT_REQUIRED_FIELDS = frozenset(
-    {
-        "schema_version",
-        "outcome",
-        "source_digest",
-        "pr_url",
-        "reviewed_head_sha",
-        "result_head_sha",
-        "added_tests",
-        "scenarios",
-    }
-)
-CRITIC_RESULT_OPTIONAL_FIELDS = frozenset({"reflection"})
-
-
 class ContractError(ValueError):
     """Raised when Task evidence does not satisfy its declared contract."""
 
@@ -140,20 +110,6 @@ class ReviewDecision(str, Enum):
 class DeepCheckDecision(str, Enum):
     PASS = "pass"
     PROBLEMS_FOUND = "problems_found"
-
-
-class PipelineStage(str, Enum):
-    EXECUTOR = "executor"
-    REVIEWER = "reviewer"
-    CRITIC = "critic"
-    EXECUTOR_REWORK = "executor-rework"
-
-
-class StageOutcome(str, Enum):
-    APPROVE = "approve"
-    REJECT = "reject"
-    PASS = "pass"
-    DEFECT_FOUND = "defect_found"
 
 
 @dataclass(frozen=True)
@@ -185,21 +141,11 @@ class CheckRun:
 
 
 @dataclass(frozen=True)
-class PullRequestSnapshot:
-    pr_url: str
-    repository: str
-    pr_number: int
-    head_sha: str
-    is_open: bool
-    is_draft: bool
-    checks: tuple[CheckRun, ...]
-
-
-@dataclass(frozen=True)
 class BuildResult:
     format_version: str
     task_settings_hash: str
     pr_url: str
+    built_base_commit: str
     built_commit: str
     changed_files: tuple[str, ...]
     completed_items: tuple[str, ...]
@@ -247,43 +193,6 @@ class StepProof:
 
 
 TaskResult: TypeAlias = BuildResult | ReviewResult | DeepCheckResult
-
-
-@dataclass(frozen=True)
-class ExecutorResult:
-    pr_url: str
-    changed_files: tuple[str, ...]
-    implemented: tuple[str, ...]
-    not_implemented: tuple[object, ...]
-    verified_by: Mapping[str, object]
-
-
-@dataclass(frozen=True)
-class ReviewerResult:
-    schema_version: str
-    verdict: StageOutcome
-    source_digest: str
-    pr_url: str
-    head_sha: str
-    delta_check: Mapping[str, tuple[str, ...]]
-    spec_check: Mapping[str, tuple[str, ...]]
-    reflection: str | None = None
-
-
-@dataclass(frozen=True)
-class CriticResult:
-    schema_version: str
-    outcome: StageOutcome
-    source_digest: str
-    pr_url: str
-    reviewed_head_sha: str
-    result_head_sha: str
-    added_tests: tuple[str, ...]
-    scenarios: tuple[str, ...]
-    reflection: str | None = None
-
-
-StageResult: TypeAlias = ExecutorResult | ReviewerResult | CriticResult
 
 
 def _require_mapping(value: object, label: str) -> Mapping[str, object]:
@@ -347,12 +256,6 @@ def _require_check_object(
     }
 
 
-def _optional_reflection(value: Mapping[str, object]) -> str | None:
-    if "reflection" not in value:
-        return None
-    return _require_string(value, "reflection")
-
-
 def _require_nullable_string(
     value: Mapping[str, object], key: str
 ) -> str | None:
@@ -399,6 +302,9 @@ def parse_build_result(summary: Mapping[str, object]) -> BuildResult:
             parsed, "task_settings_hash", pattern=_SHA256_RE
         ),
         pr_url=_require_string(parsed, "pr_url", pattern=_GITHUB_PR_RE),
+        built_base_commit=_require_string(
+            parsed, "built_base_commit", pattern=_GIT_SHA_RE
+        ),
         built_commit=_require_string(parsed, "built_commit", pattern=_GIT_SHA_RE),
         changed_files=_require_string_array(parsed, "changed_files", non_empty=False),
         completed_items=_require_string_array(
@@ -534,6 +440,7 @@ def task_result_payload(result: TaskResult) -> Mapping[str, object]:
             "format_version": result.format_version,
             "task_settings_hash": result.task_settings_hash,
             "pr_url": result.pr_url,
+            "built_base_commit": result.built_base_commit,
             "built_commit": result.built_commit,
             "changed_files": list(result.changed_files),
             "completed_items": list(result.completed_items),
@@ -589,6 +496,7 @@ def validate_task_result_binding(
     *,
     expected_task_settings_hash: str,
     expected_pr_url: str,
+    current_base_commit: str,
     current_commit: str,
 ) -> None:
     """Bind result proof to the exact Task settings, PR, and current commit."""
@@ -599,6 +507,8 @@ def validate_task_result_binding(
         raise ContractError("expected_pr_url has an invalid format")
     if _GIT_SHA_RE.fullmatch(current_commit) is None:
         raise ContractError("current_commit has an invalid format")
+    if _GIT_SHA_RE.fullmatch(current_base_commit) is None:
+        raise ContractError("current_base_commit has an invalid format")
     if not isinstance(result, (BuildResult, ReviewResult, DeepCheckResult)):
         raise ContractError("unsupported Task result binding")
     if result.task_settings_hash != expected_task_settings_hash:
@@ -607,6 +517,8 @@ def validate_task_result_binding(
         raise ContractError("pr_url does not match the Task PR")
 
     if isinstance(result, BuildResult):
+        if result.built_base_commit != current_base_commit:
+            raise ContractError("built base commit does not match current base commit")
         result_commit = result.built_commit
     elif isinstance(result, ReviewResult):
         result_commit = result.reviewed_commit
@@ -614,221 +526,3 @@ def validate_task_result_binding(
         result_commit = result.tested_commit
     if result_commit != current_commit:
         raise ContractError("result commit does not match current commit")
-
-
-def _parse_executor(summary: Mapping[str, object]) -> ExecutorResult:
-    required = {
-        "pr_url",
-        "changed_files",
-        "implemented",
-        "not_implemented",
-        "verified_by",
-    }
-    _require_exact_fields(summary, required=required)
-    not_implemented = summary.get("not_implemented")
-    if not isinstance(not_implemented, list):
-        raise ContractError("not_implemented must be an array")
-    verified_by = _require_mapping(summary.get("verified_by"), "verified_by")
-    if not verified_by:
-        raise ContractError("verified_by must be a non-empty object")
-    return ExecutorResult(
-        pr_url=_require_string(summary, "pr_url", pattern=_GITHUB_PR_RE),
-        changed_files=_require_string_array(summary, "changed_files", non_empty=False),
-        implemented=_require_string_array(summary, "implemented", non_empty=True),
-        not_implemented=tuple(not_implemented),
-        verified_by=dict(verified_by),
-    )
-
-
-def _parse_reviewer(summary: Mapping[str, object]) -> ReviewerResult:
-    schema_version = _require_string(summary, "schema_version")
-    if schema_version != "forge-reviewer-result/v1":
-        raise ContractError("schema_version must be 'forge-reviewer-result/v1'")
-    verdict_text = _require_string(summary, "verdict")
-    if verdict_text not in {StageOutcome.APPROVE.value, StageOutcome.REJECT.value}:
-        raise ContractError("verdict must be 'approve' or 'reject'")
-    if verdict_text == StageOutcome.REJECT.value:
-        _require_string(summary, "reflection")
-
-    _require_exact_fields(
-        summary,
-        required=REVIEWER_RESULT_REQUIRED_FIELDS,
-        optional=REVIEWER_RESULT_OPTIONAL_FIELDS,
-    )
-    return ReviewerResult(
-        schema_version=schema_version,
-        verdict=StageOutcome(verdict_text),
-        source_digest=_require_string(summary, "source_digest", pattern=_SHA256_RE),
-        pr_url=_require_string(summary, "pr_url", pattern=_GITHUB_PR_RE),
-        head_sha=_require_string(summary, "head_sha", pattern=_GIT_SHA_RE),
-        delta_check=_require_check_object(
-            summary,
-            "delta_check",
-            {"implemented_verified", "discrepancies"},
-        ),
-        spec_check=_require_check_object(summary, "spec_check", {"met", "unmet"}),
-        reflection=_optional_reflection(summary),
-    )
-
-
-def _parse_critic(summary: Mapping[str, object]) -> CriticResult:
-    schema_version = _require_string(summary, "schema_version")
-    if schema_version != "forge-critic-result/v1":
-        raise ContractError("schema_version must be 'forge-critic-result/v1'")
-    outcome_text = _require_string(summary, "outcome")
-    if outcome_text not in {StageOutcome.PASS.value, StageOutcome.DEFECT_FOUND.value}:
-        raise ContractError("outcome must be 'pass' or 'defect_found'")
-
-    added_tests = _require_string_array(summary, "added_tests", non_empty=True)
-    if outcome_text == StageOutcome.DEFECT_FOUND.value:
-        _require_string(summary, "reflection")
-
-    _require_exact_fields(
-        summary,
-        required=CRITIC_RESULT_REQUIRED_FIELDS,
-        optional=CRITIC_RESULT_OPTIONAL_FIELDS,
-    )
-    return CriticResult(
-        schema_version=schema_version,
-        outcome=StageOutcome(outcome_text),
-        source_digest=_require_string(summary, "source_digest", pattern=_SHA256_RE),
-        pr_url=_require_string(summary, "pr_url", pattern=_GITHUB_PR_RE),
-        reviewed_head_sha=_require_string(
-            summary, "reviewed_head_sha", pattern=_GIT_SHA_RE
-        ),
-        result_head_sha=_require_string(summary, "result_head_sha", pattern=_GIT_SHA_RE),
-        added_tests=added_tests,
-        scenarios=_require_string_array(summary, "scenarios", non_empty=True),
-        reflection=_optional_reflection(summary),
-    )
-
-
-def parse_stage_result(
-    stage: PipelineStage,
-    summary: Mapping[str, object],
-    metadata: Mapping[str, object],
-) -> StageResult:
-    """Parse one completed run without accepting missing or extra evidence."""
-
-    if not isinstance(stage, PipelineStage):
-        raise ContractError("stage must be a PipelineStage")
-    parsed_summary = _require_mapping(summary, "summary")
-    _require_mapping(metadata, "metadata")
-    if stage in {PipelineStage.EXECUTOR, PipelineStage.EXECUTOR_REWORK}:
-        return _parse_executor(parsed_summary)
-    if stage is PipelineStage.REVIEWER:
-        return _parse_reviewer(parsed_summary)
-    if stage is PipelineStage.CRITIC:
-        return _parse_critic(parsed_summary)
-    raise ContractError(f"unsupported stage: {stage.value}")
-
-
-def _pr_repository(pr_url: str, *, label: str) -> str:
-    if not isinstance(pr_url, str) or _GITHUB_PR_RE.fullmatch(pr_url) is None:
-        raise ContractError(f"{label} has an invalid format")
-    parts = pr_url.split("/")
-    return f"{parts[3]}/{parts[4]}"
-
-
-def validate_stage_result_binding(
-    result: StageResult,
-    *,
-    expected_repository: str,
-    expected_pr_url: str | None = None,
-    expected_source_digest: str | None = None,
-    expected_head_sha: str | None = None,
-) -> None:
-    """Validate stage evidence against its applicable transition bindings.
-
-    Executor and executor-rework results are repository-bound because their
-    contract has no source digest or reviewed HEAD. Reviewer and critic results
-    additionally require exact PR, source digest, and reviewed HEAD bindings.
-    """
-
-    if (
-        not isinstance(expected_repository, str)
-        or _GITHUB_REPOSITORY_RE.fullmatch(expected_repository) is None
-    ):
-        raise ContractError("expected_repository has an invalid format")
-    if _pr_repository(result.pr_url, label="pr_url") != expected_repository:
-        raise ContractError("pr_url repository does not match expected_repository")
-
-    if isinstance(result, ExecutorResult):
-        if any(
-            value is not None
-            for value in (expected_pr_url, expected_source_digest, expected_head_sha)
-        ):
-            raise ContractError(
-                "executor binding is repository-only; exact transition fields "
-                "are inapplicable"
-            )
-        return
-
-    if not isinstance(result, (ReviewerResult, CriticResult)):
-        raise ContractError("unsupported stage result binding")
-    if (
-        expected_pr_url is None
-        or expected_source_digest is None
-        or expected_head_sha is None
-    ):
-        raise ContractError(
-            "reviewer and critic bindings require expected PR, source digest, and head"
-        )
-
-    expected_pr_repository = _pr_repository(
-        expected_pr_url,
-        label="expected_pr_url",
-    )
-    if expected_pr_repository != expected_repository:
-        raise ContractError("expected_pr_url repository does not match expected_repository")
-    if result.pr_url != expected_pr_url:
-        raise ContractError("pr_url does not match expected_pr_url")
-    if _SHA256_RE.fullmatch(expected_source_digest) is None:
-        raise ContractError("expected_source_digest has an invalid format")
-    if result.source_digest != expected_source_digest:
-        raise ContractError("source_digest does not match expected_source_digest")
-    if _GIT_SHA_RE.fullmatch(expected_head_sha) is None:
-        raise ContractError("expected_head_sha has an invalid format")
-
-    reviewed_head_sha = (
-        result.head_sha
-        if isinstance(result, ReviewerResult)
-        else result.reviewed_head_sha
-    )
-    if reviewed_head_sha != expected_head_sha:
-        raise ContractError("reviewed head does not match expected_head_sha")
-    if (
-        isinstance(result, CriticResult)
-        and result.result_head_sha == result.reviewed_head_sha
-    ):
-        raise ContractError("critic result HEAD must differ from reviewed HEAD")
-
-
-def transition_digest(
-    *,
-    task_id: str,
-    run_id: int,
-    stage: PipelineStage,
-    summary: Mapping[str, object],
-    metadata: Mapping[str, object],
-    pr_url: str,
-    head_sha: str,
-) -> str:
-    """Hash canonical transition evidence for replay-safe child creation."""
-
-    payload = {
-        "task_id": task_id,
-        "run_id": run_id,
-        "stage": stage.value,
-        "summary": summary,
-        "metadata": metadata,
-        "pr_url": pr_url,
-        "head_sha": head_sha,
-    }
-    canonical = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()

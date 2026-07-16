@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import subprocess
 from pathlib import Path
 
 import pytest
 
-from forge.ops.github import GitHubClient
 from forge.ops.hermes import (
     GateError,
     HermesStore,
+    RootTaskCardSpec,
     build_create_argv,
+    build_root_create_argv,
     parse_task_card_key,
     step_card_key,
     task_card_key,
@@ -19,8 +19,6 @@ from forge.ops.hermes import (
 from forge.ops.task_flow import TaskCardSpec, TaskStep
 
 
-PR_URL = "https://github.com/owner/repo/pull/17"
-HEAD_SHA = "a" * 40
 TASK_SETTINGS_HASH = "a" * 64
 SOURCE_RESULT_HASH = "b" * 64
 ROOT_KEY = f"forge-task:owner/repo#7:{TASK_SETTINGS_HASH[:16]}"
@@ -264,6 +262,41 @@ def test_latest_completed_run_rejects_non_object_json(tmp_path: Path) -> None:
         HermesStore(db_path).latest_completed_run("root")
 
 
+def test_completed_run_accepts_official_null_metadata_as_empty_object(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    connection = _create_live_schema(db_path)
+    _insert_task(connection, task_id="root", key=ROOT_KEY)
+    connection.execute(
+        """
+        INSERT INTO task_runs (id, task_id, status, outcome, summary, metadata)
+        VALUES (1, 'root', 'done', 'completed', '{}', NULL)
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    assert HermesStore(db_path).completed_runs("root")[0].metadata == {}
+
+
+def test_completed_run_rejects_duplicate_json_fields(tmp_path: Path) -> None:
+    db_path = tmp_path / "kanban.db"
+    connection = _create_live_schema(db_path)
+    _insert_task(connection, task_id="root", key=ROOT_KEY)
+    connection.execute(
+        """
+        INSERT INTO task_runs (id, task_id, status, outcome, summary, metadata)
+        VALUES (1, 'root', 'done', 'completed', '{"run":1,"run":2}', NULL)
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(GateError, match="duplicate.*run"):
+        HermesStore(db_path).completed_runs("root")
+
+
 def test_task_create_argv_binds_parent_role_skill_and_idempotency() -> None:
     spec = TaskCardSpec(
         step=TaskStep.REVIEW,
@@ -303,96 +336,17 @@ def test_task_create_argv_uses_explicit_repository_workspace() -> None:
     assert argv[argv.index("--workspace") + 1] == "dir:/home/user/work/repo"
 
 
-_AUTO_TOTAL = object()
-
-
-class _GitHubRunner:
-    def __init__(
-        self,
-        *,
-        checks: list[dict[str, object]],
-        total_count: object = _AUTO_TOTAL,
-    ) -> None:
-        self.calls: list[tuple[str, ...]] = []
-        self._checks = checks
-        self._total_count = total_count
-
-    def __call__(
-        self,
-        argv: list[str],
-        **_: object,
-    ) -> subprocess.CompletedProcess[str]:
-        self.calls.append(tuple(argv))
-        endpoint = argv[-1]
-        if endpoint == "repos/owner/repo/pulls/17":
-            payload = {
-                "html_url": PR_URL,
-                "number": 17,
-                "state": "open",
-                "draft": False,
-                "head": {"sha": HEAD_SHA},
-            }
-        else:
-            payload = {
-                "check_runs": self._checks,
-                "total_count": (
-                    len(self._checks)
-                    if self._total_count is _AUTO_TOTAL
-                    else self._total_count
-                ),
-            }
-        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
-
-
-def _api_check(
-    *, status: str = "completed", conclusion: str | None = "success"
-) -> dict[str, object]:
-    return {
-        "name": "eval",
-        "status": status,
-        "conclusion": conclusion,
-        "head_sha": HEAD_SHA,
-    }
-
-
-def test_github_reads_checks_from_requested_current_head() -> None:
-    runner = _GitHubRunner(checks=[_api_check()])
-
-    snapshot = GitHubClient("/usr/bin/gh", runner=runner).get_pr_snapshot(
-        PR_URL, ("eval",)
+def test_root_task_create_argv_is_builder_without_parent() -> None:
+    spec = RootTaskCardSpec(
+        title="Build Task: owner/repo#7",
+        body='{"format_version":"forge-task-card/v1"}',
+        idempotency_key=ROOT_KEY,
     )
 
-    assert snapshot.head_sha == HEAD_SHA
-    assert snapshot.pr_number == 17
-    assert snapshot.checks[0].conclusion == "success"
-    assert runner.calls[1][-1] == (
-        f"repos/owner/repo/commits/{HEAD_SHA}/check-runs?per_page=100"
-    )
+    argv = build_root_create_argv(spec, "dir:/home/user/work/repo")
 
-
-@pytest.mark.parametrize("count", [0, 2])
-def test_github_requires_exactly_one_named_check(count: int) -> None:
-    runner = _GitHubRunner(checks=[_api_check() for _ in range(count)])
-
-    with pytest.raises(GateError, match="eval.*exactly one"):
-        GitHubClient("gh", runner=runner).get_pr_snapshot(PR_URL, ("eval",))
-
-
-@pytest.mark.parametrize("status", ["queued", "in_progress"])
-def test_github_preserves_pending_check_as_not_successful(status: str) -> None:
-    runner = _GitHubRunner(checks=[_api_check(status=status, conclusion=None)])
-
-    snapshot = GitHubClient("gh", runner=runner).get_pr_snapshot(PR_URL, ("eval",))
-
-    assert snapshot.checks[0].status == status
-    assert snapshot.checks[0].conclusion is None
-
-
-@pytest.mark.parametrize("total_count", [True, "1", 2])
-def test_github_rejects_invalid_or_truncated_check_count(
-    total_count: object,
-) -> None:
-    runner = _GitHubRunner(checks=[_api_check()], total_count=total_count)
-
-    with pytest.raises(GateError, match="total_count"):
-        GitHubClient("gh", runner=runner).get_pr_snapshot(PR_URL, ("eval",))
+    assert argv[:3] == ("kanban", "create", spec.title)
+    assert argv[argv.index("--assignee") + 1] == "builder"
+    assert argv[argv.index("--skill") + 1] == "build-task"
+    assert argv[argv.index("--idempotency-key") + 1] == ROOT_KEY
+    assert "--parent" not in argv

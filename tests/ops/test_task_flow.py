@@ -37,6 +37,7 @@ def _build(commit: str, *, remaining: list[str] | None = None):
             "format_version": "forge-build-result/v1",
             "task_settings_hash": SETTINGS_HASH,
             "pr_url": PR_URL,
+            "built_base_commit": BASE_COMMIT,
             "built_commit": commit,
             "changed_files": ["forge/ops/task_flow.py"],
             "completed_items": ["AC1"],

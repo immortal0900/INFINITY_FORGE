@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +17,7 @@ import forge.ops.task_settings as task_settings_module
 from forge.ops.task_options import MergeMode, TaskFlow
 from forge.ops.task_settings import (
     TASK_SETTINGS_FORMAT,
+    BranchRefreshIntent,
     TaskContent,
     TaskSettings,
     TaskSettingsError,
@@ -378,6 +379,235 @@ def test_concurrent_conflicting_lifecycle_events_commit_exactly_one(
         }
     ]
     assert len(terminal_events) == 1
+
+
+def test_active_guard_serializes_external_write_with_lifecycle_end(
+    tmp_path: Path,
+) -> None:
+    store = TaskSettingsStore(tmp_path / "task-settings.db")
+    active = _activate_one(store)
+    cancel_started = threading.Event()
+
+    def cancel() -> TaskSettings | BaseException:
+        cancel_started.set()
+        try:
+            return store.append_lifecycle_event(
+                active.request_id,
+                TaskSettingsStatus.CANCELLED,
+            )
+        except BaseException as error:  # noqa: BLE001 - compare the race result.
+            return error
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with store.guard_active(active) as guard:
+            pending_cancel = pool.submit(cancel)
+            assert cancel_started.wait(timeout=1)
+            with pytest.raises(FutureTimeout):
+                pending_cancel.result(timeout=0.05)
+            merged = guard.finish(TaskSettingsStatus.MERGED)
+        cancel_result = pending_cancel.result(timeout=1)
+
+    assert merged.status is TaskSettingsStatus.MERGED
+    assert isinstance(cancel_result, TaskSettingsError)
+    assert "lifecycle status is immutable" in str(cancel_result)
+    assert store.get_active(active.request_id) is None
+
+
+def test_active_guard_rejects_a_task_that_already_ended(tmp_path: Path) -> None:
+    store = TaskSettingsStore(tmp_path / "task-settings.db")
+    active = _activate_one(store)
+    store.append_lifecycle_event(
+        active.request_id,
+        TaskSettingsStatus.CANCELLED,
+    )
+
+    with pytest.raises(TaskSettingsError, match="no longer active"):
+        with store.guard_active(active):
+            raise AssertionError("guard must not open")
+
+
+def test_branch_refresh_intent_is_durable_and_exact_replay_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "task-settings.db"
+    store = TaskSettingsStore(database_path)
+    active = _activate_one(store)
+    expected_base = "a" * 40
+    expected_head = "b" * 40
+
+    reserved = store.reserve_branch_refresh(
+        active.request_id,
+        pr_url="https://github.com/openai/infinity-forge/pull/42",
+        expected_base_commit=expected_base,
+        expected_head_commit=expected_head,
+        applied_refresh_count=0,
+        occurred_at=CONFIRMED_AT + timedelta(minutes=3),
+    )
+    replayed = TaskSettingsStore(database_path).reserve_branch_refresh(
+        active.request_id,
+        pr_url=reserved.pr_url,
+        expected_base_commit=expected_base,
+        expected_head_commit=expected_head,
+        applied_refresh_count=0,
+        occurred_at=CONFIRMED_AT + timedelta(hours=1),
+    )
+
+    assert isinstance(reserved, BranchRefreshIntent)
+    assert reserved.refresh_number == 1
+    assert reserved.completed is False
+    assert replayed == reserved
+    assert (
+        store.get_branch_refresh_replay(active.request_id, applied_refresh_count=0)
+        == reserved
+    )
+
+
+def test_branch_refresh_intent_completion_is_durable_and_exactly_replayable(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "task-settings.db"
+    store = TaskSettingsStore(database_path)
+    active = _activate_one(store)
+    intent = store.reserve_branch_refresh(
+        active.request_id,
+        pr_url="https://github.com/openai/infinity-forge/pull/42",
+        expected_base_commit="a" * 40,
+        expected_head_commit="b" * 40,
+        applied_refresh_count=0,
+    )
+
+    completed = store.complete_branch_refresh(
+        intent,
+        current_base_commit="c" * 40,
+        current_head_commit="d" * 40,
+        occurred_at=CONFIRMED_AT + timedelta(minutes=4),
+    )
+    replayed = TaskSettingsStore(database_path).complete_branch_refresh(
+        intent,
+        current_base_commit="c" * 40,
+        current_head_commit="d" * 40,
+        occurred_at=CONFIRMED_AT + timedelta(hours=1),
+    )
+
+    assert completed.completed is True
+    assert completed.current_base_commit == "c" * 40
+    assert completed.current_head_commit == "d" * 40
+    assert replayed == completed
+    assert (
+        store.get_branch_refresh_replay(active.request_id, applied_refresh_count=0)
+        == completed
+    )
+    assert store.get_branch_refresh_replay(
+        active.request_id,
+        applied_refresh_count=1,
+    ) is None
+
+
+def test_active_guard_completes_refresh_in_its_transaction(tmp_path: Path) -> None:
+    store = TaskSettingsStore(tmp_path / "task-settings.db")
+    active = _activate_one(store)
+    intent = store.reserve_branch_refresh(
+        active.request_id,
+        pr_url="https://github.com/openai/infinity-forge/pull/42",
+        expected_base_commit="a" * 40,
+        expected_head_commit="b" * 40,
+        applied_refresh_count=0,
+    )
+
+    with pytest.raises(RuntimeError, match="simulate crash"):
+        with store.guard_active(active) as guard:
+            guard.complete_branch_refresh(
+                intent,
+                current_base_commit="c" * 40,
+                current_head_commit="d" * 40,
+            )
+            raise RuntimeError("simulate crash")
+
+    assert store.get_branch_refresh_replay(
+        active.request_id,
+        applied_refresh_count=0,
+    ) == intent
+
+    with store.guard_active(active) as guard:
+        completed = guard.complete_branch_refresh(
+            intent,
+            current_base_commit="c" * 40,
+            current_head_commit="d" * 40,
+        )
+
+    assert completed.completed is True
+    assert store.get_branch_refresh_replay(
+        active.request_id,
+        applied_refresh_count=0,
+    ) == completed
+
+
+def test_branch_refresh_intent_rejects_conflict_and_unproven_count(
+    tmp_path: Path,
+) -> None:
+    store = TaskSettingsStore(tmp_path / "task-settings.db")
+    active = _activate_one(store)
+    intent = store.reserve_branch_refresh(
+        active.request_id,
+        pr_url="https://github.com/openai/infinity-forge/pull/42",
+        expected_base_commit="a" * 40,
+        expected_head_commit="b" * 40,
+        applied_refresh_count=0,
+    )
+
+    with pytest.raises(TaskSettingsError, match="different pull request state"):
+        store.reserve_branch_refresh(
+            active.request_id,
+            pr_url=intent.pr_url,
+            expected_base_commit="a" * 40,
+            expected_head_commit="e" * 40,
+            applied_refresh_count=0,
+        )
+    with pytest.raises(TaskSettingsError, match="has no durable proof"):
+        store.get_branch_refresh_replay(
+            active.request_id,
+            applied_refresh_count=2,
+        )
+    with pytest.raises(TaskSettingsError, match="different result"):
+        completed = store.complete_branch_refresh(
+            intent,
+            current_base_commit="c" * 40,
+            current_head_commit="d" * 40,
+        )
+        store.complete_branch_refresh(
+            completed,
+            current_base_commit="c" * 40,
+            current_head_commit="e" * 40,
+        )
+
+
+def test_branch_refresh_intent_cap_cannot_be_bypassed_by_replay(
+    tmp_path: Path,
+) -> None:
+    store = TaskSettingsStore(tmp_path / "task-settings.db")
+    active = _activate_one(store)
+    for applied_count, head in enumerate(("b", "c", "d")):
+        intent = store.reserve_branch_refresh(
+            active.request_id,
+            pr_url="https://github.com/openai/infinity-forge/pull/42",
+            expected_base_commit="a" * 40,
+            expected_head_commit=head * 40,
+            applied_refresh_count=applied_count,
+        )
+        store.complete_branch_refresh(
+            intent,
+            current_base_commit="a" * 40,
+            current_head_commit=chr(ord(head) + 1) * 40,
+        )
+
+    with pytest.raises(TaskSettingsError, match="limit"):
+        store.reserve_branch_refresh(
+            active.request_id,
+            pr_url="https://github.com/openai/infinity-forge/pull/42",
+            expected_base_commit="a" * 40,
+            expected_head_commit="e" * 40,
+            applied_refresh_count=3,
+        )
 
 
 def test_lifecycle_changes_append_events_without_changing_settings(

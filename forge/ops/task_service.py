@@ -20,6 +20,7 @@ from .task_settings import (
     TaskSettings,
     TaskSettingsStatus,
     TaskSettingsStore,
+    task_content_hash,
 )
 
 
@@ -106,6 +107,17 @@ class TaskIssueClient(Protocol):
     ) -> TaskIssue: ...
 
 
+def _task_marker_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise TaskServiceError("GitHub issue Task marker has duplicate fields")
+        value[key] = item
+    return value
+
+
 def read_task_marker(body: str) -> dict[str, str]:
     """Read the one strict request marker used to resume a GitHub issue."""
 
@@ -115,7 +127,10 @@ def read_task_marker(body: str) -> dict[str, str]:
     if len(matches) != 1 or body.count(_MARKER_START) != 1:
         raise TaskServiceError("GitHub issue must contain exactly one Task marker")
     try:
-        value = json.loads(matches[0].group("json"))
+        value = json.loads(
+            matches[0].group("json"),
+            object_pairs_hook=_task_marker_object,
+        )
     except json.JSONDecodeError as error:
         raise TaskServiceError("GitHub issue Task marker is invalid JSON") from error
     if not isinstance(value, dict):
@@ -163,7 +178,13 @@ def _marker(settings: TaskSettings) -> str:
     return f"{_MARKER_START}\n{encoded}\n-->"
 
 
-def _task_body(content: TaskContent, settings: TaskSettings) -> str:
+def build_task_issue_body(content: TaskContent, settings: TaskSettings) -> str:
+    """Build the one exact GitHub issue body for confirmed Task content."""
+
+    if not isinstance(content, TaskContent):
+        raise TaskServiceError("content must be TaskContent")
+    if not isinstance(settings, TaskSettings):
+        raise TaskServiceError("settings must be TaskSettings")
     criteria = "\n".join(
         f"{number}. {criterion}"
         for number, criterion in enumerate(content.acceptance_criteria, start=1)
@@ -187,6 +208,43 @@ def _task_body(content: TaskContent, settings: TaskSettings) -> str:
         )
     sections.append(_marker(settings))
     return "\n\n".join(sections)
+
+
+def verify_task_issue_content(
+    issue: TaskIssue,
+    request: TaskCreationRequest,
+    settings: TaskSettings,
+) -> None:
+    """Require the issue title and body to equal the confirmed Task exactly."""
+
+    if not isinstance(issue, TaskIssue):
+        raise TaskServiceError("issue must be TaskIssue")
+    if not isinstance(request, TaskCreationRequest):
+        raise TaskServiceError("request must be TaskCreationRequest")
+    if not isinstance(settings, TaskSettings):
+        raise TaskServiceError("settings must be TaskSettings")
+    if (
+        request.request_id != settings.request_id
+        or request.repository != settings.repository
+        or task_content_hash(request.content) != settings.task_content_hash
+    ):
+        raise TaskServiceError("Task request does not match immutable settings")
+
+    marker = read_task_marker(issue.body)
+    if marker.get("request_id") != settings.request_id:
+        raise TaskServiceError("GitHub issue request_id does not match")
+    if marker.get("task_content_hash") != settings.task_content_hash:
+        raise TaskServiceError("GitHub issue Task content hash does not match")
+    if marker.get("task_settings_hash") != settings.task_settings_hash:
+        raise TaskServiceError("GitHub issue Task settings hash does not match")
+    if issue.title != request.content.title:
+        raise TaskServiceError(
+            "GitHub issue title does not match the confirmed Task"
+        )
+    if issue.body != build_task_issue_body(request.content, settings):
+        raise TaskServiceError(
+            "GitHub issue body does not match the confirmed Task"
+        )
 
 
 class TaskService:
@@ -274,7 +332,8 @@ class TaskService:
                 if settings.issue_number is not None:
                     raise TaskServiceError("bound GitHub issue could not be found")
                 issue = self._create_issue(request, settings)
-            self._verify_issue_identity(issue, request, settings)
+            if settings.status is not TaskSettingsStatus.ACTIVE:
+                verify_task_issue_content(issue, request, settings)
 
             if settings.issue_number is None:
                 settings = self._store.bind_issue(
@@ -284,29 +343,43 @@ class TaskService:
             elif settings.issue_number != issue.number:
                 raise TaskServiceError("GitHub issue does not match the bound issue")
 
-            expected_body = _task_body(request.content, settings)
+            expected_body = build_task_issue_body(request.content, settings)
             if settings.status is TaskSettingsStatus.ACTIVE:
-                if issue.title != request.content.title or issue.body != expected_body:
-                    raise TaskServiceError("active GitHub issue content changed")
+                self._require_exact_issue(
+                    issue,
+                    request,
+                    settings,
+                    "active GitHub issue content changed",
+                )
             else:
                 issue = self._update_issue(request, settings, expected_body)
-                if issue.title != request.content.title or issue.body != expected_body:
-                    raise TaskServiceError("GitHub issue update did not persist exact content")
+                self._require_exact_issue(
+                    issue,
+                    request,
+                    settings,
+                    "GitHub issue update did not persist exact content",
+                )
                 settings = self._store.activate(settings.request_id)
 
             # RISK(race): serialize the active-state check and final GitHub write
             # against terminal lifecycle events in the settings database.
             with self._ready_label_guard(settings):
                 issue = self._get_issue(settings)
-                if issue.title != request.content.title or issue.body != expected_body:
-                    raise TaskServiceError("active GitHub issue content changed")
+                self._require_exact_issue(
+                    issue,
+                    request,
+                    settings,
+                    "active GitHub issue content changed",
+                )
                 issue = self._add_ready_label(settings)
                 if READY_TO_BUILD_LABEL not in issue.labels:
                     raise TaskServiceError("GitHub ready label was not persisted")
-                if issue.title != request.content.title or issue.body != expected_body:
-                    raise TaskServiceError(
-                        "GitHub issue changed while adding the ready label"
-                    )
+                self._require_exact_issue(
+                    issue,
+                    request,
+                    settings,
+                    "GitHub issue changed while adding the ready label",
+                )
             return CreatedTask(settings=settings, issue=issue)
 
     @contextmanager
@@ -371,11 +444,13 @@ class TaskService:
             raise TaskServiceError(
                 "completed Task issue does not match durable settings"
             )
-        expected_body = _task_body(request.content, settings)
         issue = self._get_issue(settings)
-        self._verify_issue_identity(issue, request, settings)
-        if issue.title != request.content.title or issue.body != expected_body:
-            raise TaskServiceError("active GitHub issue content changed")
+        self._require_exact_issue(
+            issue,
+            request,
+            settings,
+            "active GitHub issue content changed",
+        )
         if READY_TO_BUILD_LABEL not in issue.labels:
             raise TaskServiceError("completed Task is missing the ready label")
         return CreatedTask(settings=settings, issue=issue)
@@ -403,7 +478,7 @@ class TaskService:
             issue = self._github.create_issue(
                 settings.repository,
                 request.content.title,
-                _task_body(request.content, settings),
+                build_task_issue_body(request.content, settings),
             )
         except Exception as error:
             raise TaskServiceError("GitHub issue creation failed") from error
@@ -456,15 +531,13 @@ class TaskService:
         return issue
 
     @staticmethod
-    def _verify_issue_identity(
+    def _require_exact_issue(
         issue: TaskIssue,
         request: TaskCreationRequest,
         settings: TaskSettings,
+        message: str,
     ) -> None:
-        marker = read_task_marker(issue.body)
-        if marker.get("request_id") != settings.request_id:
-            raise TaskServiceError("GitHub issue request_id does not match")
-        if marker.get("task_content_hash") != settings.task_content_hash:
-            raise TaskServiceError("GitHub issue Task content does not match")
-        if issue.title != request.content.title:
-            raise TaskServiceError("GitHub issue title does not match")
+        try:
+            verify_task_issue_content(issue, request, settings)
+        except TaskServiceError as error:
+            raise TaskServiceError(message) from error

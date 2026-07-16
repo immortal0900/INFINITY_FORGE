@@ -16,21 +16,23 @@ metadata:
 
 | 라벨 | 의미 | 즉시 알림 |
 |---|---|---|
-| forge:spec-draft | triage 대기 | |
-| forge:adr | 인간 결정 대기 (그 건만 정지) | O |
-| forge:need-execution | 실행 대기 | |
-| forge:in-progress | 클레임됨 | |
-| forge:need-review | PR 오픈, 리뷰 대기 | |
-| forge:need-critic | 적대 리뷰 대기 | |
-| forge:mergeable | critic + CI green | O |
-| forge:blocked | 의존·장애 (adr 외) | |
+| forge:needs-details | 작업 설명 보완 필요 | |
+| forge:needs-decision | 사람의 설계 결정 필요 | O |
+| forge:ready-to-build | Build 실행 대기 | |
+| forge:building | Build 또는 Fix 실행 중 | |
+| forge:reviewing | Review 실행 또는 대기 | |
+| forge:deep-checking | Deep Check 실행 또는 대기 | |
+| forge:ready-to-merge | 선택한 Task 흐름 완료. 병합 전 GitHub 검사는 별도 확인 | O |
+| forge:waiting-for-help | 사람 입력 또는 외부 문제로 정지 | |
 | forge:failed | 재시도 3회 소진 | O |
 
 ## 전이
-spec-draft → (adr ↔) need-execution → in-progress → need-review → need-critic → mergeable → close.
-반려: need-review → need-execution (반성문 동반). 어디서든 → blocked/failed.
+needs-details → (needs-decision ↔) ready-to-build → building → reviewing → deep-checking → ready-to-merge → close.
+선택한 Task 흐름에 없는 단계는 건너뛴다. 수정 요청은 building으로 돌아가며 어디서든 waiting-for-help/failed로 정지할 수 있다.
 
-## 작성자 규칙 (위반 = drift-audit 감지 대상)
-- 기계 전이는 **미러 스크립트 단독** 작성. 워커·게이트웨이는 라벨을 바꾸지 않는다(코멘트만).
-- 인간 전용 전이 2건: forge:adr 라벨 **제거**(결정 완료 신호), PR 머지.
-- 불변식: ① 열린 이슈에 forge:* 상태 라벨 정확히 1개 ② 이슈:카드 멱등키 1:1 (github-issue:OWNER/REPO#N).
+## 작성자 규칙 (위반 = state mismatch check 대상)
+- 자동 전이는 **Issue Status Sync**(`issue-status-sync.py`)만 작성한다. 다른 작업 실행기와 Hermes Gateway는 라벨을 바꾸지 않는다.
+- 사람은 `forge:needs-decision`을 해결하고 최종 PR을 병합할 수 있다.
+- 불변식: 열린 Task 이슈에는 Forge 상태 라벨이 정확히 1개다.
+
+> RISK(breaking): 위 9개 라벨만 현재 상태로 인식하며 이전 라벨은 읽지 않는다.

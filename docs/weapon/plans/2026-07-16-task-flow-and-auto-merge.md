@@ -4,14 +4,14 @@
 
 **Goal:** 새 Hermes 대화에서 Chat 또는 Task를 고르고, Task마다 세 가지 작업 흐름과 `manual|safe_auto|full_auto`를 모두 선택하며, 검증한 현재 commit만 정책에 맞게 병합한다.
 
-**Architecture:** Forge 소유 정책은 stdlib-only Python 모듈과 Hermes 사용자 plugin에 둔다. Hermes에는 모든 surface가 공유하는 `pre_user_turn` plugin hook만 추가하는 두 파일짜리 carried change를 설치한다. Task 설정은 별도 SQLite에 불변 기록하고, 작업 흐름과 자동 병합은 같은 설정 hash와 현재 GitHub commit을 다시 검증한다.
+**Architecture:** Forge 소유 정책은 stdlib-only Python 모듈과 Hermes 사용자 plugin에 둔다. Hermes에는 모든 surface가 공유하는 `pre_user_turn` plugin hook과 실제 사용자 입력 표시를 연결하는 6개 대상(`hermes_cli/plugins.py`, `agent/conversation_loop.py`, `run_agent.py`, `cli.py`, `tui_gateway/server.py`, `gateway/run.py`)의 carried change를 설치한다. Task 설정은 별도 SQLite에 불변 기록하고, 작업 흐름과 자동 병합은 같은 설정 hash와 현재 GitHub commit을 다시 검증한다.
 
 **Tech Stack:** Python 3.11+, pytest 9.x, SQLite, GitHub CLI, Hermes Agent v0.18.2 plugin API, Bash/PowerShell, systemd user timers
 
 ## Global Constraints
 
 1. 공식 값은 `mode=chat|task`, `task_flow=build|build_review|build_review_deep_check`, `merge_mode=manual|safe_auto|full_auto`뿐이다.
-2. 역할은 `builder|reviewer|deep_checker|fix`뿐이며 모든 9개 설정 조합을 허용한다.
+2. 화면 역할은 Build·Review·Deep Check·Fix이며 모든 9개 설정 조합을 허용한다. 내부 카드 role ID는 각각 `builder|reviewer|deep_checker|fix`다.
 3. 이전 Forge 설정 키, 카드 key, JSON schema, 라벨을 읽는 alias나 fallback을 만들지 않는다.
 4. Chat은 GitHub, Kanban, Task 설정 저장소에 write하지 않는다.
 5. Task는 `task_flow`와 `merge_mode`를 매번 새로 선택하고 확인 전에는 외부 write가 없다.
@@ -37,12 +37,12 @@ forge/ops/
   displayed_status.py      current step을 Forge label로 표시
   safe_files.py            safe_auto 결정 규칙
   merge_decision.py        외부 write 없는 공통 병합 판단
-  github.py                완전한 PR/CI/files/review read adapter
-  github_merge.py          expected-commit merge와 branch update write adapter
+  github.py                PR·CI·파일·Review 전체 읽기
+  github_merge.py          예상 base/head commit 병합과 branch 갱신 쓰기
 forge/hermes_plugin/infinity_forge/
   plugin.yaml, __init__.py  pre_user_turn 선택 UI와 Task service 연결
 forge/hermes_change/
-  installer.py, files/...  Hermes 두 파일 carried change와 restore package
+  installer.py, files/...  Hermes 6개 대상 carried change와 restore package
 forge/scripts/
   task-flow-worker.py, issue-status-sync.py, merge-worker.py
   system-check.sh, state-mismatch-check.sh, activity-log-writer.py
@@ -75,7 +75,7 @@ def test_all_nine_task_combinations_are_valid() -> None:
 
 def test_old_policy_keys_are_rejected() -> None:
     with pytest.raises(TaskOptionError, match="unexpected fields"):
-        parse_task_selection({"assurance_policy": "direct", "merge_policy": "P1"})
+        parse_task_selection({"quality_level": "standard", "merge_choice": "manual"})
 ```
 
 - [ ] **Step 2: RED 확인**
@@ -210,6 +210,10 @@ Commit: `git commit -m "feat: add Hermes chat and task chooser"`
 - Create: `forge/hermes_change/installer.py`
 - Create: `forge/hermes_change/files/hermes_cli/plugins.py.patch`
 - Create: `forge/hermes_change/files/agent/conversation_loop.py.patch`
+- Create: `forge/hermes_change/files/run_agent.py.patch`
+- Create: `forge/hermes_change/files/cli.py.patch`
+- Create: `forge/hermes_change/files/tui_gateway/server.py.patch`
+- Create: `forge/hermes_change/files/gateway/run.py.patch`
 - Create: `forge/scripts/install-hermes-change.py`
 - Create: `tests/hermes/test_installer.py`
 - Create: `tests/hermes/test_pre_user_turn_contract.py`
@@ -238,7 +242,7 @@ Expected: installer import 실패.
 - [ ] **Step 3: hash 확인, atomic replace, restore package 구현**
 
 ```python
-# RISK(data-loss): 대상 두 파일의 before_file_hash가 정확히 맞을 때만 임시 파일을 os.replace한다.
+# RISK(data-loss): 대상 6개 파일의 before_file_hash가 정확히 맞을 때만 임시 파일을 os.replace한다.
 if file_hash(target) != item.before_file_hash:
     raise InstallError(f"before_file_hash mismatch: {item.path}")
 ```
@@ -510,10 +514,11 @@ Expected: test failure 0개, diff error 0개, placeholder 0개.
 
 - [ ] **Step 5: copied Hermes tree에 install→system check→restore 실행**
 
-Expected: 대상 두 파일의 `after_file_hash`가 설치 package와 일치하고 restore 뒤 `before_file_hash`와 일치한다. live Hermes 설치본은 배포 승인 전 수정하지 않는다.
+Expected: 대상 6개 파일의 `after_file_hash`가 설치 package와 일치하고 restore 뒤 `before_file_hash`와 일치한다. live Hermes 설치본은 배포 승인 전 수정하지 않는다.
 
 Commit: `git commit -m "feat: restart validation after branch refresh"`
 
 ## 변경이력
 
+- 2026-07-16 | 쉬운 운영 이름과 실제 worker 연결 | 변경: 9개 선택 조합, Build·Review·Deep Check·Fix 프로필, 공통 writer lock, 자동 병합 기본 off, Hermes 변경 대상 6개, Task Flow Worker·Issue Status Sync·Merge Worker의 실제 DB·GitHub·Hermes 연결을 반영. 불일치와 읽기 오류는 코드 2로 중단 | 검증: Task runtime·Issue Status Sync·Merge Worker 계약 테스트, plain-name/workflow 검사, Python·Git Bash·PowerShell 문법, Work Check known-input smoke
 - 2026-07-16 | 구현 계획 작성 | 변경: Plain English clean break, Hermes 공통 입력 hook, Task 설정, 3개 작업 흐름, safe/full 자동 병합, branch 갱신을 9개 TDD task로 분해 | 검증: 두 2026-07-16 설계 명세와 현재 244 passed, 2 skipped 기준선 대조

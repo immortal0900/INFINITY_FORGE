@@ -130,6 +130,31 @@ def _service(tmp_path: Path, github: FakeTaskIssues) -> tuple[TaskService, TaskS
     return TaskService(store, github), store
 
 
+@pytest.mark.parametrize(
+    "marker_json",
+    (
+        (
+            '{"format_version":"forge-task-request/v1",'
+            '"format_version":"forge-task-request/v1",'
+            '"request_id":"9f7453ce-36ec-4e8e-9dfa-bb159b58c19b",'
+            '"task_content_hash":"' + "a" * 64 + '"}'
+        ),
+        (
+            '{"format_version":"forge-task-request/v1",'
+            '"request_id":"9f7453ce-36ec-4e8e-9dfa-bb159b58c19b",'
+            '"task_content_hash":{"value":"first","value":"second"}}'
+        ),
+    ),
+)
+def test_task_marker_rejects_duplicate_keys_at_every_object_level(
+    marker_json: str,
+) -> None:
+    body = f"<!-- forge-task-request\n{marker_json}\n-->"
+
+    with pytest.raises(TaskServiceError, match="duplicate fields"):
+        read_task_marker(body)
+
+
 def test_confirmed_task_is_activated_before_ready_label(tmp_path: Path) -> None:
     github = FakeTaskIssues()
     service, store = _service(tmp_path, github)

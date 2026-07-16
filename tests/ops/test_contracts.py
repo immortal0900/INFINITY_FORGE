@@ -36,6 +36,7 @@ SETTINGS_HASH = "a" * 64
 SOURCE_HASH = "b" * 64
 PR_URL = "https://github.com/owner/repo/pull/17"
 BUILT_COMMIT = "c" * 40
+BUILT_BASE_COMMIT = "e" * 40
 TESTED_COMMIT = "d" * 40
 
 
@@ -44,6 +45,7 @@ def build_summary(**overrides: object) -> dict[str, object]:
         "format_version": "forge-build-result/v1",
         "task_settings_hash": SETTINGS_HASH,
         "pr_url": PR_URL,
+        "built_base_commit": BUILT_BASE_COMMIT,
         "built_commit": BUILT_COMMIT,
         "changed_files": ["forge/ops/task_flow.py"],
         "completed_items": ["AC1"],
@@ -109,6 +111,7 @@ def test_parsers_accept_only_the_new_exact_result_shapes() -> None:
     proof = parse_step_proof(step_proof_summary())
 
     assert isinstance(build, BuildResult)
+    assert build.built_base_commit == BUILT_BASE_COMMIT
     assert build.built_commit == BUILT_COMMIT
     assert isinstance(review, ReviewResult)
     assert review.result is ReviewDecision.APPROVE
@@ -132,6 +135,15 @@ def test_old_stage_symbols_are_not_part_of_any_public_export() -> None:
 
     assert old_symbols.isdisjoint(contracts.__all__)
     assert old_symbols.isdisjoint(forge_ops.__all__)
+    assert all(not hasattr(contracts, name) for name in old_symbols)
+    assert all(not hasattr(forge_ops, name) for name in old_symbols)
+
+
+def test_old_pull_request_snapshot_is_removed() -> None:
+    assert "PullRequestSnapshot" not in contracts.__all__
+    assert "PullRequestSnapshot" not in forge_ops.__all__
+    assert not hasattr(contracts, "PullRequestSnapshot")
+    assert not hasattr(forge_ops, "PullRequestSnapshot")
 
 
 @pytest.mark.parametrize(
@@ -152,6 +164,7 @@ def test_parsers_reject_extra_or_old_fields(parser: object, summary: object) -> 
     ("parser", "summary", "field"),
     [
         (parse_build_result, build_summary(), "built_commit"),
+        (parse_build_result, build_summary(), "built_base_commit"),
         (parse_review_result, review_summary(), "reviewed_commit"),
         (parse_deep_check_result, deep_check_summary(), "tested_commit"),
         (parse_step_proof, step_proof_summary(), "source_run_id"),
@@ -245,6 +258,7 @@ def test_result_binding_accepts_exact_settings_pr_and_current_commit(
         result,
         expected_task_settings_hash=SETTINGS_HASH,
         expected_pr_url=PR_URL,
+        current_base_commit=BUILT_BASE_COMMIT,
         current_commit=current_commit,
     )
 
@@ -258,6 +272,7 @@ def test_result_binding_accepts_exact_settings_pr_and_current_commit(
             "https://github.com/owner/repo/pull/18",
             "pr_url",
         ),
+        ("current_base_commit", "f" * 40, "base commit"),
         ("current_commit", "e" * 40, "current commit"),
     ],
 )
@@ -267,6 +282,7 @@ def test_result_binding_rejects_any_binding_mismatch(
     arguments = {
         "expected_task_settings_hash": SETTINGS_HASH,
         "expected_pr_url": PR_URL,
+        "current_base_commit": BUILT_BASE_COMMIT,
         "current_commit": BUILT_COMMIT,
     }
     arguments[field] = value

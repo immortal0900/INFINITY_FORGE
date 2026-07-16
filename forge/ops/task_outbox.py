@@ -613,7 +613,7 @@ def _prepare_database_path(database_path: str | Path) -> Path:
         ) from error
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise TaskOutboxError(
             "database parent directory could not be created safely"
         ) from error
@@ -650,7 +650,7 @@ def _assert_safe_database_path(path: Path, *, require_exists: bool) -> None:
             raise TaskOutboxError("database_path must be a regular file")
     except TaskOutboxError:
         raise
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise TaskOutboxError(
             "database_path could not be checked safely"
         ) from error
@@ -661,7 +661,7 @@ def _prepare_lock_directory(database_path: Path) -> Path:
     _assert_no_symlink_components(directory)
     try:
         directory.mkdir(mode=0o700, exist_ok=True)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise TaskOutboxError(
             "Task outbox lock directory could not be created safely"
         ) from error
@@ -678,7 +678,7 @@ def _assert_safe_lock_directory(directory: Path) -> None:
             )
     except TaskOutboxError:
         raise
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise TaskOutboxError(
             "Task outbox lock directory could not be checked safely"
         ) from error

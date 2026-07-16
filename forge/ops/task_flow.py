@@ -235,6 +235,7 @@ def record_task_result(
         result,
         expected_task_settings_hash=state.task_settings_hash,
         expected_pr_url=state.pr_url,
+        current_base_commit=state.current_base_commit,
         current_commit=current_commit,
     )
     if isinstance(result, BuildResult):
