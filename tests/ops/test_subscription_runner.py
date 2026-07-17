@@ -698,10 +698,10 @@ def test_codex_skill_returns_original_failure_when_probe_errors() -> None:
         (OSError("spawn failed"), 70, ExitClass.UNKNOWN),
         (
             subprocess.TimeoutExpired(["codex"], 1),
-            124,
+            70,
             ExitClass.TIMEOUT,
         ),
-        (KeyboardInterrupt(), 130, ExitClass.CANCELLED),
+        (KeyboardInterrupt(), 70, ExitClass.CANCELLED),
     ],
 )
 def test_codex_skill_process_boundary_failures_never_probe_or_fallback(

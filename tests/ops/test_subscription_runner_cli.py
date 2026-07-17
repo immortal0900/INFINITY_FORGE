@@ -5,12 +5,18 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import pytest
 
 from forge.ops import subscription_runner
-from forge.ops.subscription_runtime import RuntimeKind
+from forge.ops.subscription_runtime import (
+    ExitClass,
+    RuntimeKind,
+    classify_claude_stream,
+)
 from forge.ops.subscription_runner import SubscriptionRunResult
 
 
@@ -231,6 +237,152 @@ def test_process_runner_streams_utf8_jsonl_and_discards_raw_fields(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_process_runner_large_unicode_prompt_uses_no_file_and_does_not_deadlock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompt = "대용량 🧪𐐷" * 200_000
+    child = (
+        "import json,sys; value=sys.stdin.read(); "
+        "assert value.startswith('대용량') and value.endswith('𐐷'); "
+        "print(json.dumps({'type':'system','subtype':'api_retry',"
+        "'error':'rate_limit'}, ensure_ascii=False))"
+    )
+    monkeypatch.setattr(
+        tempfile,
+        "TemporaryFile",
+        lambda *args, **kwargs: pytest.fail("prompt must never touch a temporary file"),
+    )
+
+    started = time.monotonic()
+    completed = subscription_runner.default_process_runner(
+        [sys.executable, "-c", child],
+        str(tmp_path),
+        dict(os.environ, PYTHONUTF8="1"),
+        prompt,
+        None,
+    )
+
+    assert completed.returncode == 0
+    assert completed.events[-1]["error"] == "rate_limit"
+    assert time.monotonic() - started < 10
+
+
+@pytest.mark.parametrize("failure", ["timeout", "cancel"])
+def test_process_runner_inherited_descendant_pipe_returns_bounded(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = (
+        "import subprocess,sys,time; "
+        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(0.8)']); "
+        "time.sleep(10)"
+    )
+    monkeypatch.setattr(
+        subscription_runner, "_PROCESS_WAIT_TIMEOUT_SECONDS", 0.15
+    )
+    if failure == "cancel":
+        original_wait = subprocess.Popen.wait
+        interrupted = False
+
+        def wait(
+            process: subprocess.Popen[str], timeout: float | None = None
+        ) -> int:
+            nonlocal interrupted
+            if timeout is not None and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return original_wait(process, timeout=timeout)
+
+        monkeypatch.setattr(subprocess.Popen, "wait", wait)
+
+    started = time.monotonic()
+    completed = subscription_runner.default_process_runner(
+        [sys.executable, "-c", child],
+        str(tmp_path),
+        dict(os.environ, PYTHONUTF8="1"),
+        "🧪𐐷" * 100_000,
+        None,
+    )
+    elapsed = time.monotonic() - started
+
+    assert completed.returncode == 70
+    assert completed.failure_class is (
+        ExitClass.TIMEOUT if failure == "timeout" else ExitClass.CANCELLED
+    )
+    assert elapsed < 3
+
+
+def test_process_runner_caps_events_but_preserves_late_exact_quota(
+    tmp_path: Path,
+) -> None:
+    child = (
+        "import json; "
+        "[print(json.dumps({'type':'assistant','subtype':str(i)})) "
+        "for i in range(1000)]; "
+        "print(json.dumps({'type':'system','subtype':'api_retry',"
+        "'error':'rate_limit'})); "
+        "print(json.dumps({'type':'system','subtype':'api_retry',"
+        "'error':'billing_error'})); "
+        "print(json.dumps({'type':'result','is_error':True}))"
+    )
+
+    completed = subscription_runner.default_process_runner(
+        [sys.executable, "-c", child],
+        str(tmp_path),
+        dict(os.environ, PYTHONUTF8="1"),
+        None,
+        None,
+    )
+
+    assert len(completed.events) <= subscription_runner._MAX_CLASSIFIED_EVENTS
+    assert {"type": "system", "subtype": "api_retry", "error": "rate_limit"} in completed.events
+    assert {"type": "system", "subtype": "api_retry", "error": "billing_error"} in completed.events
+    assert {"type": "result", "is_error": True} in completed.events
+    assert (
+        classify_claude_stream(completed.events, {
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "subscriptionType": "max",
+        })
+        is ExitClass.SUBSCRIPTION_QUOTA
+    )
+
+
+def test_process_runner_oversized_error_is_bounded_unknown_not_quota(
+    tmp_path: Path,
+) -> None:
+    child = (
+        "import json; print(json.dumps({'type':'system',"
+        "'subtype':'api_retry','error':'rate_limit'+'x'*100000}))"
+    )
+
+    completed = subscription_runner.default_process_runner(
+        [sys.executable, "-c", child],
+        str(tmp_path),
+        dict(os.environ, PYTHONUTF8="1"),
+        None,
+        None,
+    )
+
+    assert len(completed.events) == 1
+    assert "error" not in completed.events[0]
+    assert all(
+        not isinstance(value, str)
+        or len(value) <= subscription_runner._MAX_CLASSIFICATION_STRING_CHARS
+        for event in completed.events
+        for value in event.values()
+    )
+    assert (
+        classify_claude_stream(completed.events, {
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "subscriptionType": "max",
+        })
+        is ExitClass.UNKNOWN
+    )
 
 
 def test_auth_status_parses_unicode_json_with_strict_utf8(

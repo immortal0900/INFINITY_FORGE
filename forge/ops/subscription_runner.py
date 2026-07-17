@@ -6,7 +6,8 @@ import argparse
 import json
 import os
 import subprocess
-import tempfile
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -30,6 +31,15 @@ EXIT_CONFIGURATION = 78
 EXIT_CONTRACT = 70
 EXIT_TRANSIENT = 75
 _TERMINAL_STATUSES = frozenset({"done", "blocked", "triage", "archived"})
+_PROCESS_WAIT_TIMEOUT_SECONDS = 6 * 60 * 60.0
+_PROCESS_POLL_SECONDS = 0.1
+_PROCESS_TERMINATE_WAIT_SECONDS = 0.5
+_THREAD_JOIN_TIMEOUT_SECONDS = 0.5
+_MAX_CLASSIFIED_EVENTS = 64
+_MAX_DECISIVE_EVENTS = 3
+_MAX_CLASSIFICATION_STRING_CHARS = 256
+_CLOSING_STREAM_IDS: set[int] = set()
+_CLOSING_STREAM_LOCK = threading.Lock()
 
 
 class ConfigurationError(RuntimeError):
@@ -109,20 +119,18 @@ def default_process_runner(
 
     del stdout_path
     started_at = _utc_now()
-    events: list[Mapping[str, object]] = []
+    fold = _ClassificationFold()
     process: subprocess.Popen[str] | None = None
-    stdin_file = None
+    writer: threading.Thread | None = None
+    reader: threading.Thread | None = None
+    boundary_failure = threading.Event()
     try:
-        if stdin_text is not None:
-            stdin_file = tempfile.TemporaryFile()
-            stdin_file.write(stdin_text.encode("utf-8", errors="strict"))
-            stdin_file.seek(0)
         # RISK(side-effect): this is the single external runtime process boundary.
         process = subprocess.Popen(
             list(argv),
             cwd=cwd,
             env=dict(env),
-            stdin=stdin_file,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -130,52 +138,209 @@ def default_process_runner(
             errors="strict",
             shell=False,
         )
+        assert process.stdin is not None
         assert process.stdout is not None
-        for line in process.stdout:
+
+        writer = threading.Thread(
+            target=_write_stdin,
+            args=(process.stdin, stdin_text or "", boundary_failure),
+            name="subscription-runtime-stdin",
+            daemon=True,
+        )
+        reader = threading.Thread(
+            target=_read_stdout,
+            args=(process.stdout, fold, boundary_failure),
+            name="subscription-runtime-stdout",
+            daemon=True,
+        )
+        writer.start()
+        reader.start()
+
+        returncode, failure_class = _wait_for_process(process, boundary_failure)
+        if failure_class is not None:
+            _terminate_process(process)
+            _force_close_stream(process.stdin)
+            _force_close_stream(process.stdout)
+
+        _join_thread(writer)
+        _join_thread(reader)
+        if writer.is_alive() or reader.is_alive():
+            boundary_failure.set()
+            _force_close_stream(process.stdin)
+            _force_close_stream(process.stdout)
+            _join_thread(writer)
+            _join_thread(reader)
+
+        if boundary_failure.is_set() and failure_class is None:
+            failure_class = ExitClass.UNKNOWN
+        if failure_class is not None:
+            returncode = EXIT_CONTRACT
+        return CompletedAttempt(
+            returncode,
+            fold.events(),
+            started_at,
+            _utc_now(),
+            failure_class,
+        )
+    except OSError:
+        _terminate_process(process)
+        if process is not None:
+            _force_close_stream(process.stdin)
+            _force_close_stream(process.stdout)
+        raise
+    finally:
+        if process is not None:
+            _force_close_stream(process.stdin)
+            _force_close_stream(process.stdout)
+        _join_thread(writer)
+        _join_thread(reader)
+
+
+class _ClassificationFold:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._ordinary: list[tuple[int, Mapping[str, object]]] = []
+        self._decisive: list[tuple[int, Mapping[str, object]]] = []
+        self._decisive_keys: set[tuple[str, object]] = set()
+
+    def add(self, value: object) -> None:
+        if not isinstance(value, Mapping):
+            return
+        projected = _classification_projection(value)
+        if not projected:
+            return
+        with self._lock:
+            sequence = self._sequence
+            self._sequence += 1
+            decisive_key = _decisive_key(projected)
+            if decisive_key is not None:
+                if (
+                    decisive_key not in self._decisive_keys
+                    and len(self._decisive) < _MAX_DECISIVE_EVENTS
+                ):
+                    self._decisive_keys.add(decisive_key)
+                    self._decisive.append((sequence, projected))
+                return
+            ordinary_limit = _MAX_CLASSIFIED_EVENTS - _MAX_DECISIVE_EVENTS
+            if len(self._ordinary) < ordinary_limit:
+                self._ordinary.append((sequence, projected))
+
+    def events(self) -> tuple[Mapping[str, object], ...]:
+        with self._lock:
+            retained = sorted(
+                (*self._ordinary, *self._decisive), key=lambda item: item[0]
+            )
+        return tuple(event for _, event in retained)
+
+
+def _classification_projection(value: Mapping[str, object]) -> dict[str, object]:
+    projected: dict[str, object] = {}
+    for key in ("type", "subtype", "error"):
+        candidate = value.get(key)
+        if isinstance(candidate, str):
+            if len(candidate) > _MAX_CLASSIFICATION_STRING_CHARS:
+                return {"type": "result", "is_error": True}
+            projected[key] = candidate
+    if isinstance(value.get("is_error"), bool):
+        projected["is_error"] = value["is_error"]
+    return projected
+
+
+def _decisive_key(event: Mapping[str, object]) -> tuple[str, object] | None:
+    if event.get("type") == "system" and event.get("subtype") == "api_retry":
+        error = event.get("error")
+        if error in {"rate_limit", "billing_error"}:
+            return ("api_retry", error)
+    if event.get("type") == "result" and event.get("is_error") is True:
+        return ("result", True)
+    return None
+
+
+def _write_stdin(
+    stream: object, text: str, boundary_failure: threading.Event
+) -> None:
+    try:
+        stream.write(text)  # type: ignore[attr-defined]
+        stream.flush()  # type: ignore[attr-defined]
+    except (BrokenPipeError, OSError, UnicodeError, ValueError):
+        boundary_failure.set()
+    finally:
+        _close_stream(stream)
+
+
+def _read_stdout(
+    stream: object,
+    fold: _ClassificationFold,
+    boundary_failure: threading.Event,
+) -> None:
+    try:
+        for line in stream:  # type: ignore[union-attr]
             try:
                 value = json.loads(line)
             except (json.JSONDecodeError, TypeError):
                 continue
-            if not isinstance(value, Mapping):
-                continue
-            projected: dict[str, object] = {}
-            for key in ("type", "subtype", "error"):
-                if isinstance(value.get(key), str):
-                    projected[key] = value[key]
-            if isinstance(value.get("is_error"), bool):
-                projected["is_error"] = value["is_error"]
-            if projected:
-                events.append(projected)
-        return CompletedAttempt(
-            process.wait(), tuple(events), started_at, _utc_now()
-        )
-    except KeyboardInterrupt:
-        _terminate_process(process)
-        return CompletedAttempt(
-            130,
-            tuple(events),
-            started_at,
-            _utc_now(),
-            ExitClass.CANCELLED,
-        )
-    except subprocess.TimeoutExpired:
-        _terminate_process(process)
-        return CompletedAttempt(
-            124, tuple(events), started_at, _utc_now(), ExitClass.TIMEOUT
-        )
-    except UnicodeError:
-        _terminate_process(process)
-        return CompletedAttempt(
-            EXIT_CONTRACT, tuple(events), started_at, _utc_now(), ExitClass.UNKNOWN
-        )
-    except OSError:
-        _terminate_process(process)
-        raise
+            fold.add(value)
+    except (OSError, UnicodeError, ValueError):
+        boundary_failure.set()
     finally:
-        if process is not None and process.stdout is not None:
-            process.stdout.close()
-        if stdin_file is not None:
-            stdin_file.close()
+        _close_stream(stream)
+
+
+def _wait_for_process(
+    process: subprocess.Popen[str], boundary_failure: threading.Event
+) -> tuple[int, ExitClass | None]:
+    deadline = time.monotonic() + _PROCESS_WAIT_TIMEOUT_SECONDS
+    try:
+        while True:
+            if boundary_failure.is_set():
+                return EXIT_CONTRACT, ExitClass.UNKNOWN
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return EXIT_CONTRACT, ExitClass.TIMEOUT
+            try:
+                return process.wait(timeout=min(_PROCESS_POLL_SECONDS, remaining)), None
+            except subprocess.TimeoutExpired:
+                continue
+    except KeyboardInterrupt:
+        return EXIT_CONTRACT, ExitClass.CANCELLED
+
+
+def _join_thread(thread: threading.Thread | None) -> None:
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=_THREAD_JOIN_TIMEOUT_SECONDS)
+
+
+def _close_stream(stream: object | None) -> None:
+    if stream is None:
+        return
+    try:
+        stream.close()  # type: ignore[attr-defined]
+    except (OSError, ValueError):
+        return
+
+
+def _force_close_stream(stream: object | None) -> None:
+    if stream is None or getattr(stream, "closed", False):
+        return
+    stream_id = id(stream)
+    with _CLOSING_STREAM_LOCK:
+        if stream_id in _CLOSING_STREAM_IDS:
+            return
+        _CLOSING_STREAM_IDS.add(stream_id)
+
+    def close() -> None:
+        try:
+            _close_stream(stream)
+        finally:
+            with _CLOSING_STREAM_LOCK:
+                _CLOSING_STREAM_IDS.discard(stream_id)
+
+    threading.Thread(
+        target=close,
+        name="subscription-runtime-pipe-close",
+        daemon=True,
+    ).start()
 
 
 def _terminate_process(process: subprocess.Popen[str] | None) -> None:
@@ -184,7 +349,7 @@ def _terminate_process(process: subprocess.Popen[str] | None) -> None:
     try:
         process.terminate()
         try:
-            process.wait(timeout=2)
+            process.wait(timeout=_PROCESS_TERMINATE_WAIT_SECONDS)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
@@ -807,11 +972,11 @@ class SubscriptionRunner:
             return self._process_runner(argv, cwd, env, stdin_text, stdout_path)
         except subprocess.TimeoutExpired:
             return CompletedAttempt(
-                124, (), started_at, _utc_now(), ExitClass.TIMEOUT
+                EXIT_CONTRACT, (), started_at, _utc_now(), ExitClass.TIMEOUT
             )
         except KeyboardInterrupt:
             return CompletedAttempt(
-                130, (), started_at, _utc_now(), ExitClass.CANCELLED
+                EXIT_CONTRACT, (), started_at, _utc_now(), ExitClass.CANCELLED
             )
         except OSError:
             return CompletedAttempt(
