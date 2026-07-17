@@ -39,7 +39,7 @@ def _is_direct_provider_cli(line: str) -> bool:
     command = line.strip()
     if not command or command.startswith("#"):
         return False
-    command = re.sub(r"^(?:&\s+|command\s+)", "", command)
+    command = re.sub(r"^(?:&\s*|command\s+)", "", command)
     match = re.match(r'''(?:"([^"]+)"|'([^']+)'|(\S+))''', command)
     if match is None:
         return False
@@ -128,7 +128,9 @@ def test_managed_subscription_skill_has_local_override_contract(
     "line",
     (
         '& "codex" exec',
+        '&"codex" exec',
         "& '.\\claude.exe' -p",
+        "&'C:\\Tools\\claude.exe' -p",
         '& "C:\\Tools\\codex.exe" exec',
         "command claude",
     ),
