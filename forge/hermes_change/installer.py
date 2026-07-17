@@ -1,4 +1,4 @@
-"""Safely add the generic ``pre_user_turn`` hook to a Hermes checkout."""
+"""Safely build the INFINITY_FORGE change package for a Hermes checkout."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ _RELEASE_DIR = "release_files"
 _RESTORE_DIR = "restore_files"
 _STATE_NAME = ".infinity-forge-change-state.json"
 _HOOK_MARKER = "INFINITY_FORGE_PRE_USER_TURN_V1"
+_WORKER_MARKER = "INFINITY_FORGE_SUBSCRIPTION_WORKER_V1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -508,6 +509,119 @@ def change_gateway_source(source: str) -> str:
     )
 
 
+_SUBSCRIPTION_WORKER_HELPERS = f'''def _infinity_forge_required_worker_file(value, label, *, native):
+    if not isinstance(value, str) or not value or not os.path.isabs(value):
+        raise RuntimeError(f"{{label}} configuration is invalid")
+    try:
+        resolved = Path(value).resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(f"{{label}} configuration is invalid") from error
+    if not resolved.is_file():
+        raise RuntimeError(f"{{label}} configuration is invalid")
+    if native:
+        if os.name == "nt":
+            if resolved.suffix.lower() != ".exe":
+                raise RuntimeError(f"{{label}} configuration is invalid")
+        elif not os.access(resolved, os.X_OK):
+            raise RuntimeError(f"{{label}} configuration is invalid")
+    return resolved
+
+
+def _infinity_forge_subscription_worker_argv(task, cmd, env):
+    # {_WORKER_MARKER}
+    if env.get("INFINITY_FORGE_SUBSCRIPTION_ROUTING") != "1":
+        return cmd
+    key = task.idempotency_key or ""
+    if not isinstance(key, str) or not key.startswith(("forge-task:", "forge-step:")):
+        return cmd
+
+    python_bin = _infinity_forge_required_worker_file(
+        env.get("INFINITY_FORGE_SUBSCRIPTION_PYTHON"),
+        "INFINITY_FORGE_SUBSCRIPTION_PYTHON",
+        native=True,
+    )
+    runner = _infinity_forge_required_worker_file(
+        env.get("INFINITY_FORGE_SUBSCRIPTION_RUNNER"),
+        "INFINITY_FORGE_SUBSCRIPTION_RUNNER",
+        native=False,
+    )
+    configured_hermes = _infinity_forge_required_worker_file(
+        env.get("INFINITY_FORGE_HERMES_BIN") or env.get("HERMES_BIN"),
+        "INFINITY_FORGE_HERMES_BIN or HERMES_BIN",
+        native=True,
+    )
+    if len(cmd) >= 3 and cmd[1] == "-m":
+        raise RuntimeError("Hermes module-form Python fallback is not allowed")
+    original_hermes = _infinity_forge_required_worker_file(
+        cmd[0] if cmd else None,
+        "original Hermes command",
+        native=True,
+    )
+    normalized_original = os.path.normcase(os.path.normpath(str(original_hermes)))
+    normalized_configured = os.path.normcase(os.path.normpath(str(configured_hermes)))
+    if normalized_original != normalized_configured:
+        raise RuntimeError("configured Hermes executable does not match original command")
+
+    env["INFINITY_FORGE_HERMES_BIN"] = str(configured_hermes)
+    return [
+        str(python_bin),
+        str(runner),
+        "worker",
+        "--workspace",
+        env["HERMES_KANBAN_WORKSPACE"],
+        "--",
+        *cmd,
+    ]
+
+
+'''
+
+
+def change_kanban_db_source(source: str) -> str:
+    """Route only Forge-owned workers through the subscription runner."""
+
+    if _WORKER_MARKER in source:
+        raise InstallError("kanban_db.py subscription worker routing is already installed")
+    if (
+        "_infinity_forge_required_worker_file" in source
+        or "_infinity_forge_subscription_worker_argv" in source
+    ):
+        raise InstallError("kanban_db.py subscription worker routing is partial or drifted")
+    newline = "\r\n" if "\r\n" in source else "\n"
+    function_anchor = "def _default_spawn("
+    if source.count(function_anchor) != 1:
+        raise InstallError("kanban_db.py _default_spawn anchor is not unique")
+    command_anchor = newline.join(
+        (
+            "    cmd.extend([",
+            '        "chat",',
+            '        "-q", prompt,',
+            "    ])",
+            "",
+        )
+    )
+    if source.count(command_anchor) != 1:
+        raise InstallError("kanban_db.py completed worker command anchor is not unique")
+    function_position = source.index(function_anchor)
+    command_position = source.index(command_anchor)
+    next_function = source.find(f"{newline}def ", function_position + len(function_anchor))
+    if command_position < function_position or (
+        next_function >= 0 and command_position > next_function
+    ):
+        raise InstallError("kanban_db.py completed worker command anchor drifted")
+    helpers = _SUBSCRIPTION_WORKER_HELPERS.replace("\n", newline)
+    source = source.replace(function_anchor, helpers + function_anchor, 1)
+    addition = newline.join(
+        (
+            command_anchor.rstrip("\r\n"),
+            "    # RISK(security): env-selected executables cross the worker process boundary.",
+            "    cmd = _infinity_forge_subscription_worker_argv(task, cmd, env)",
+            "",
+        )
+    )
+    return source.replace(command_anchor, addition, 1)
+
+
 _CHANGES: dict[str, Callable[[str], str]] = {
     "hermes_cli/plugins.py": change_plugins_source,
     "agent/conversation_loop.py": change_conversation_source,
@@ -515,6 +629,7 @@ _CHANGES: dict[str, Callable[[str], str]] = {
     "cli.py": change_cli_source,
     "tui_gateway/server.py": change_tui_gateway_source,
     "gateway/run.py": change_gateway_source,
+    "hermes_cli/kanban_db.py": change_kanban_db_source,
 }
 
 

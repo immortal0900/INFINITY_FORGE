@@ -220,7 +220,7 @@ def test_python_entrypoint_help_is_runnable(script: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_hermes_change_docs_name_all_six_targets() -> None:
+def test_hermes_change_historical_docs_name_all_six_input_targets() -> None:
     paths = (
         ROOT / "docs" / "weapon" / "plans" / "2026-07-16-task-flow-and-auto-merge.md",
         ROOT
@@ -243,3 +243,14 @@ def test_hermes_change_docs_name_all_six_targets() -> None:
         assert "두 파일" not in text
         for target in targets:
             assert target in text
+
+
+def test_subscription_docs_name_the_seventh_worker_spawn_target() -> None:
+    path = (
+        ROOT
+        / "docs"
+        / "weapon"
+        / "plans"
+        / "2026-07-17-subscription-runtime-fallback.md"
+    )
+    assert "hermes_cli/kanban_db.py" in path.read_text(encoding="utf-8")
