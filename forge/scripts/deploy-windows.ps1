@@ -275,9 +275,11 @@ function New-HermesChangePackage {
   }
 
   $suffix = "$PID-$([guid]::NewGuid().ToString('N'))"
-  $sourceTemp = Join-Path $Paths.PackageRoot ".$packageVersion.source-$suffix"
-  $packageTemp = Join-Path $Paths.PackageRoot ".$packageVersion.build-$suffix"
-  $archive = Join-Path $Paths.PackageRoot ".$packageVersion.archive-$suffix.zip"
+  # Windows의 legacy MAX_PATH 환경에서도 package 안의 중첩 파일을 만들 수
+  # 있도록 두 SHA는 최종 directory에만 두고 sibling 임시 이름은 짧게 유지한다.
+  $sourceTemp = Join-Path $Paths.PackageRoot "._s-$suffix"
+  $packageTemp = Join-Path $Paths.PackageRoot "._b-$suffix"
+  $archive = Join-Path $Paths.PackageRoot "._a-$suffix.zip"
   try {
     git -C $paths.HermesRoot archive --format=zip `
       "--output=$archive" $hermesSourceCommit
@@ -291,11 +293,11 @@ function New-HermesChangePackage {
     Move-Item -LiteralPath $packageTemp -Destination $packagePath
   } finally {
     Remove-DeploymentPath -Path $archive -ExpectedParent $Paths.PackageRoot `
-      -ExpectedPrefix ".$packageVersion.archive-"
+      -ExpectedPrefix "._a-"
     Remove-DeploymentPath -Path $sourceTemp -ExpectedParent $Paths.PackageRoot `
-      -ExpectedPrefix ".$packageVersion.source-"
+      -ExpectedPrefix "._s-"
     Remove-DeploymentPath -Path $packageTemp -ExpectedParent $Paths.PackageRoot `
-      -ExpectedPrefix ".$packageVersion.build-"
+      -ExpectedPrefix "._b-"
   }
   return [pscustomobject]@{
     Path = $packagePath
