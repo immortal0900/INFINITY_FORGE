@@ -144,6 +144,15 @@ def test_runtime_is_stopped_before_legacy_recheck_and_restored_on_error() -> Non
     assert 'systemctl --user start "forge-$T.timer"' in deploy
     assert 'systemctl --user stop hermes-gateway' in deploy
     assert 'trap restore_runtime_after_error EXIT' in deploy
+    rollback_start = deploy.index("restore_runtime_after_error()")
+    rollback_end = deploy.index("trap restore_runtime_after_error EXIT")
+    rollback = deploy[rollback_start:rollback_end]
+    assert rollback.index('systemctl --user stop hermes-gateway') < rollback.index(
+        "restore_forge_environment"
+    )
+    assert rollback.index('systemctl --user stop "forge-$T.service"') < rollback.index(
+        "restore_plugin_state"
+    )
 
 
 def test_deploy_enables_plugin_without_waiting_for_operator_input() -> None:
@@ -158,6 +167,144 @@ def test_deploy_enables_plugin_without_waiting_for_operator_input() -> None:
         '"$HERMES_PY" -m hermes_cli.main plugins enable infinity-forge\n'
         not in deploy
     )
+
+
+def test_server_deploy_publishes_clean_commit_release_atomically() -> None:
+    deploy = DEPLOY.read_text(encoding="utf-8")
+
+    assert 'FORGE_RELEASE_ROOT="$HOME/.hermes/infinity-forge/releases"' in deploy
+    assert 'FORGE_RELEASE="$FORGE_RELEASE_ROOT/$DEPLOYED_COMMIT"' in deploy
+    assert 'FORGE_RELEASE_ROOT="$TASK_DATA_DIR/releases"' not in deploy
+    assert 'RELEASE_TEMP="$(mktemp -d ' in deploy
+    assert 'git ls-tree -r "$DEPLOYED_COMMIT"' in deploy
+    assert 'managed release cannot contain symbolic links' in deploy
+    assert 'find "$FORGE_RELEASE" -type l -print -quit' in deploy
+    assert 'existing managed release contains a symbolic link' in deploy
+    assert 'git archive "$DEPLOYED_COMMIT" | tar -x -C "$RELEASE_TEMP"' in deploy
+    assert 'diff -qr "$RELEASE_TEMP" "$FORGE_RELEASE"' in deploy
+    assert 'mv -T "$RELEASE_TEMP" "$FORGE_RELEASE"' in deploy
+    assert deploy.index('git archive "$DEPLOYED_COMMIT"') < deploy.index(
+        'mv -T "$RELEASE_TEMP" "$FORGE_RELEASE"'
+    )
+    assert '"$FORGE_RELEASE_ROOT"/.build-*) rm -rf -- "$RELEASE_TEMP"' in deploy
+
+
+def test_server_deploy_upgrades_physical_plugin_to_atomic_version_link() -> None:
+    deploy = DEPLOY.read_text(encoding="utf-8")
+
+    assert 'PLUGIN_RELEASE_ROOT="$HOME/.hermes/plugin-releases"' in deploy
+    assert 'PLUGIN_RELEASE="$PLUGIN_RELEASE_ROOT/$DEPLOYED_COMMIT"' in deploy
+    assert 'PLUGIN_LINK="$HOME/.hermes/plugins/infinity-forge"' in deploy
+    assert 'release-path.txt' in deploy
+    assert 'find "$PLUGIN_RELEASE" -type l -print -quit' in deploy
+    assert 'existing plugin release contains a symbolic link' in deploy
+    assert 'if [ -d "$PLUGIN_LINK" ] && [ ! -L "$PLUGIN_LINK" ]' in deploy
+    assert 'mv -T "$PLUGIN_LINK" "$PLUGIN_BACKUP"' in deploy
+    assert 'ln -s -- "$PLUGIN_RELEASE" "$PLUGIN_LINK_STAGE/infinity-forge"' in deploy
+    assert (
+        'mv -Tf "$PLUGIN_LINK_STAGE/infinity-forge" "$PLUGIN_LINK"'
+        in deploy
+    )
+    assert "PLUGIN_ROLLBACK_OK" not in deploy
+    assert "PLUGIN_RELEASE_CREATED" not in deploy
+    assert 'rm -rf -- "$PLUGIN_RELEASE"' not in deploy
+    assert 'mkdir -p "$PLUGIN_DIR"' not in deploy
+    assert '[ ! -L "$PLUGIN_RELEASE" ]' in deploy
+    assert '[ ! -L "$FORGE_RELEASE" ]' in deploy
+
+
+def test_server_deploy_saves_and_can_restore_only_three_runtime_keys() -> None:
+    deploy = DEPLOY.read_text(encoding="utf-8")
+
+    assert "from hermes_cli.config import save_env_value" in deploy
+    assert "from hermes_cli.config import remove_env_value" in deploy
+    assert 'ENV_BACKUP="$(mktemp "$TASK_DATA_DIR/.env-backup.' in deploy
+    assert 'ENV_CHANGED=true' in deploy
+    for key in (
+        "INFINITY_FORGE_REPOSITORY",
+        "INFINITY_FORGE_TASK_SETTINGS_DB",
+        "INFINITY_FORGE_GH_PATH",
+    ):
+        assert key in deploy
+    assert '"$TASK_DATA_DIR"/.env-backup.*) rm -f -- "$ENV_BACKUP"' in deploy
+    assert "runtime settings rollback failed" in deploy
+    assert "print(payload)" not in deploy
+
+
+def test_both_server_deploy_layers_run_the_same_actual_chooser_smoke() -> None:
+    server_deploy = DEPLOY.read_text(encoding="utf-8")
+    local_deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+    begin = "# INFINITY_FORGE_CHOOSER_SMOKE_BEGIN"
+    end = "# INFINITY_FORGE_CHOOSER_SMOKE_END"
+
+    def smoke_block(script: str) -> str:
+        assert script.count(begin) == 1
+        assert script.count(end) == 1
+        return script.split(begin, 1)[1].split(end, 1)[0]
+
+    server_smoke = smoke_block(server_deploy)
+    local_smoke = smoke_block(local_deploy)
+
+    assert server_smoke == local_smoke
+    assert 'CHOOSER_EXPECTED_COMMIT="$DEPLOYED_COMMIT"' in server_deploy
+    assert 'CHOOSER_EXPECTED_COMMIT="$EXPECTED_COMMIT"' in local_deploy
+    for script in (server_deploy, local_deploy):
+        assert 'CHOOSER_HERMES_ROOT="$HERMES_ROOT"' in script
+        assert 'CHOOSER_EXPECTED_REPOSITORY="$REPOSITORY"' in script
+        assert 'CHOOSER_EXPECTED_TASK_SETTINGS_DB="$TASK_SETTINGS_DB"' in script
+        assert 'CHOOSER_EXPECTED_GH_PATH="$GH_BIN"' in script
+    for contract in (
+        'CHOOSER_SMOKE_CWD="$(mktemp -d ',
+        'chmod 700 "$CHOOSER_SMOKE_CWD"',
+        'rmdir -- "$CHOOSER_SMOKE_CWD" 2>/dev/null || true',
+        'cd "$CHOOSER_SMOKE_CWD"',
+        "-u PYTHONPATH",
+        "-u PYTHONHOME",
+        "-u PYTHONOPTIMIZE",
+        "-u INFINITY_FORGE_REPOSITORY",
+        "-u INFINITY_FORGE_TASK_SETTINGS_DB",
+        "-u INFINITY_FORGE_GH_PATH",
+        'HERMES_HOME="$HOME/.hermes"',
+        "PYTHONDONTWRITEBYTECODE=1",
+        'CHOOSER_HERMES_ROOT="$CHOOSER_HERMES_ROOT"',
+        'CHOOSER_EXPECTED_REPOSITORY="$CHOOSER_EXPECTED_REPOSITORY"',
+        'CHOOSER_EXPECTED_TASK_SETTINGS_DB="$CHOOSER_EXPECTED_TASK_SETTINGS_DB"',
+        'CHOOSER_EXPECTED_GH_PATH="$CHOOSER_EXPECTED_GH_PATH"',
+        "from hermes_cli.env_loader import load_hermes_dotenv",
+        'load_hermes_dotenv(project_env=hermes_project_root / ".env")',
+        'os.environ["INFINITY_FORGE_REPOSITORY"]',
+        'os.environ["CHOOSER_EXPECTED_REPOSITORY"]',
+        'os.environ["INFINITY_FORGE_TASK_SETTINGS_DB"]',
+        'os.environ["CHOOSER_EXPECTED_TASK_SETTINGS_DB"]',
+        'os.environ["INFINITY_FORGE_GH_PATH"]',
+        'os.environ["CHOOSER_EXPECTED_GH_PATH"]',
+        "from hermes_cli.plugins import discover_plugins",
+        "from hermes_cli.plugins import get_plugin_manager",
+        "from hermes_cli.plugins import has_hook",
+        "discover_plugins(force=True)",
+        'manager._plugins["infinity-forge"]',
+        "loaded.enabled is True",
+        "loaded.error is None",
+        '"pre_user_turn" in loaded.hooks_registered',
+        'has_hook("pre_user_turn")',
+        "loaded.module is not None",
+        "loaded.manifest.path is not None",
+        'getattr(module, "_MANAGED_RELEASE", None)',
+        "module.set_task_service(forbid_task_service)",
+        "module.before_user_turn(",
+        'result["action"] == "handled"',
+        '[choice["id"] for choice in result["choices"]] == ["chat", "task"]',
+        'raise AssertionError("Task service must not run during chooser smoke")',
+    ):
+        assert contract in server_smoke
+    assert server_smoke.index("load_hermes_dotenv(") < server_smoke.index(
+        "from hermes_cli.plugins import"
+    )
+    assert "invoke_hook" not in server_smoke
+    assert "PYTHONPATH=" not in server_smoke
+    assert "sys.path" not in server_smoke
+    assert "print(" not in server_smoke
+    assert 'rm -rf -- "$CHOOSER_SMOKE_CWD"' not in server_smoke
 
 
 def test_hermes_change_package_is_version_bound_and_committed_atomically() -> None:
@@ -205,10 +352,45 @@ def test_local_deploy_uses_absolute_remote_paths_and_requires_clean_main() -> No
     assert "git status --porcelain=v1 --untracked-files=all" in deploy
     assert "git stash" not in deploy
     assert "named stash" in deploy
-    assert '$RemotePrepareScript = @\'' in deploy
-    assert 'git fetch origin main --quiet' in deploy
-    assert 'git merge --ff-only "$EXPECTED_COMMIT"' in deploy
-    assert 'deploy-vps.sh" --post-update' in deploy
+    assert "$RemotePrepareScript" not in deploy
+    assert 'git merge --ff-only "$EXPECTED_COMMIT"' not in deploy
+    assert 'deploy-vps.sh" --post-update' not in deploy
+
+
+def test_server_apply_runs_update_and_deploy_under_one_remote_lock() -> None:
+    deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+    start = deploy.index("function Invoke-ForgeServerDeploy")
+    verification = deploy.index("  $VerificationScript = @'", start)
+    apply = deploy[start:verification]
+
+    assert apply.count("Invoke-RemoteBashScript") == 1
+    assert apply.count("$DeployBootstrapScript = @'") == 1
+    assert apply.index("git -C $RemoteRepo symbolic-ref --short HEAD") < apply.index(
+        "$DeployBootstrapScript = @'"
+    )
+    assert apply.index(
+        "git -C $RemoteRepo status --porcelain=v1 --untracked-files=all"
+    ) < apply.index("$DeployBootstrapScript = @'")
+    for contract in (
+        'DEPLOY_LOCK_ROOT="$HOME/.hermes/infinity-forge"',
+        'DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/deploy.lock"',
+        "mkdir -p \"$DEPLOY_LOCK_ROOT\"",
+        "if [ ! -x /usr/bin/flock ]; then",
+        'exec 9>"$DEPLOY_LOCK_FILE"',
+        "/usr/bin/flock --nonblock 9",
+        "another Infinity Forge deployment is already running",
+        'export INFINITY_FORGE_DEPLOY_LOCK_FD9="$DEPLOY_LOCK_FILE"',
+        'FORGE_EXPECTED_COMMIT="$EXPECTED_COMMIT"',
+        'FORGE_REPO_DIR="$REPO_DIR"',
+        'bash "$REPO_DIR/forge/scripts/deploy-vps.sh"',
+        "-Script $DeployBootstrapScript",
+        "배포 잠금을 얻지 못했거나 배포가 실패했습니다.",
+    ):
+        assert contract in apply
+    assert "git fetch" not in apply
+    assert "git merge --ff-only" not in apply
+    assert "--post-update" not in apply
+    assert 'ssh $HostName env "FORGE_EXPECTED_COMMIT=' not in apply
 
 
 def test_local_deploy_sends_remote_bash_without_windows_line_endings() -> None:
@@ -217,7 +399,7 @@ def test_local_deploy_sends_remote_bash_without_windows_line_endings() -> None:
     assert "function Invoke-RemoteBashScript" in deploy
     assert "[Convert]::ToBase64String" in deploy
     assert "base64 --decode | bash -s --" in deploy
-    assert "$RemotePrepareScript | ssh" not in deploy
+    assert "$DeployBootstrapScript | ssh" not in deploy
     assert "$VerificationScript | ssh" not in deploy
 
 

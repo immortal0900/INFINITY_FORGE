@@ -37,6 +37,25 @@ def _make_plugin_file(tmp_path: Path, pointer: str | None) -> Path:
     return plugin_file
 
 
+def _make_linux_plugin_and_release(tmp_path: Path) -> tuple[Path, Path]:
+    hermes_home = tmp_path / "hermes"
+    plugin_file = (
+        hermes_home / "plugins" / "infinity-forge" / "__init__.py"
+    )
+    plugin_file.parent.mkdir(parents=True)
+    plugin_file.write_text("", encoding="utf-8")
+    release = hermes_home / "infinity-forge" / "releases" / ("a" * 40)
+    (release / "forge" / "ops").mkdir(parents=True)
+    (release / "forge" / "__init__.py").write_text("", encoding="utf-8")
+    (release / "forge" / "ops" / "task_setup.py").write_text(
+        "", encoding="utf-8"
+    )
+    (plugin_file.parent / "release-path.txt").write_text(
+        str(release), encoding="utf-8"
+    )
+    return plugin_file, release
+
+
 def test_missing_pointer_keeps_existing_import_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -59,6 +78,49 @@ def test_valid_pointer_prepends_exact_release(
     monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
 
     result = plugin._activate_managed_release(plugin_file)
+
+    assert result == release.resolve()
+    assert Path(sys.path[0]) == release.resolve()
+
+
+def test_valid_linux_pointer_prepends_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    plugin_file, expected_release = _make_linux_plugin_and_release(tmp_path)
+
+    result = plugin._activate_managed_release(plugin_file)
+
+    assert result == expected_release.resolve()
+    assert Path(sys.path[0]) == expected_release.resolve()
+
+
+def test_linux_versioned_plugin_symlink_uses_fixed_release_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    hermes_home = tmp_path / "hermes"
+    sha = "a" * 40
+    versioned_plugin = hermes_home / "plugin-releases" / sha
+    versioned_plugin.mkdir(parents=True)
+    (versioned_plugin / "__init__.py").write_text("", encoding="utf-8")
+    release = hermes_home / "infinity-forge" / "releases" / sha
+    (release / "forge" / "ops").mkdir(parents=True)
+    (release / "forge" / "__init__.py").write_text("", encoding="utf-8")
+    (release / "forge" / "ops" / "task_setup.py").write_text(
+        "", encoding="utf-8"
+    )
+    (versioned_plugin / "release-path.txt").write_text(
+        str(release), encoding="utf-8"
+    )
+    stable_plugin = hermes_home / "plugins" / "infinity-forge"
+    stable_plugin.parent.mkdir(parents=True)
+    try:
+        stable_plugin.symlink_to(versioned_plugin, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    result = plugin._activate_managed_release(stable_plugin / "__init__.py")
 
     assert result == release.resolve()
     assert Path(sys.path[0]) == release.resolve()
@@ -98,6 +160,20 @@ def test_pointer_outside_managed_release_root_fails_loudly(
     outside = _make_release(tmp_path / "Outside")
     plugin_file = _make_plugin_file(tmp_path, pointer=str(outside))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+
+    with pytest.raises(RuntimeError, match="outside managed release root"):
+        plugin._activate_managed_release(plugin_file)
+
+
+def test_linux_pointer_outside_managed_release_root_fails_loudly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    plugin_file, _ = _make_linux_plugin_and_release(tmp_path)
+    outside = _make_release(tmp_path / "Outside")
+    (plugin_file.parent / "release-path.txt").write_text(
+        str(outside), encoding="utf-8"
+    )
 
     with pytest.raises(RuntimeError, match="outside managed release root"):
         plugin._activate_managed_release(plugin_file)

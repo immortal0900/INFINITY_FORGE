@@ -199,29 +199,36 @@ function Invoke-ForgeServerDeploy {
     throw "$Name 저장소가 깨끗하지 않습니다. 서버에서 manual named stash를 만든 뒤 다시 실행하세요."
   }
 
-  # 서버에 설치된 배포 스크립트가 이전 버전이어도 정확한 커밋만 먼저 적용한다.
-  $RemotePrepareScript = @'
+  # 저장소 fast-forward와 배포 전체를 같은 FD 9 lock 아래에서 실행한다.
+  # 이전 deploy-vps.sh가 새 script로 exec해도 FD와 marker가 그대로 상속된다.
+  $DeployBootstrapScript = @'
 set -euo pipefail
 REPO_DIR="$1"
 EXPECTED_COMMIT="$2"
-cd "$REPO_DIR"
-test "$(git symbolic-ref --short HEAD)" = "main"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
-git fetch origin main --quiet
-test "$(git rev-parse origin/main)" = "$EXPECTED_COMMIT"
-git merge-base --is-ancestor HEAD "$EXPECTED_COMMIT"
-git merge --ff-only "$EXPECTED_COMMIT"
-test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
+DEPLOY_LOCK_ROOT="$HOME/.hermes/infinity-forge"
+DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/deploy.lock"
+if [ ! -x /usr/bin/flock ]; then
+  echo "[deploy] /usr/bin/flock is required for deployment locking" >&2
+  exit 1
+fi
+mkdir -p "$DEPLOY_LOCK_ROOT"
+exec 9>"$DEPLOY_LOCK_FILE"
+if ! /usr/bin/flock --nonblock 9; then
+  echo "[deploy] another Infinity Forge deployment is already running" >&2
+  exec 9>&-
+  exit 1
+fi
+export INFINITY_FORGE_DEPLOY_LOCK_FD9="$DEPLOY_LOCK_FILE"
+env \
+  FORGE_EXPECTED_COMMIT="$EXPECTED_COMMIT" \
+  FORGE_REPO_DIR="$REPO_DIR" \
+  bash "$REPO_DIR/forge/scripts/deploy-vps.sh"
 '@
   Invoke-RemoteBashScript `
     -HostName $HostName `
-    -Script $RemotePrepareScript `
+    -Script $DeployBootstrapScript `
     -Arguments @($RemoteRepo, $Commit) `
-    -FailureMessage "$Name 저장소를 요청한 main commit으로 이동하지 못했습니다."
-
-  ssh $HostName env "FORGE_EXPECTED_COMMIT=$Commit" "FORGE_REPO_DIR=$RemoteRepo" bash "$RemoteRepo/forge/scripts/deploy-vps.sh" --post-update
-  if ($LASTEXITCODE -ne 0) { throw "$Name 배포가 실패했습니다." }
+    -FailureMessage "$Name 배포 잠금을 얻지 못했거나 배포가 실패했습니다."
 
   $VerificationScript = @'
 set -euo pipefail
@@ -248,6 +255,103 @@ case "$PLUGIN_LIST" in
   *infinity-forge*) ;;
   *) echo "[verify] infinity-forge plugin is not enabled" >&2; exit 1 ;;
 esac
+
+CHOOSER_EXPECTED_COMMIT="$EXPECTED_COMMIT"
+CHOOSER_HERMES_ROOT="$HERMES_ROOT"
+CHOOSER_EXPECTED_REPOSITORY="$REPOSITORY"
+CHOOSER_EXPECTED_TASK_SETTINGS_DB="$TASK_SETTINGS_DB"
+CHOOSER_EXPECTED_GH_PATH="$GH_BIN"
+# INFINITY_FORGE_CHOOSER_SMOKE_BEGIN
+(
+  CHOOSER_SMOKE_CWD="$(mktemp -d "${TMPDIR:-/tmp}/infinity-forge-chooser-smoke.XXXXXX")"
+  chmod 700 "$CHOOSER_SMOKE_CWD"
+  trap 'rmdir -- "$CHOOSER_SMOKE_CWD" 2>/dev/null || true' EXIT
+  cd "$CHOOSER_SMOKE_CWD"
+  env \
+    -u PYTHONPATH \
+    -u PYTHONHOME \
+    -u PYTHONOPTIMIZE \
+    -u INFINITY_FORGE_REPOSITORY \
+    -u INFINITY_FORGE_TASK_SETTINGS_DB \
+    -u INFINITY_FORGE_GH_PATH \
+    HERMES_HOME="$HOME/.hermes" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CHOOSER_EXPECTED_COMMIT="$CHOOSER_EXPECTED_COMMIT" \
+    CHOOSER_HERMES_ROOT="$CHOOSER_HERMES_ROOT" \
+    CHOOSER_EXPECTED_REPOSITORY="$CHOOSER_EXPECTED_REPOSITORY" \
+    CHOOSER_EXPECTED_TASK_SETTINGS_DB="$CHOOSER_EXPECTED_TASK_SETTINGS_DB" \
+    CHOOSER_EXPECTED_GH_PATH="$CHOOSER_EXPECTED_GH_PATH" \
+    "$HERMES_PY" - <<'PY'
+import os
+from pathlib import Path
+
+from hermes_cli.env_loader import load_hermes_dotenv
+
+hermes_root = Path(os.environ["HERMES_HOME"]).resolve()
+hermes_project_root = Path(os.environ["CHOOSER_HERMES_ROOT"]).resolve()
+expected_commit = os.environ["CHOOSER_EXPECTED_COMMIT"]
+load_hermes_dotenv(project_env=hermes_project_root / ".env")
+assert (
+    os.environ["INFINITY_FORGE_REPOSITORY"]
+    == os.environ["CHOOSER_EXPECTED_REPOSITORY"]
+)
+assert (
+    os.environ["INFINITY_FORGE_TASK_SETTINGS_DB"]
+    == os.environ["CHOOSER_EXPECTED_TASK_SETTINGS_DB"]
+)
+assert (
+    os.environ["INFINITY_FORGE_GH_PATH"]
+    == os.environ["CHOOSER_EXPECTED_GH_PATH"]
+)
+
+from hermes_cli.plugins import discover_plugins
+from hermes_cli.plugins import get_plugin_manager
+from hermes_cli.plugins import has_hook
+
+discover_plugins(force=True)
+manager = get_plugin_manager()
+loaded = manager._plugins["infinity-forge"]
+assert loaded.enabled is True
+assert loaded.error is None
+assert loaded.module is not None
+assert loaded.manifest.path is not None
+assert "pre_user_turn" in loaded.hooks_registered
+assert has_hook("pre_user_turn")
+
+module = loaded.module
+plugin_path = Path(loaded.manifest.path).resolve()
+expected_plugin_path = (hermes_root / "plugins" / "infinity-forge").resolve()
+assert plugin_path == expected_plugin_path
+module_file = getattr(module, "__file__", None)
+assert module_file is not None
+assert Path(module_file).resolve() == (plugin_path / "__init__.py").resolve()
+
+managed_release = getattr(module, "_MANAGED_RELEASE", None)
+assert managed_release is not None
+expected_release = (
+    hermes_root / "infinity-forge" / "releases" / expected_commit
+).resolve()
+assert Path(managed_release).resolve() == expected_release
+assert expected_release.name == expected_commit
+
+
+def forbid_task_service(_request):
+    raise AssertionError("Task service must not run during chooser smoke")
+
+
+module.set_task_service(forbid_task_service)
+result = module.before_user_turn(
+    session_id=f"chooser-smoke-{expected_commit}",
+    user_id="deploy-verifier",
+    surface="cli",
+    text="diagnostic",
+    is_new_session=True,
+)
+assert result["action"] == "handled"
+assert [choice["id"] for choice in result["choices"]] == ["chat", "task"]
+PY
+)
+# INFINITY_FORGE_CHOOSER_SMOKE_END
 
 for MarkerFile in \
   hermes_cli/plugins.py \

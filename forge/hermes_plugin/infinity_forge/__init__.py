@@ -18,6 +18,13 @@ from typing import Any
 _RELEASE_SHA = re.compile(r"[0-9a-f]{40}")
 
 
+def _managed_release_root(plugin_file: Path) -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        return Path(local_app_data).resolve() / "InfinityForge" / "releases"
+    return plugin_file.resolve().parent.parent.parent / "infinity-forge" / "releases"
+
+
 def _activate_managed_release(
     plugin_file: Path = Path(__file__),
 ) -> Path | None:
@@ -32,15 +39,12 @@ def _activate_managed_release(
         ) from exc
 
     candidate = Path(raw)
-    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-    if not raw or not candidate.is_absolute() or not local_app_data:
+    if not raw or not candidate.is_absolute():
         raise RuntimeError("invalid Infinity Forge managed release pointer")
 
     # RISK(security): 이 경로가 사용자 관리 release root를 벗어나면
     # plugin import를 통해 임의 Python 코드를 실행할 수 있다.
-    release_root = (
-        Path(local_app_data).resolve() / "InfinityForge" / "releases"
-    )
+    release_root = _managed_release_root(plugin_file)
     resolved = candidate.resolve()
     if resolved.parent != release_root:
         raise RuntimeError(

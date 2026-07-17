@@ -2,8 +2,41 @@
 # INFINITY_FORGE — 서버의 검증된 main 커밋과 Hermes 자산을 반영합니다.
 # 실행 위치: 서버의 INFINITY_FORGE clone. 로컬 변경은 운영자가 먼저 보관해야 합니다.
 set -euo pipefail
+
+acquire_deploy_lock() {
+  DEPLOY_LOCK_FILE="$HOME/.hermes/infinity-forge/deploy.lock"
+  if [ ! -x /usr/bin/flock ]; then
+    echo "[deploy] /usr/bin/flock is required for deployment locking" >&2
+    exit 1
+  fi
+  mkdir -p "$HOME/.hermes/infinity-forge"
+
+  # fast-forward 후 exec로 재진입하면 같은 FD와 lock을 그대로 사용한다.
+  # 환경 marker만 위조됐거나 FD가 사라졌다면 반드시 다시 lock을 잡는다.
+  if [ "${INFINITY_FORGE_DEPLOY_LOCK_FD9:-}" = "$DEPLOY_LOCK_FILE" ]; then
+    LOCK_FD_TARGET="$(readlink -f "/proc/$$/fd/9" 2>/dev/null || true)"
+    LOCK_FILE_TARGET="$(readlink -f "$DEPLOY_LOCK_FILE" 2>/dev/null || true)"
+    if [ -n "$LOCK_FD_TARGET" ] && [ "$LOCK_FD_TARGET" = "$LOCK_FILE_TARGET" ]; then
+      if /usr/bin/flock --nonblock 9; then
+        return 0
+      fi
+      echo "[deploy] another Infinity Forge deployment is already running" >&2
+      exit 1
+    fi
+  fi
+
+  exec 9>"$DEPLOY_LOCK_FILE"
+  if ! /usr/bin/flock --nonblock 9; then
+    echo "[deploy] another Infinity Forge deployment is already running" >&2
+    exec 9>&-
+    exit 1
+  fi
+  export INFINITY_FORGE_DEPLOY_LOCK_FD9="$DEPLOY_LOCK_FILE"
+}
+
 # main 함수로 전체를 감싸서 fast-forward가 이 파일을 갱신해도 현재 실행을 안전하게 끝낸다.
 main() {
+acquire_deploy_lock
 REPO_DIR="${FORGE_REPO_DIR:-$HOME/work/INFINITY_FORGE}"
 cd "$REPO_DIR"
 
@@ -65,6 +98,21 @@ CONFIRMED_TASKS_DB="$TASK_SETTINGS_DB.task-outbox.db"
 HERMES_DB="$HOME/.hermes/kanban.db"
 mkdir -p "$TASK_DATA_DIR"
 
+# Plugin bootstrap은 사용자 Hermes home 아래의 이 고정 경로만 신뢰한다.
+# 작업 데이터 경로 override가 코드 실행 root를 바꾸게 두지 않는다.
+FORGE_RELEASE_ROOT="$HOME/.hermes/infinity-forge/releases"
+FORGE_RELEASE="$FORGE_RELEASE_ROOT/$DEPLOYED_COMMIT"
+PLUGIN_ROOT="$HOME/.hermes/plugins"
+PLUGIN_LINK="$HOME/.hermes/plugins/infinity-forge"
+PLUGIN_RELEASE_ROOT="$HOME/.hermes/plugin-releases"
+PLUGIN_RELEASE="$PLUGIN_RELEASE_ROOT/$DEPLOYED_COMMIT"
+PLUGIN_BACKUP_ROOT="$HOME/.hermes/plugin-backups/infinity-forge"
+mkdir -p \
+  "$FORGE_RELEASE_ROOT" \
+  "$PLUGIN_ROOT" \
+  "$PLUGIN_RELEASE_ROOT" \
+  "$PLUGIN_BACKUP_ROOT"
+
 MANAGED_TIMERS="ledger stage mirror canary drift morning merge flush messages"
 ACTIVE_TIMERS=""
 ENABLED_TIMERS=""
@@ -75,8 +123,81 @@ fi
 CHANGE_PACKAGE_ROOT="$TASK_DATA_DIR/hermes-user-turn-changes"
 PACKAGE_TEMP=""
 HERMES_SOURCE_TEMP=""
-restore_runtime_after_error() {
-  STATUS=$?
+RELEASE_TEMP=""
+PLUGIN_TEMP=""
+PLUGIN_LINK_STAGE=""
+PLUGIN_PREVIOUS_KIND=""
+PLUGIN_PREVIOUS_LINK=""
+PLUGIN_BACKUP_CONTAINER=""
+PLUGIN_BACKUP=""
+PLUGIN_STATE_CHANGED=false
+ENV_BACKUP=""
+ENV_CHANGED=false
+
+restore_forge_environment() {
+  [ "$ENV_CHANGED" = true ] || return 0
+  [ -n "$ENV_BACKUP" ] && [ -f "$ENV_BACKUP" ] || return 1
+  HERMES_ENV_BACKUP="$ENV_BACKUP" "$HERMES_PY" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+from dotenv import get_key
+from hermes_cli.config import get_env_path
+from hermes_cli.config import remove_env_value
+from hermes_cli.config import save_env_value
+
+backup = json.loads(
+    Path(os.environ["HERMES_ENV_BACKUP"]).read_text(encoding="utf-8")
+)
+for key, previous in backup.items():
+    if previous["present"]:
+        save_env_value(key, previous["value"] or "")
+    else:
+        remove_env_value(key)
+env_path = get_env_path()
+for key, previous in backup.items():
+    expected = (previous["value"] or "") if previous["present"] else None
+    if get_key(str(env_path), key) != expected:
+        raise RuntimeError("Infinity Forge runtime settings rollback failed")
+PY
+}
+
+restore_plugin_state() {
+  [ "$PLUGIN_STATE_CHANGED" = true ] || return 0
+  if [ -L "$PLUGIN_LINK" ]; then
+    if [ "$(readlink "$PLUGIN_LINK")" != "$PLUGIN_RELEASE" ]; then
+      echo "[deploy] plugin link changed concurrently; refusing rollback overwrite" >&2
+      return 1
+    fi
+    rm -f -- "$PLUGIN_LINK"
+  elif [ -e "$PLUGIN_LINK" ]; then
+    echo "[deploy] plugin path changed concurrently; refusing rollback overwrite" >&2
+    return 1
+  fi
+
+  case "$PLUGIN_PREVIOUS_KIND" in
+    symlink)
+      PLUGIN_LINK_STAGE="$(mktemp -d "$PLUGIN_ROOT/.infinity-forge-rollback.XXXXXX")"
+      ln -s -- "$PLUGIN_PREVIOUS_LINK" "$PLUGIN_LINK_STAGE/infinity-forge"
+      mv -Tf "$PLUGIN_LINK_STAGE/infinity-forge" "$PLUGIN_LINK"
+      rmdir -- "$PLUGIN_LINK_STAGE"
+      PLUGIN_LINK_STAGE=""
+      ;;
+    directory)
+      [ -d "$PLUGIN_BACKUP" ] || return 1
+      mv -T "$PLUGIN_BACKUP" "$PLUGIN_LINK"
+      rmdir -- "$PLUGIN_BACKUP_CONTAINER"
+      PLUGIN_BACKUP_CONTAINER=""
+      PLUGIN_BACKUP=""
+      ;;
+    missing) ;;
+    *) return 1 ;;
+  esac
+  PLUGIN_STATE_CHANGED=false
+}
+
+cleanup_deploy_temporaries() {
   if [ -n "$PACKAGE_TEMP" ]; then
     case "$PACKAGE_TEMP" in
       "$CHANGE_PACKAGE_ROOT"/.build-*) rm -rf -- "$PACKAGE_TEMP" ;;
@@ -87,10 +208,49 @@ restore_runtime_after_error() {
       "$CHANGE_PACKAGE_ROOT"/.source-*) rm -rf -- "$HERMES_SOURCE_TEMP" ;;
     esac
   fi
+  if [ -n "$RELEASE_TEMP" ]; then
+    case "$RELEASE_TEMP" in
+      "$FORGE_RELEASE_ROOT"/.build-*) rm -rf -- "$RELEASE_TEMP" ;;
+    esac
+  fi
+  if [ -n "$PLUGIN_TEMP" ]; then
+    case "$PLUGIN_TEMP" in
+      "$PLUGIN_RELEASE_ROOT"/.build-*) rm -rf -- "$PLUGIN_TEMP" ;;
+    esac
+  fi
+  if [ -n "$PLUGIN_LINK_STAGE" ]; then
+    case "$PLUGIN_LINK_STAGE" in
+      "$PLUGIN_ROOT"/.infinity-forge-*) rm -rf -- "$PLUGIN_LINK_STAGE" ;;
+    esac
+  fi
+  if [ -n "$ENV_BACKUP" ] && [ "$ENV_CHANGED" = false ]; then
+    case "$ENV_BACKUP" in
+      "$TASK_DATA_DIR"/.env-backup.*) rm -f -- "$ENV_BACKUP" ;;
+    esac
+  fi
+}
+
+restore_runtime_after_error() {
+  STATUS=$?
+  set +e
   if [ "$STATUS" -ne 0 ]; then
+    # 새 코드를 실행할 수 있는 모든 managed process를 먼저 멈춘 뒤
+    # plugin link와 release를 되돌린다.
     systemctl --user stop hermes-gateway >/dev/null 2>&1 || true
     for T in $MANAGED_TIMERS; do
       systemctl --user stop "forge-$T.timer" >/dev/null 2>&1 || true
+      systemctl --user stop "forge-$T.service" >/dev/null 2>&1 || true
+    done
+    if ! restore_forge_environment; then
+      echo "[deploy] WARNING: runtime settings rollback needs manual review: $ENV_BACKUP" >&2
+    else
+      ENV_CHANGED=false
+    fi
+    if ! restore_plugin_state; then
+      echo "[deploy] WARNING: plugin rollback needs manual review" >&2
+    fi
+    cleanup_deploy_temporaries
+    for T in $MANAGED_TIMERS; do
       case " $ENABLED_TIMERS " in
         *" $T "*) systemctl --user enable "forge-$T.timer" >/dev/null 2>&1 || true ;;
         *) systemctl --user disable "forge-$T.timer" >/dev/null 2>&1 || true ;;
@@ -102,6 +262,8 @@ restore_runtime_after_error() {
     for T in $ACTIVE_TIMERS; do
       systemctl --user start "forge-$T.timer" >/dev/null 2>&1 || true
     done
+  else
+    cleanup_deploy_temporaries
   fi
   return "$STATUS"
 }
@@ -128,6 +290,47 @@ fi
 # OLD_PROFILE_MIGRATION_END
 
 echo "[deploy] Hermes user-turn chooser..."
+
+# 커밋 스냅샷을 별도 release로 만든다. 실행 중인 CLI는 기존 모듈을
+# 계속 사용하고, 새 CLI만 완성된 release를 보게 된다.
+if git ls-tree -r "$DEPLOYED_COMMIT" | awk \
+  '$1 == "120000" { found=1 } END { exit(found ? 0 : 1) }'; then
+  echo "[deploy] managed release cannot contain symbolic links" >&2
+  exit 1
+fi
+RELEASE_TEMP="$(mktemp -d "$FORGE_RELEASE_ROOT/.build-$DEPLOYED_COMMIT.XXXXXX")"
+git archive "$DEPLOYED_COMMIT" | tar -x -C "$RELEASE_TEMP"
+for REQUIRED_RELEASE_FILE in \
+  forge/__init__.py \
+  forge/ops/task_setup.py \
+  forge/hermes_plugin/infinity_forge/__init__.py; do
+  [ -f "$RELEASE_TEMP/$REQUIRED_RELEASE_FILE" ] || {
+    echo "[deploy] managed release is incomplete" >&2
+    exit 1
+  }
+done
+if [ -d "$FORGE_RELEASE" ] && [ ! -L "$FORGE_RELEASE" ]; then
+  if [ -n "$(find "$FORGE_RELEASE" -type l -print -quit)" ]; then
+    echo "[deploy] existing managed release contains a symbolic link" >&2
+    exit 1
+  fi
+  if ! diff -qr "$RELEASE_TEMP" "$FORGE_RELEASE" >/dev/null; then
+    echo "[deploy] existing managed release does not match its Git commit" >&2
+    exit 1
+  fi
+  rm -rf -- "$RELEASE_TEMP"
+  RELEASE_TEMP=""
+elif [ -e "$FORGE_RELEASE" ] || [ -L "$FORGE_RELEASE" ]; then
+  echo "[deploy] managed release path is not a directory" >&2
+  exit 1
+else
+  # Python import가 release 안에 __pycache__를 만들지 못하게 하여
+  # 같은 SHA 재배포 때 전체 스냅샷 검증이 가능하게 한다.
+  chmod -R a-w "$RELEASE_TEMP"
+  mv -T "$RELEASE_TEMP" "$FORGE_RELEASE"
+  RELEASE_TEMP=""
+fi
+
 HERMES_SOURCE_VERSION="$(git -C "$HERMES_ROOT" rev-parse HEAD)"
 if ! printf '%s\n' "$HERMES_SOURCE_VERSION" | grep -Eq '^[0-9a-f]{40}$'; then
   echo "[deploy] Hermes source version is not a full Git commit ID" >&2
@@ -159,13 +362,208 @@ EXPECTED_PACKAGE_VERSION="$CHANGE_PACKAGE_VERSION" CHANGE_PACKAGE="$CHANGE_PACKA
 "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" install \
   --hermes-root "$HERMES_ROOT" \
   --package "$CHANGE_PACKAGE"
-PLUGIN_DIR="$HOME/.hermes/plugins/infinity-forge"
-mkdir -p "$PLUGIN_DIR"
-install -m 644 forge/hermes_plugin/infinity_forge/plugin.yaml "$PLUGIN_DIR/plugin.yaml"
-install -m 644 forge/hermes_plugin/infinity_forge/__init__.py "$PLUGIN_DIR/__init__.py"
-PYTHONPATH="$REPO_DIR" "$HERMES_PY" -m hermes_cli.main plugins enable infinity-forge --no-allow-tool-override
-TASK_SETTINGS_DB="$TASK_SETTINGS_DB" PYTHONPATH="$REPO_DIR" "$HERMES_PY" -c \
+
+# 플러그인 세 파일을 버전 디렉터리에 먼저 완성한 뒤 stable link만
+# 교체한다. 기존 일반 디렉터리는 plugins 밖으로 옮겨 롤백용으로 보존한다.
+PLUGIN_TEMP="$(mktemp -d "$PLUGIN_RELEASE_ROOT/.build-$DEPLOYED_COMMIT.XXXXXX")"
+install -m 644 "$FORGE_RELEASE/forge/hermes_plugin/infinity_forge/plugin.yaml" "$PLUGIN_TEMP/plugin.yaml"
+install -m 644 "$FORGE_RELEASE/forge/hermes_plugin/infinity_forge/__init__.py" "$PLUGIN_TEMP/__init__.py"
+printf '%s\n' "$FORGE_RELEASE" > "$PLUGIN_TEMP/release-path.txt"
+chmod 644 "$PLUGIN_TEMP/release-path.txt"
+if [ -d "$PLUGIN_RELEASE" ] && [ ! -L "$PLUGIN_RELEASE" ]; then
+  if [ -n "$(find "$PLUGIN_RELEASE" -type l -print -quit)" ]; then
+    echo "[deploy] existing plugin release contains a symbolic link" >&2
+    exit 1
+  fi
+  for PLUGIN_FILE in plugin.yaml __init__.py release-path.txt; do
+    if ! cmp -s "$PLUGIN_TEMP/$PLUGIN_FILE" "$PLUGIN_RELEASE/$PLUGIN_FILE"; then
+      echo "[deploy] existing plugin release does not match its Git commit" >&2
+      exit 1
+    fi
+  done
+  rm -rf -- "$PLUGIN_TEMP"
+  PLUGIN_TEMP=""
+elif [ -e "$PLUGIN_RELEASE" ] || [ -L "$PLUGIN_RELEASE" ]; then
+  echo "[deploy] plugin release path is not a directory" >&2
+  exit 1
+else
+  mv -T "$PLUGIN_TEMP" "$PLUGIN_RELEASE"
+  PLUGIN_TEMP=""
+fi
+
+if [ -L "$PLUGIN_LINK" ]; then
+  PLUGIN_PREVIOUS_KIND=symlink
+  PLUGIN_PREVIOUS_LINK="$(readlink "$PLUGIN_LINK")"
+elif [ -d "$PLUGIN_LINK" ] && [ ! -L "$PLUGIN_LINK" ]; then
+  PLUGIN_PREVIOUS_KIND=directory
+  PLUGIN_BACKUP_CONTAINER="$(mktemp -d "$PLUGIN_BACKUP_ROOT/migration-$DEPLOYED_COMMIT.XXXXXX")"
+  PLUGIN_BACKUP="$PLUGIN_BACKUP_CONTAINER/infinity-forge"
+  mv -T "$PLUGIN_LINK" "$PLUGIN_BACKUP"
+  PLUGIN_STATE_CHANGED=true
+elif [ -e "$PLUGIN_LINK" ]; then
+  echo "[deploy] plugin path must be a directory or symbolic link" >&2
+  exit 1
+else
+  PLUGIN_PREVIOUS_KIND=missing
+fi
+
+PLUGIN_LINK_STAGE="$(mktemp -d "$PLUGIN_ROOT/.infinity-forge-link.XXXXXX")"
+ln -s -- "$PLUGIN_RELEASE" "$PLUGIN_LINK_STAGE/infinity-forge"
+mv -Tf "$PLUGIN_LINK_STAGE/infinity-forge" "$PLUGIN_LINK"
+PLUGIN_STATE_CHANGED=true
+rmdir -- "$PLUGIN_LINK_STAGE"
+PLUGIN_LINK_STAGE=""
+
+# Hermes 공식 설정 API로 사용자 CLI가 시작할 때 필요한 세 값만 저장한다.
+# 백업에도 이 세 값만 담고, 실패 시 missing/value 상태를 그대로 복원한다.
+ENV_BACKUP="$(mktemp "$TASK_DATA_DIR/.env-backup.XXXXXX")"
+chmod 600 "$ENV_BACKUP"
+HERMES_ENV_BACKUP="$ENV_BACKUP" "$HERMES_PY" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+from dotenv import get_key
+from hermes_cli.config import get_env_path
+
+keys = (
+    "INFINITY_FORGE_REPOSITORY",
+    "INFINITY_FORGE_TASK_SETTINGS_DB",
+    "INFINITY_FORGE_GH_PATH",
+)
+env_path = get_env_path()
+backup = {
+    key: {
+        "present": env_path.exists() and get_key(str(env_path), key) is not None,
+        "value": get_key(str(env_path), key) if env_path.exists() else None,
+    }
+    for key in keys
+}
+Path(os.environ["HERMES_ENV_BACKUP"]).write_text(
+    json.dumps(backup), encoding="utf-8"
+)
+PY
+ENV_CHANGED=true
+"$HERMES_PY" - "$REPOSITORY" "$TASK_SETTINGS_DB" "$GH_BIN" <<'PY'
+import sys
+
+from dotenv import get_key
+from hermes_cli.config import get_env_path
+from hermes_cli.config import save_env_value
+
+keys = (
+    "INFINITY_FORGE_REPOSITORY",
+    "INFINITY_FORGE_TASK_SETTINGS_DB",
+    "INFINITY_FORGE_GH_PATH",
+)
+expected = dict(zip(keys, sys.argv[1:], strict=True))
+for key, value in expected.items():
+    save_env_value(key, value)
+env_path = get_env_path()
+if any(get_key(str(env_path), key) != value for key, value in expected.items()):
+    raise RuntimeError("Infinity Forge runtime settings were not saved")
+PY
+
+(cd "$HOME" && env -u PYTHONPATH -u PYTHONHOME "$HERMES_PY" -m hermes_cli.main plugins enable infinity-forge --no-allow-tool-override)
+TASK_SETTINGS_DB="$TASK_SETTINGS_DB" PYTHONPATH="$FORGE_RELEASE" "$HERMES_PY" -c \
   "import os; from forge.ops.task_settings import TaskSettingsStore; from forge.ops.task_outbox import TaskOutbox, task_outbox_path; store=TaskSettingsStore(os.environ['TASK_SETTINGS_DB']); TaskOutbox(task_outbox_path(store.database_path))"
+
+CHOOSER_EXPECTED_COMMIT="$DEPLOYED_COMMIT"
+CHOOSER_HERMES_ROOT="$HERMES_ROOT"
+CHOOSER_EXPECTED_REPOSITORY="$REPOSITORY"
+CHOOSER_EXPECTED_TASK_SETTINGS_DB="$TASK_SETTINGS_DB"
+CHOOSER_EXPECTED_GH_PATH="$GH_BIN"
+# INFINITY_FORGE_CHOOSER_SMOKE_BEGIN
+(
+  CHOOSER_SMOKE_CWD="$(mktemp -d "${TMPDIR:-/tmp}/infinity-forge-chooser-smoke.XXXXXX")"
+  chmod 700 "$CHOOSER_SMOKE_CWD"
+  trap 'rmdir -- "$CHOOSER_SMOKE_CWD" 2>/dev/null || true' EXIT
+  cd "$CHOOSER_SMOKE_CWD"
+  env \
+    -u PYTHONPATH \
+    -u PYTHONHOME \
+    -u PYTHONOPTIMIZE \
+    -u INFINITY_FORGE_REPOSITORY \
+    -u INFINITY_FORGE_TASK_SETTINGS_DB \
+    -u INFINITY_FORGE_GH_PATH \
+    HERMES_HOME="$HOME/.hermes" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CHOOSER_EXPECTED_COMMIT="$CHOOSER_EXPECTED_COMMIT" \
+    CHOOSER_HERMES_ROOT="$CHOOSER_HERMES_ROOT" \
+    CHOOSER_EXPECTED_REPOSITORY="$CHOOSER_EXPECTED_REPOSITORY" \
+    CHOOSER_EXPECTED_TASK_SETTINGS_DB="$CHOOSER_EXPECTED_TASK_SETTINGS_DB" \
+    CHOOSER_EXPECTED_GH_PATH="$CHOOSER_EXPECTED_GH_PATH" \
+    "$HERMES_PY" - <<'PY'
+import os
+from pathlib import Path
+
+from hermes_cli.env_loader import load_hermes_dotenv
+
+hermes_root = Path(os.environ["HERMES_HOME"]).resolve()
+hermes_project_root = Path(os.environ["CHOOSER_HERMES_ROOT"]).resolve()
+expected_commit = os.environ["CHOOSER_EXPECTED_COMMIT"]
+load_hermes_dotenv(project_env=hermes_project_root / ".env")
+assert (
+    os.environ["INFINITY_FORGE_REPOSITORY"]
+    == os.environ["CHOOSER_EXPECTED_REPOSITORY"]
+)
+assert (
+    os.environ["INFINITY_FORGE_TASK_SETTINGS_DB"]
+    == os.environ["CHOOSER_EXPECTED_TASK_SETTINGS_DB"]
+)
+assert (
+    os.environ["INFINITY_FORGE_GH_PATH"]
+    == os.environ["CHOOSER_EXPECTED_GH_PATH"]
+)
+
+from hermes_cli.plugins import discover_plugins
+from hermes_cli.plugins import get_plugin_manager
+from hermes_cli.plugins import has_hook
+
+discover_plugins(force=True)
+manager = get_plugin_manager()
+loaded = manager._plugins["infinity-forge"]
+assert loaded.enabled is True
+assert loaded.error is None
+assert loaded.module is not None
+assert loaded.manifest.path is not None
+assert "pre_user_turn" in loaded.hooks_registered
+assert has_hook("pre_user_turn")
+
+module = loaded.module
+plugin_path = Path(loaded.manifest.path).resolve()
+expected_plugin_path = (hermes_root / "plugins" / "infinity-forge").resolve()
+assert plugin_path == expected_plugin_path
+module_file = getattr(module, "__file__", None)
+assert module_file is not None
+assert Path(module_file).resolve() == (plugin_path / "__init__.py").resolve()
+
+managed_release = getattr(module, "_MANAGED_RELEASE", None)
+assert managed_release is not None
+expected_release = (
+    hermes_root / "infinity-forge" / "releases" / expected_commit
+).resolve()
+assert Path(managed_release).resolve() == expected_release
+assert expected_release.name == expected_commit
+
+
+def forbid_task_service(_request):
+    raise AssertionError("Task service must not run during chooser smoke")
+
+
+module.set_task_service(forbid_task_service)
+result = module.before_user_turn(
+    session_id=f"chooser-smoke-{expected_commit}",
+    user_id="deploy-verifier",
+    surface="cli",
+    text="diagnostic",
+    is_new_session=True,
+)
+assert result["action"] == "handled"
+assert [choice["id"] for choice in result["choices"]] == ["chat", "task"]
+PY
+)
+# INFINITY_FORGE_CHOOSER_SMOKE_END
 
 echo "[deploy] four Task profiles..."
 profile() { "$HERMES_PY" -m hermes_cli.main profile "$@"; }
@@ -279,7 +677,9 @@ mkunit morning "/bin/bash $HOME/forge/morning-report.sh"                        
 mkunit merge  "$PROCESS_LOCK $HERMES_PY $REPO_DIR/forge/scripts/merge-worker.py --settings-db $TASK_SETTINGS_DB --outbox $CONFIRMED_TASKS_DB --hermes-db $HERMES_DB --gh $GH_BIN --repo $REPOSITORY --required-check eval --hermes $HERMES_BIN --workspace dir:$REPO_DIR" "OnCalendar=*-*-* *:*:15" "Merge Worker" "Environment=AUTO_MERGE_ENABLED=false"
 mkunit flush  "$PROCESS_LOCK $HERMES_PY $REPO_DIR/forge/scripts/send-pending-messages.py"   "OnCalendar=*-*-* *:*:45"             "Send Pending Messages"
 systemctl --user daemon-reload
-for T in ledger stage mirror canary drift morning merge flush; do systemctl --user enable --now "forge-$T.timer" > /dev/null; done
+for T in ledger stage mirror canary drift morning merge flush; do
+  systemctl --user enable "forge-$T.timer" > /dev/null
+done
 
 echo "[deploy] remove replaced files and skills..."
 # OLD_INSTALLATION_CLEANUP_BEGIN: fixed allowlist, safe to repeat.
@@ -314,7 +714,17 @@ Environment=INFINITY_FORGE_TASK_SETTINGS_DB=$TASK_SETTINGS_DB
 Environment=INFINITY_FORGE_GH_PATH=$GH_BIN
 UNIT
 systemctl --user daemon-reload
+cleanup_deploy_temporaries
 systemctl --user restart hermes-gateway
+for T in ledger stage mirror canary drift morning merge flush; do
+  systemctl --user start "forge-$T.timer" > /dev/null
+done
+case "$ENV_BACKUP" in
+  "$TASK_DATA_DIR"/.env-backup.*) rm -f -- "$ENV_BACKUP" ;;
+  *) echo "[deploy] runtime settings backup path is invalid" >&2; exit 1 ;;
+esac
+ENV_BACKUP=""
+ENV_CHANGED=false
 GATEWAY_WAS_ACTIVE=false
 trap - EXIT
 echo "[deploy] done: $(git rev-parse --short HEAD)"
