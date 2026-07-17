@@ -17,6 +17,7 @@ from forge.ops.subscription_runner import (
     SubscriptionRunner,
     WorkerRequest,
     build_claude_continuation_prompt,
+    default_process_runner,
 )
 from forge.ops.subscription_runtime import (
     CodexSubscriptionSnapshot,
@@ -746,6 +747,71 @@ def test_claude_skill_returns_nonquota_failure_unchanged() -> None:
     )
 
     assert outcome.returncode == 19
+
+
+@pytest.mark.parametrize("returncode", [23, 75])
+def test_codex_skill_preserves_actual_early_child_code_and_post_probes(
+    returncode: int,
+) -> None:
+    class ActualEarlyExitProcess(SequenceProcess):
+        def __call__(
+            self,
+            argv: Sequence[str],
+            cwd: str,
+            env: Mapping[str, str],
+            stdin_text: str | None,
+            stdout_path: Path | None,
+        ) -> CompletedAttempt:
+            self.calls.append({"argv": list(argv)})
+            return default_process_runner(
+                [sys.executable, "-c", f"raise SystemExit({returncode})"],
+                str(Path.cwd()),
+                dict(os.environ, PYTHONUTF8="1"),
+                stdin_text,
+                stdout_path,
+            )
+
+    process = ActualEarlyExitProcess([])
+    probe = SequenceProbe([available_snapshot()])
+
+    outcome = make_runner(process, probe).run_codex_skill(
+        SkillRequest("C:/work", "대용량 🧪𐐷" * 200_000, {})
+    )
+
+    assert outcome.returncode == returncode
+    assert outcome.receipt.attempts[0].returncode == returncode
+    assert len(probe.calls) == 1
+
+
+def test_claude_quota_event_survives_writer_broken_pipe_on_nonzero_child() -> None:
+    class ActualQuotaExitProcess(SequenceProcess):
+        def __call__(
+            self,
+            argv: Sequence[str],
+            cwd: str,
+            env: Mapping[str, str],
+            stdin_text: str | None,
+            stdout_path: Path | None,
+        ) -> CompletedAttempt:
+            child = (
+                "import json; print(json.dumps({'type':'system',"
+                "'subtype':'api_retry','error':'rate_limit'}), flush=True); "
+                "raise SystemExit(9)"
+            )
+            return default_process_runner(
+                [sys.executable, "-c", child],
+                str(Path.cwd()),
+                dict(os.environ, PYTHONUTF8="1"),
+                stdin_text,
+                stdout_path,
+            )
+
+    outcome = make_runner(ActualQuotaExitProcess([]), SequenceProbe([])).run_claude_skill(
+        SkillRequest("C:/work", "대용량 🧪𐐷" * 200_000, {})
+    )
+
+    assert outcome.returncode == 75
+    assert outcome.receipt.attempts[0].exit_class is ExitClass.SUBSCRIPTION_QUOTA
 
 
 def test_build_prompt_includes_skill_instruction_but_not_environment() -> None:

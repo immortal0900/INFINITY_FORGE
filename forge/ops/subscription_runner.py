@@ -123,7 +123,8 @@ def default_process_runner(
     process: subprocess.Popen[str] | None = None
     writer: threading.Thread | None = None
     reader: threading.Thread | None = None
-    boundary_failure = threading.Event()
+    writer_failure = threading.Event()
+    reader_failure = threading.Event()
     try:
         # RISK(side-effect): this is the single external runtime process boundary.
         process = subprocess.Popen(
@@ -143,20 +144,20 @@ def default_process_runner(
 
         writer = threading.Thread(
             target=_write_stdin,
-            args=(process.stdin, stdin_text or "", boundary_failure),
+            args=(process.stdin, stdin_text or "", writer_failure),
             name="subscription-runtime-stdin",
             daemon=True,
         )
         reader = threading.Thread(
             target=_read_stdout,
-            args=(process.stdout, fold, boundary_failure),
+            args=(process.stdout, fold, reader_failure),
             name="subscription-runtime-stdout",
             daemon=True,
         )
         writer.start()
         reader.start()
 
-        returncode, failure_class = _wait_for_process(process, boundary_failure)
+        returncode, failure_class = _wait_for_process(process)
         if failure_class is not None:
             _terminate_process(process)
             _force_close_stream(process.stdin)
@@ -164,20 +165,27 @@ def default_process_runner(
 
         _join_thread(writer)
         _join_thread(reader)
-        if writer.is_alive() or reader.is_alive():
-            boundary_failure.set()
+        if writer.is_alive():
+            writer_failure.set()
             _force_close_stream(process.stdin)
+        if reader.is_alive():
+            reader_failure.set()
             _force_close_stream(process.stdout)
+        if writer.is_alive() or reader.is_alive():
             _join_thread(writer)
             _join_thread(reader)
 
-        if boundary_failure.is_set() and failure_class is None:
-            failure_class = ExitClass.UNKNOWN
+        events = fold.finish()
         if failure_class is not None:
             returncode = EXIT_CONTRACT
+        elif returncode == 0 and (writer_failure.is_set() or reader_failure.is_set()):
+            returncode = EXIT_CONTRACT
+            failure_class = ExitClass.UNKNOWN
+        elif reader_failure.is_set():
+            events = ()
         return CompletedAttempt(
             returncode,
-            fold.events(),
+            events,
             started_at,
             _utc_now(),
             failure_class,
@@ -203,14 +211,18 @@ class _ClassificationFold:
         self._ordinary: list[tuple[int, Mapping[str, object]]] = []
         self._decisive: list[tuple[int, Mapping[str, object]]] = []
         self._decisive_keys: set[tuple[str, object]] = set()
+        self._frozen = False
+        self._finished_events: tuple[Mapping[str, object], ...] = ()
 
     def add(self, value: object) -> None:
         if not isinstance(value, Mapping):
             return
-        projected = _classification_projection(value)
-        if not projected:
-            return
         with self._lock:
+            if self._frozen:
+                return
+            projected = _classification_projection(value)
+            if not projected:
+                return
             sequence = self._sequence
             self._sequence += 1
             decisive_key = _decisive_key(projected)
@@ -226,12 +238,15 @@ class _ClassificationFold:
             if len(self._ordinary) < ordinary_limit:
                 self._ordinary.append((sequence, projected))
 
-    def events(self) -> tuple[Mapping[str, object], ...]:
+    def finish(self) -> tuple[Mapping[str, object], ...]:
         with self._lock:
-            retained = sorted(
-                (*self._ordinary, *self._decisive), key=lambda item: item[0]
-            )
-        return tuple(event for _, event in retained)
+            if not self._frozen:
+                retained = sorted(
+                    (*self._ordinary, *self._decisive), key=lambda item: item[0]
+                )
+                self._finished_events = tuple(event for _, event in retained)
+                self._frozen = True
+            return self._finished_events
 
 
 def _classification_projection(value: Mapping[str, object]) -> dict[str, object]:
@@ -258,13 +273,13 @@ def _decisive_key(event: Mapping[str, object]) -> tuple[str, object] | None:
 
 
 def _write_stdin(
-    stream: object, text: str, boundary_failure: threading.Event
+    stream: object, text: str, writer_failure: threading.Event
 ) -> None:
     try:
         stream.write(text)  # type: ignore[attr-defined]
         stream.flush()  # type: ignore[attr-defined]
     except (BrokenPipeError, OSError, UnicodeError, ValueError):
-        boundary_failure.set()
+        writer_failure.set()
     finally:
         _close_stream(stream)
 
@@ -272,7 +287,7 @@ def _write_stdin(
 def _read_stdout(
     stream: object,
     fold: _ClassificationFold,
-    boundary_failure: threading.Event,
+    reader_failure: threading.Event,
 ) -> None:
     try:
         for line in stream:  # type: ignore[union-attr]
@@ -282,19 +297,17 @@ def _read_stdout(
                 continue
             fold.add(value)
     except (OSError, UnicodeError, ValueError):
-        boundary_failure.set()
+        reader_failure.set()
     finally:
         _close_stream(stream)
 
 
 def _wait_for_process(
-    process: subprocess.Popen[str], boundary_failure: threading.Event
+    process: subprocess.Popen[str],
 ) -> tuple[int, ExitClass | None]:
     deadline = time.monotonic() + _PROCESS_WAIT_TIMEOUT_SECONDS
     try:
         while True:
-            if boundary_failure.is_set():
-                return EXIT_CONTRACT, ExitClass.UNKNOWN
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return EXIT_CONTRACT, ExitClass.TIMEOUT

@@ -6,7 +6,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -383,6 +385,93 @@ def test_process_runner_oversized_error_is_bounded_unknown_not_quota(
         })
         is ExitClass.UNKNOWN
     )
+
+
+def test_classification_fold_finish_is_atomic_and_ignores_late_reader_add() -> None:
+    fold = subscription_runner._ClassificationFold()
+    fold.add({"type": "system", "subtype": "api_retry", "error": "rate_limit"})
+    reader_ready = threading.Event()
+    release_reader = threading.Event()
+
+    def reader() -> None:
+        for index in range(100):
+            fold.add({"type": "assistant", "subtype": str(index)})
+        reader_ready.set()
+        release_reader.wait(timeout=2)
+        fold.add(
+            {"type": "system", "subtype": "api_retry", "error": "billing_error"}
+        )
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    assert reader_ready.wait(timeout=2)
+    frozen = fold.finish()
+    release_reader.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert {"type": "system", "subtype": "api_retry", "error": "rate_limit"} in frozen
+    assert {"type": "system", "subtype": "api_retry", "error": "billing_error"} not in frozen
+    assert fold.finish() == frozen
+
+
+def test_process_runner_freezes_classification_fold_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    original_finish = subscription_runner._ClassificationFold.finish
+
+    def finish(fold: object) -> tuple[Mapping[str, object], ...]:
+        nonlocal calls
+        calls += 1
+        return original_finish(fold)
+
+    monkeypatch.setattr(subscription_runner._ClassificationFold, "finish", finish)
+
+    completed = subscription_runner.default_process_runner(
+        [sys.executable, "-c", "print('{}')"],
+        str(tmp_path),
+        dict(os.environ, PYTHONUTF8="1"),
+        "prompt",
+        None,
+    )
+
+    assert completed.returncode == 0
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("child_returncode", "expected_returncode", "expected_failure"),
+    [
+        (0, 70, ExitClass.UNKNOWN),
+        (23, 23, None),
+    ],
+)
+def test_reader_decode_failure_discards_partial_evidence_and_preserves_nonzero(
+    child_returncode: int,
+    expected_returncode: int,
+    expected_failure: ExitClass | None,
+    tmp_path: Path,
+) -> None:
+    child = (
+        "import sys; "
+        "sys.stdout.buffer.write(b'{\"type\":\"system\",\"subtype\":"
+        "\"api_retry\",\"error\":\"rate_limit\"}\\n'+bytes([255])+b'\\n'); "
+        "sys.stdout.buffer.flush(); "
+        f"raise SystemExit({child_returncode})"
+    )
+
+    completed = subscription_runner.default_process_runner(
+        [sys.executable, "-c", child],
+        str(tmp_path),
+        dict(os.environ, PYTHONUTF8="1"),
+        "대용량 🧪𐐷" * 200_000,
+        None,
+    )
+
+    assert completed.returncode == expected_returncode
+    assert completed.failure_class is expected_failure
+    assert completed.events == ()
 
 
 def test_auth_status_parses_unicode_json_with_strict_utf8(
