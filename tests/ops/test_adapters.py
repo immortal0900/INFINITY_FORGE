@@ -241,6 +241,31 @@ def test_latest_completed_run_uses_newest_run_and_parses_json(tmp_path: Path) ->
     assert run.metadata == {"worker_session_id": "session-3"}
 
 
+def test_completed_run_readers_accept_synthetic_manual_completion(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    connection = _create_live_schema(db_path)
+    _insert_task(
+        connection,
+        task_id="root",
+        key="forge-task:owner/repo#7:aaaaaaaaaaaaaaaa",
+    )
+    connection.execute(
+        """
+        INSERT INTO task_runs (id, task_id, status, outcome, summary, metadata)
+        VALUES (1, 'root', 'completed', 'completed', '{"run": 1}', '{}')
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = HermesStore(db_path)
+
+    assert [run.run_id for run in store.completed_runs("root")] == [1]
+    assert store.latest_completed_run("root").run_id == 1
+
+
 def test_latest_completed_run_rejects_non_object_json(tmp_path: Path) -> None:
     db_path = tmp_path / "kanban.db"
     connection = _create_live_schema(db_path)
