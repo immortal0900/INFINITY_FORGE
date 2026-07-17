@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -457,6 +458,92 @@ def test_runtime_switch_capture_restores_adapter_on_system_exit():
         )
 
     assert migration_module.migrate is migration
+
+
+def test_runtime_switch_capture_reads_and_restores_migration_inside_lock(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker_b_entered_lock = threading.Event()
+    worker_b_read_migrate = threading.Event()
+    worker_a_holding_lock = threading.Event()
+    release_worker_a = threading.Event()
+
+    class RecordingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "migration-worker-b":
+                worker_b_entered_lock.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self._lock.release()
+
+    reports = {
+        "a": SimpleNamespace(written=True, migrated=["a"]),
+        "b": SimpleNamespace(written=True, migrated=["b"]),
+    }
+    calls: list[str] = []
+
+    def original_migrate(config):
+        worker = config["worker"]
+        calls.append(worker)
+        return reports[worker]
+
+    class MigrationModule:
+        migrate = staticmethod(original_migrate)
+
+        def __getattribute__(self, name):
+            if (
+                name == "migrate"
+                and threading.current_thread().name == "migration-worker-b"
+            ):
+                worker_b_read_migrate.set()
+            return object.__getattribute__(self, name)
+
+    migration_module = MigrationModule()
+    recording_lock = RecordingLock()
+    monkeypatch.setattr(subscription_setup, "_MIGRATION_CAPTURE_LOCK", recording_lock)
+    outcomes: dict[str, object] = {}
+
+    def helper(config, value, *, persist_callback):
+        migration_module.migrate(config)
+        if config["worker"] == "a":
+            worker_a_holding_lock.set()
+            assert release_worker_a.wait(timeout=5)
+        return SimpleNamespace(success=True)
+
+    def run(worker: str):
+        outcomes[worker] = (
+            subscription_setup._apply_runtime_switch_with_captured_migration(
+                {"worker": worker},
+                "codex_app_server",
+                persist_callback=lambda config: None,
+                runtime_switch_apply=helper,
+                migration_module=migration_module,
+            )
+        )
+
+    worker_a = threading.Thread(target=run, args=("a",), name="migration-worker-a")
+    worker_b = threading.Thread(target=run, args=("b",), name="migration-worker-b")
+    worker_a.start()
+    assert worker_a_holding_lock.wait(timeout=5)
+    worker_b.start()
+    assert worker_b_entered_lock.wait(timeout=5)
+    worker_b_read_before_lock = worker_b_read_migrate.is_set()
+    release_worker_a.set()
+    worker_a.join(timeout=5)
+    worker_b.join(timeout=5)
+
+    assert not worker_a.is_alive()
+    assert not worker_b.is_alive()
+    assert worker_b_read_before_lock is False
+    assert migration_module.migrate is original_migrate
+    assert outcomes["a"].migration_report is reports["a"]
+    assert outcomes["b"].migration_report is reports["b"]
+    assert calls == ["a", "b"]
 
 
 def test_failed_reapply_restores_immediate_state_and_keeps_original_baseline(

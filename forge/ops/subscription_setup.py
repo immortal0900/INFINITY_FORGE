@@ -68,19 +68,19 @@ def _apply_runtime_switch_with_captured_migration(
     runtime_switch_apply: Callable[..., object],
     migration_module: object,
 ) -> _RuntimeSwitchOutcome:
-    reports: list[object] = []
-    original_migrate = getattr(migration_module, "migrate")
-    owner_thread = threading.get_ident()
-
-    def observe_migration(*args: object, **kwargs: object) -> object:
-        report = original_migrate(*args, **kwargs)
-        if threading.get_ident() == owner_thread:
-            reports.append(report)
-        return report
-
     # The Hermes helper imports migrate inside apply(). Serialize and always restore
     # the temporary observer so one helper-owned plugin discovery is authoritative.
     with _MIGRATION_CAPTURE_LOCK:
+        reports: list[object] = []
+        original_migrate = getattr(migration_module, "migrate")
+        owner_thread = threading.get_ident()
+
+        def observe_migration(*args: object, **kwargs: object) -> object:
+            report = original_migrate(*args, **kwargs)
+            if threading.get_ident() == owner_thread:
+                reports.append(report)
+            return report
+
         setattr(migration_module, "migrate", observe_migration)
         try:
             status = runtime_switch_apply(
@@ -90,10 +90,10 @@ def _apply_runtime_switch_with_captured_migration(
             )
         finally:
             setattr(migration_module, "migrate", original_migrate)
-    return _RuntimeSwitchOutcome(
-        status=status,
-        migration_report=reports[0] if len(reports) == 1 else None,
-    )
+        return _RuntimeSwitchOutcome(
+            status=status,
+            migration_report=reports[0] if len(reports) == 1 else None,
+        )
 
 
 def _default_runtime_switch_apply(
