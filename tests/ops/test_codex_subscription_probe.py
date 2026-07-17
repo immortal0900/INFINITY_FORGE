@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shutil
+import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -57,7 +60,9 @@ def test_probe_reads_account_and_rate_limits() -> None:
         factory_calls.append(kwargs)
         return client
 
-    snapshot = CodexAppServerProbe(factory).probe("codex", environment, 1)
+    snapshot = CodexAppServerProbe(factory).probe(
+        r"C:\\tools\\codex.exe", environment, 1
+    )
 
     assert snapshot.account_type == "chatgpt"
     assert snapshot.plan_type == "plus"
@@ -74,10 +79,200 @@ def test_probe_reads_account_and_rate_limits() -> None:
         ("account/read", {"refreshToken": False}, 1),
         ("account/rateLimits/read", {}, 1),
     ]
-    assert factory_calls == [{"codex_bin": "codex", "env": {"PATH": "kept"}}]
+    assert factory_calls == [
+        {"codex_bin": r"C:\\tools\\codex.exe", "env": {"PATH": "kept"}}
+    ]
     assert factory_calls[0]["env"] is not environment
     assert environment == {"PATH": "kept"}
     assert client.closed is True
+
+
+def test_windows_probe_resolves_bare_codex_to_native_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient(
+        {
+            "account/read": {"account": {"type": "chatgpt"}},
+            "account/rateLimits/read": {"rateLimits": {}},
+        }
+    )
+    factory_calls: list[dict[str, object]] = []
+    environment = {"PATH": "kept"}
+
+    def factory(**kwargs: object) -> FakeClient:
+        factory_calls.append(kwargs)
+        return client
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: r"C:\\tools\\codex.exe",
+    )
+
+    CodexAppServerProbe(factory).probe("codex", environment, 1)
+
+    assert factory_calls == [
+        {
+            "codex_bin": r"C:\\tools\\codex.exe",
+            "env": {"PATH": "kept"},
+        }
+    ]
+    assert factory_calls[0]["env"] is not environment
+    assert environment == {"PATH": "kept"}
+
+
+def test_windows_probe_keeps_explicit_native_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient(
+        {
+            "account/read": {"account": {"type": "chatgpt"}},
+            "account/rateLimits/read": {"rateLimits": {}},
+        }
+    )
+    factory_calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> FakeClient:
+        factory_calls.append(kwargs)
+        return client
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: pytest.fail("explicit executable must not be resolved"),
+    )
+
+    CodexAppServerProbe(factory).probe(r"C:\\tools\\codex.exe", {}, 1)
+
+    assert factory_calls[0]["codex_bin"] == r"C:\\tools\\codex.exe"
+
+
+def test_windows_probe_uses_npm_native_executable_when_which_finds_windows_apps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = FakeClient(
+        {
+            "account/read": {"account": {"type": "chatgpt"}},
+            "account/rateLimits/read": {"rateLimits": {}},
+        }
+    )
+    vendor_executable = (
+        tmp_path
+        / "npm"
+        / "node_modules"
+        / "@openai"
+        / "codex"
+        / "node_modules"
+        / "@openai"
+        / "codex-win32-x64"
+        / "vendor"
+        / "x86_64-pc-windows-msvc"
+        / "bin"
+        / "codex.exe"
+    )
+    vendor_executable.parent.mkdir(parents=True)
+    vendor_executable.touch()
+    factory_calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> FakeClient:
+        factory_calls.append(kwargs)
+        return client
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: r"C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe",
+    )
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+    CodexAppServerProbe(factory).probe("codex", {}, 1)
+
+    assert factory_calls[0]["codex_bin"] == str(vendor_executable)
+
+
+def test_windows_probe_rejects_unlaunchable_windows_apps_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    factory_calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> FakeClient:
+        factory_calls.append(kwargs)
+        raise AssertionError("unlaunchable executable must be rejected")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: r"C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe",
+    )
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+    with pytest.raises(ProbeError, match="native .exe"):
+        CodexAppServerProbe(factory).probe("codex", {}, 1)
+
+    assert factory_calls == []
+
+
+@pytest.mark.parametrize("script_path", [r"C:\\tools\\codex.cmd", r"C:\\tools\\codex.bat", r"C:\\tools\\codex.ps1"])
+def test_windows_probe_rejects_script_shims_before_client_creation(
+    monkeypatch: pytest.MonkeyPatch, script_path: str
+) -> None:
+    factory_calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> FakeClient:
+        factory_calls.append(kwargs)
+        raise AssertionError("script shim must be rejected before client creation")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    with pytest.raises(ProbeError, match="native .exe") as raised:
+        CodexAppServerProbe(factory).probe(script_path, {}, 1)
+
+    assert script_path not in str(raised.value)
+    assert factory_calls == []
+
+
+def test_windows_probe_fails_closed_when_native_executable_is_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory_calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> FakeClient:
+        factory_calls.append(kwargs)
+        raise AssertionError("client must not be created without a native executable")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    with pytest.raises(ProbeError, match="native .exe"):
+        CodexAppServerProbe(factory).probe("codex", {}, 1)
+
+    assert factory_calls == []
+
+
+def test_non_windows_probe_preserves_bare_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient(
+        {
+            "account/read": {"account": {"type": "chatgpt"}},
+            "account/rateLimits/read": {"rateLimits": {}},
+        }
+    )
+    factory_calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> FakeClient:
+        factory_calls.append(kwargs)
+        return client
+
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    CodexAppServerProbe(factory).probe("codex", {}, 1)
+
+    assert factory_calls[0]["codex_bin"] == "codex"
 
 
 @pytest.mark.parametrize(
