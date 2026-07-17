@@ -152,6 +152,35 @@ def test_explicit_task_command_resets_choices_and_requires_task_text() -> None:
     assert ready.task_text == "새 Task 내용"
 
 
+def test_task_content_prompt_always_shows_standard_spec_template() -> None:
+    setup = begin_task_setup()
+    setup.handle("s1", "u1", "build_review", NOW)
+
+    prompt = setup.handle("s1", "u1", "manual", NOW + timedelta(seconds=1))
+    retry = setup.handle("s1", "u1", "   ", NOW + timedelta(seconds=2))
+
+    required_text = (
+        "[SPEC-NNN] <대상>을 <원하는 결과>로 변경",
+        "## 목적",
+        "## 문제",
+        "## SoT 근거",
+        "## 작업 범위",
+        "## 수용 기준 (AC)",
+        "[AC-01]",
+        "[AC-02]",
+        "[AC-03]",
+        "[AC-04]",
+        "## 범위 제외",
+        "## 확정된 제약",
+        "미결정 사항: 없음",
+    )
+    assert prompt.text is not None
+    assert all(item in prompt.text for item in required_text)
+    assert retry.text is not None
+    assert retry.text.startswith("Task content cannot be empty.")
+    assert all(item in retry.text for item in required_text)
+
+
 def test_cancel_discards_task_draft_and_returns_to_chat() -> None:
     setup = begin_task_setup()
 

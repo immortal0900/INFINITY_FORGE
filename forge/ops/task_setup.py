@@ -19,6 +19,37 @@ SETUP_TIMEOUT = timedelta(minutes=30)
 DEFAULT_MAX_TRACKED_SESSIONS = 1024
 DEFAULT_SURFACE = "unknown"
 
+TASK_CONTENT_TEMPLATE = """[SPEC-NNN] <대상>을 <원하는 결과>로 변경
+
+## 목적
+이 작업으로 사용자가 얻어야 하는 결과를 한두 문장으로 작성한다.
+
+## 문제
+현재 상태: 현재 발생하는 문제나 부족한 동작을 작성한다.
+완료 상태: 작업 후 관찰할 수 있어야 하는 상태를 작성한다.
+
+## SoT 근거
+근거: `docs/spec.md:42` 또는 관련 이슈·문서 URL
+근거가 없는 신규 요구라면 `신규 요구사항`이라고 작성한다.
+
+## 작업 범위
+포함: 변경할 기능과 동작을 작성한다.
+대상 모듈: 관련 모듈이나 디렉터리를 작성한다.
+
+## 수용 기준 (AC)
+1. [AC-01] `<조건 또는 입력>`일 때 `<관찰 가능한 결과>`가 발생한다.
+2. [AC-02] `<오류 또는 경계 조건>`일 때 `<오류 코드·메시지·상태>`를 반환한다.
+3. [AC-03] 위 동작을 재현하는 테스트가 추가되고 `<정확한 테스트 명령>`이 통과한다.
+4. [AC-04] `<구체적인 기존 기능>`이 유지되고 `<검증 방법>`으로 확인된다.
+
+## 범위 제외
+제외: 이번 작업에서 변경하지 않을 내용을 작성한다.
+
+## 확정된 제약
+호환성: 유지해야 할 API, 데이터 형식 또는 실행 환경을 작성한다.
+보안·성능: 지켜야 할 구체적인 제한을 작성한다.
+미결정 사항: 없음"""
+
 _ACCEPTANCE_CRITERION = re.compile(
     r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(?P<text>\S.*)$"
 )
@@ -598,8 +629,9 @@ class TaskSetup:
 
     @staticmethod
     def _task_content_prompt(prefix: str | None = None) -> TurnResult:
+        intro = prefix or "Enter the Task content."
         return TurnResult.handled(
-            prefix or "Enter the Task content.",
+            f"{intro}\n\nUse this format:\n\n{TASK_CONTENT_TEMPLATE}",
             next_step=SetupStep.TASK_CONTENT,
         )
 
