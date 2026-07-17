@@ -260,6 +260,7 @@ def test_both_server_deploy_layers_run_the_same_actual_chooser_smoke() -> None:
         'cd "$CHOOSER_SMOKE_CWD"',
         "-u PYTHONPATH",
         "-u PYTHONHOME",
+        "-u PYTHONOPTIMIZE",
         "-u INFINITY_FORGE_REPOSITORY",
         "-u INFINITY_FORGE_TASK_SETTINGS_DB",
         "-u INFINITY_FORGE_GH_PATH",
@@ -351,10 +352,45 @@ def test_local_deploy_uses_absolute_remote_paths_and_requires_clean_main() -> No
     assert "git status --porcelain=v1 --untracked-files=all" in deploy
     assert "git stash" not in deploy
     assert "named stash" in deploy
-    assert '$RemotePrepareScript = @\'' in deploy
-    assert 'git fetch origin main --quiet' in deploy
-    assert 'git merge --ff-only "$EXPECTED_COMMIT"' in deploy
-    assert 'deploy-vps.sh" --post-update' in deploy
+    assert "$RemotePrepareScript" not in deploy
+    assert 'git merge --ff-only "$EXPECTED_COMMIT"' not in deploy
+    assert 'deploy-vps.sh" --post-update' not in deploy
+
+
+def test_server_apply_runs_update_and_deploy_under_one_remote_lock() -> None:
+    deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+    start = deploy.index("function Invoke-ForgeServerDeploy")
+    verification = deploy.index("  $VerificationScript = @'", start)
+    apply = deploy[start:verification]
+
+    assert apply.count("Invoke-RemoteBashScript") == 1
+    assert apply.count("$DeployBootstrapScript = @'") == 1
+    assert apply.index("git -C $RemoteRepo symbolic-ref --short HEAD") < apply.index(
+        "$DeployBootstrapScript = @'"
+    )
+    assert apply.index(
+        "git -C $RemoteRepo status --porcelain=v1 --untracked-files=all"
+    ) < apply.index("$DeployBootstrapScript = @'")
+    for contract in (
+        'DEPLOY_LOCK_ROOT="$HOME/.hermes/infinity-forge"',
+        'DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/deploy.lock"',
+        "mkdir -p \"$DEPLOY_LOCK_ROOT\"",
+        "if [ ! -x /usr/bin/flock ]; then",
+        'exec 9>"$DEPLOY_LOCK_FILE"',
+        "/usr/bin/flock --nonblock 9",
+        "another Infinity Forge deployment is already running",
+        'export INFINITY_FORGE_DEPLOY_LOCK_FD9="$DEPLOY_LOCK_FILE"',
+        'FORGE_EXPECTED_COMMIT="$EXPECTED_COMMIT"',
+        'FORGE_REPO_DIR="$REPO_DIR"',
+        'bash "$REPO_DIR/forge/scripts/deploy-vps.sh"',
+        "-Script $DeployBootstrapScript",
+        "배포 잠금을 얻지 못했거나 배포가 실패했습니다.",
+    ):
+        assert contract in apply
+    assert "git fetch" not in apply
+    assert "git merge --ff-only" not in apply
+    assert "--post-update" not in apply
+    assert 'ssh $HostName env "FORGE_EXPECTED_COMMIT=' not in apply
 
 
 def test_local_deploy_sends_remote_bash_without_windows_line_endings() -> None:
@@ -363,7 +399,7 @@ def test_local_deploy_sends_remote_bash_without_windows_line_endings() -> None:
     assert "function Invoke-RemoteBashScript" in deploy
     assert "[Convert]::ToBase64String" in deploy
     assert "base64 --decode | bash -s --" in deploy
-    assert "$RemotePrepareScript | ssh" not in deploy
+    assert "$DeployBootstrapScript | ssh" not in deploy
     assert "$VerificationScript | ssh" not in deploy
 
 

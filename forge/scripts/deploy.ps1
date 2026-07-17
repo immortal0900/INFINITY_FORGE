@@ -199,29 +199,36 @@ function Invoke-ForgeServerDeploy {
     throw "$Name 저장소가 깨끗하지 않습니다. 서버에서 manual named stash를 만든 뒤 다시 실행하세요."
   }
 
-  # 서버에 설치된 배포 스크립트가 이전 버전이어도 정확한 커밋만 먼저 적용한다.
-  $RemotePrepareScript = @'
+  # 저장소 fast-forward와 배포 전체를 같은 FD 9 lock 아래에서 실행한다.
+  # 이전 deploy-vps.sh가 새 script로 exec해도 FD와 marker가 그대로 상속된다.
+  $DeployBootstrapScript = @'
 set -euo pipefail
 REPO_DIR="$1"
 EXPECTED_COMMIT="$2"
-cd "$REPO_DIR"
-test "$(git symbolic-ref --short HEAD)" = "main"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
-git fetch origin main --quiet
-test "$(git rev-parse origin/main)" = "$EXPECTED_COMMIT"
-git merge-base --is-ancestor HEAD "$EXPECTED_COMMIT"
-git merge --ff-only "$EXPECTED_COMMIT"
-test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
+DEPLOY_LOCK_ROOT="$HOME/.hermes/infinity-forge"
+DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/deploy.lock"
+if [ ! -x /usr/bin/flock ]; then
+  echo "[deploy] /usr/bin/flock is required for deployment locking" >&2
+  exit 1
+fi
+mkdir -p "$DEPLOY_LOCK_ROOT"
+exec 9>"$DEPLOY_LOCK_FILE"
+if ! /usr/bin/flock --nonblock 9; then
+  echo "[deploy] another Infinity Forge deployment is already running" >&2
+  exec 9>&-
+  exit 1
+fi
+export INFINITY_FORGE_DEPLOY_LOCK_FD9="$DEPLOY_LOCK_FILE"
+env \
+  FORGE_EXPECTED_COMMIT="$EXPECTED_COMMIT" \
+  FORGE_REPO_DIR="$REPO_DIR" \
+  bash "$REPO_DIR/forge/scripts/deploy-vps.sh"
 '@
   Invoke-RemoteBashScript `
     -HostName $HostName `
-    -Script $RemotePrepareScript `
+    -Script $DeployBootstrapScript `
     -Arguments @($RemoteRepo, $Commit) `
-    -FailureMessage "$Name 저장소를 요청한 main commit으로 이동하지 못했습니다."
-
-  ssh $HostName env "FORGE_EXPECTED_COMMIT=$Commit" "FORGE_REPO_DIR=$RemoteRepo" bash "$RemoteRepo/forge/scripts/deploy-vps.sh" --post-update
-  if ($LASTEXITCODE -ne 0) { throw "$Name 배포가 실패했습니다." }
+    -FailureMessage "$Name 배포 잠금을 얻지 못했거나 배포가 실패했습니다."
 
   $VerificationScript = @'
 set -euo pipefail
@@ -263,6 +270,7 @@ CHOOSER_EXPECTED_GH_PATH="$GH_BIN"
   env \
     -u PYTHONPATH \
     -u PYTHONHOME \
+    -u PYTHONOPTIMIZE \
     -u INFINITY_FORGE_REPOSITORY \
     -u INFINITY_FORGE_TASK_SETTINGS_DB \
     -u INFINITY_FORGE_GH_PATH \
