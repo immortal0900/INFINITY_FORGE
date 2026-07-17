@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import tomllib
 import uuid
@@ -33,6 +34,7 @@ _BACKUP_NAMES = {
     "claude": "claude-mcp.bin",
 }
 _BACKUP_SUFFIX = re.compile(r"\A\d{8}T\d{12}Z-[0-9a-f]{8}\Z")
+_MIGRATION_CAPTURE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -52,15 +54,64 @@ class _Snapshot:
     content: bytes
 
 
+@dataclass(frozen=True)
+class _RuntimeSwitchOutcome:
+    status: object
+    migration_report: object | None
+
+
+def _apply_runtime_switch_with_captured_migration(
+    config: dict[str, Any],
+    value: str,
+    *,
+    persist_callback: Callable[[dict[str, Any]], None],
+    runtime_switch_apply: Callable[..., object],
+    migration_module: object,
+) -> _RuntimeSwitchOutcome:
+    reports: list[object] = []
+    original_migrate = getattr(migration_module, "migrate")
+    owner_thread = threading.get_ident()
+
+    def observe_migration(*args: object, **kwargs: object) -> object:
+        report = original_migrate(*args, **kwargs)
+        if threading.get_ident() == owner_thread:
+            reports.append(report)
+        return report
+
+    # The Hermes helper imports migrate inside apply(). Serialize and always restore
+    # the temporary observer so one helper-owned plugin discovery is authoritative.
+    with _MIGRATION_CAPTURE_LOCK:
+        setattr(migration_module, "migrate", observe_migration)
+        try:
+            status = runtime_switch_apply(
+                config,
+                value,
+                persist_callback=persist_callback,
+            )
+        finally:
+            setattr(migration_module, "migrate", original_migrate)
+    return _RuntimeSwitchOutcome(
+        status=status,
+        migration_report=reports[0] if len(reports) == 1 else None,
+    )
+
+
 def _default_runtime_switch_apply(
     config: dict[str, Any],
     value: str,
     *,
     persist_callback: Callable[[dict[str, Any]], None],
 ) -> object:
+    from hermes_cli import codex_runtime_plugin_migration
     from hermes_cli.codex_runtime_switch import apply
 
-    return apply(config, value, persist_callback=persist_callback)
+    return _apply_runtime_switch_with_captured_migration(
+        config,
+        value,
+        persist_callback=persist_callback,
+        runtime_switch_apply=apply,
+        migration_module=codex_runtime_plugin_migration,
+    )
 
 
 def _default_mcp_migration_apply(config: dict[str, Any], *, codex_home: Path) -> object:
@@ -119,10 +170,12 @@ class SubscriptionRuntimeSetup:
     ) -> None:
         self.forge_root = Path(forge_root).resolve()
         self.hermes_root = Path(hermes_root).resolve()
+        self._hermes_root_anchor = self.hermes_root
         self.environment = dict(os.environ if environment is None else environment)
         # Hermes v0.18.2 migration writes only to this exact home-relative target.
         configured_codex_home = codex_home or (Path.home() / ".codex")
         self.codex_home = Path(configured_codex_home).resolve()
+        self._codex_home_anchor = self.codex_home
         default_python = (
             self.hermes_root
             / "hermes-agent"
@@ -145,6 +198,7 @@ class SubscriptionRuntimeSetup:
         self.managed_root = self.hermes_root / "infinity-forge" / "subscription-runtime"
         self.claude_mcp_path = self.managed_root / "claude-mcp.json"
         self.manifest_path = self.managed_root / "backup-manifest.json"
+        self.rollback_tombstone_path = self.managed_root / "rollback-completed.json"
         self.backup_root = self.managed_root / "backups"
 
     @property
@@ -172,15 +226,23 @@ class SubscriptionRuntimeSetup:
                 try:
                     self._assert_managed_paths_safe()
                     self._save_hermes_config(updated)
-                except (Exception, KeyboardInterrupt):
+                except (Exception, KeyboardInterrupt, SystemExit):
                     # The installed helper logs callback exceptions with details.
                     persist_failed = True
 
-            status = self._runtime_switch_apply(
+            switch_outcome = self._runtime_switch_apply(
                 config,
                 _RUNTIME,
                 persist_callback=persist_safely,
             )
+            if self._uses_default_switch:
+                if not isinstance(switch_outcome, _RuntimeSwitchOutcome):
+                    raise RuntimeError("runtime switch adapter rejected")
+                status = switch_outcome.status
+                migration = switch_outcome.migration_report
+            else:
+                status = switch_outcome
+                migration = None
             if persist_failed or getattr(status, "success", False) is not True:
                 raise RuntimeError("runtime switch rejected")
             self._assert_managed_paths_safe()
@@ -188,14 +250,16 @@ class SubscriptionRuntimeSetup:
             if persisted_config.get("model", {}).get("openai_runtime") != _RUNTIME:
                 raise RuntimeError("runtime post-check failed")
             expected_mcp = _expected_mcp_names(persisted_config)
-            migration = self._mcp_migration_apply(
-                persisted_config,
-                codex_home=self.codex_home,
-            )
+            if not self._uses_default_switch:
+                migration = self._mcp_migration_apply(
+                    persisted_config,
+                    codex_home=self.codex_home,
+                )
             self._assert_managed_paths_safe()
             migrated = getattr(migration, "migrated", None)
             if (
                 getattr(migration, "written", False) is not True
+                or getattr(migration, "plugin_query_error", None) is not None
                 or not isinstance(migrated, (list, tuple, set))
                 or not all(isinstance(name, str) for name in migrated)
                 or not expected_mcp | {_CLAUDE_SERVER} <= set(migrated)
@@ -207,8 +271,9 @@ class SubscriptionRuntimeSetup:
             readiness = self.verify()
             if not readiness.ready:
                 raise RuntimeError("readiness post-check failed")
+            self._discard_rollback_tombstone()
             return readiness
-        except (Exception, KeyboardInterrupt):
+        except (Exception, KeyboardInterrupt, SystemExit):
             restored = (
                 self._restore_snapshots(paths, transaction)
                 if transaction is not None
@@ -217,7 +282,7 @@ class SubscriptionRuntimeSetup:
             if created_baseline and restored and self.manifest_path.exists():
                 try:
                     self._discard_baseline()
-                except (Exception, KeyboardInterrupt):
+                except (Exception, KeyboardInterrupt, SystemExit):
                     return _failure(
                         "runtime configuration failed", rollback_required=True
                     )
@@ -255,16 +320,19 @@ class SubscriptionRuntimeSetup:
         try:
             self._assert_managed_paths_safe()
             if not self.manifest_path.is_file():
-                raise ValueError
+                self._validate_completed_rollback()
+                return SubscriptionReadiness(
+                    False, None, None, None, False, False, None
+                )
             current = self._capture_snapshots(paths)
             baseline = self._baseline_snapshots()
             # RISK(data-loss): restoration overwrites managed config with exact backups.
             mutation_started = True
             if not self._restore_snapshots(paths, baseline):
                 raise OSError
-            self._deactivate_baseline()
+            self._deactivate_baseline(baseline)
             return SubscriptionReadiness(False, None, None, None, False, False, None)
-        except (Exception, KeyboardInterrupt):
+        except (Exception, KeyboardInterrupt, SystemExit):
             restored = not mutation_started
             if mutation_started and "current" in locals():
                 restored = self._restore_snapshots(paths, current)
@@ -320,6 +388,8 @@ class SubscriptionRuntimeSetup:
     def _assert_managed_paths_safe(self) -> None:
         if (
             not self.hermes_root.is_dir()
+            or self.hermes_root.resolve(strict=True) != self._hermes_root_anchor
+            or self.codex_home.resolve(strict=False) != self._codex_home_anchor
             or _is_link_like(self.hermes_root)
             or _is_link_like(self.codex_home)
             or _is_link_like(self.hermes_config_path)
@@ -332,6 +402,7 @@ class SubscriptionRuntimeSetup:
             self.managed_root,
             self.backup_root,
             self.manifest_path,
+            self.rollback_tombstone_path,
             self.claude_mcp_path,
         )
         for path in managed_paths:
@@ -463,7 +534,11 @@ class SubscriptionRuntimeSetup:
         self._assert_managed_paths_safe()
         self.manifest_path.unlink(missing_ok=True)
 
-    def _deactivate_baseline(self) -> None:
+    def _discard_rollback_tombstone(self) -> None:
+        self._assert_managed_paths_safe()
+        self.rollback_tombstone_path.unlink(missing_ok=True)
+
+    def _deactivate_baseline(self, baseline: Mapping[str, _Snapshot]) -> None:
         self._assert_managed_paths_safe()
         suffix = self._backup_suffix(self._load_manifest())
         archived = self.backup_root / f"backup-manifest.{suffix}.json"
@@ -474,11 +549,64 @@ class SubscriptionRuntimeSetup:
             != self.backup_root.resolve(strict=False)
         ):
             raise FileExistsError
+        tombstone = {
+            "version": 1,
+            "backup_suffix": suffix,
+            "archive": archived.name,
+            "targets": {
+                name: _snapshot_metadata(baseline[name]) for name in _BACKUP_NAMES
+            },
+        }
+        try:
+            _atomic_write(
+                self.rollback_tombstone_path,
+                (json.dumps(tombstone, sort_keys=True) + "\n").encode("utf-8"),
+            )
+        except BaseException:
+            self._assert_managed_paths_safe()
+            self.rollback_tombstone_path.unlink(missing_ok=True)
+            raise
         # RISK(data-loss): moving the active manifest makes later apply create a new baseline.
+        try:
+            self._assert_managed_paths_safe()
+            _replace_with_retry(self.manifest_path, archived)
+        except BaseException:
+            self._assert_managed_paths_safe()
+            self.rollback_tombstone_path.unlink(missing_ok=True)
+            raise
+
+    def _validate_completed_rollback(self) -> None:
         self._assert_managed_paths_safe()
-        _replace_with_retry(self.manifest_path, archived)
-        if os.name != "nt":
-            os.chmod(archived, 0o600)
+        if not self.rollback_tombstone_path.is_file():
+            raise ValueError
+        tombstone = json.loads(self.rollback_tombstone_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(tombstone, dict)
+            or tombstone.get("version") != 1
+            or not isinstance(tombstone.get("targets"), dict)
+        ):
+            raise ValueError
+        suffix = self._backup_suffix(tombstone)
+        archive_name = f"backup-manifest.{suffix}.json"
+        if tombstone.get("archive") != archive_name:
+            raise ValueError
+        archive = self.backup_root / archive_name
+        if (
+            _is_link_like(archive)
+            or archive.parent.resolve() != self.backup_root.resolve()
+        ):
+            raise ValueError
+        archived_manifest = self._load_manifest(archive)
+        if self._backup_suffix(archived_manifest) != suffix:
+            raise ValueError
+        baseline = self._baseline_snapshots(archive)
+        expected_targets = {
+            name: _snapshot_metadata(baseline[name]) for name in _BACKUP_NAMES
+        }
+        if tombstone["targets"] != expected_targets:
+            raise ValueError
+        if self._capture_snapshots(self._managed_targets()) != baseline:
+            raise ValueError
 
     def _restore_snapshots(
         self,
@@ -494,7 +622,7 @@ class SubscriptionRuntimeSetup:
                 else:
                     path.unlink(missing_ok=True)
             return True
-        except (Exception, KeyboardInterrupt):
+        except (Exception, KeyboardInterrupt, SystemExit):
             return False
 
     def _load_hermes_config(self) -> dict[str, Any]:
@@ -555,6 +683,13 @@ def _expected_mcp_names(config: Mapping[str, object]) -> set[str]:
         str(name)
         for name, server in servers.items()
         if isinstance(server, dict) and bool(server.get("command") or server.get("url"))
+    }
+
+
+def _snapshot_metadata(snapshot: _Snapshot) -> dict[str, object]:
+    return {
+        "existed": snapshot.existed,
+        "sha256": hashlib.sha256(snapshot.content).hexdigest(),
     }
 
 
@@ -643,6 +778,10 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
         if args.command != "rollback" and args.forge_root is None:
             parser.error("--forge-root is required")
+    except SystemExit as error:
+        return 0 if error.code == 0 else 78
+
+    try:
         setup = SubscriptionRuntimeSetup(
             forge_root=args.forge_root or Path.cwd(),
             hermes_root=args.hermes_root,
@@ -650,9 +789,7 @@ def main(argv: list[str] | None = None) -> int:
         result = getattr(setup, args.command)()
         print(json.dumps(_result_payload(result), sort_keys=True))
         return 0 if result.error is None else 78
-    except SystemExit as error:
-        return int(error.code) if int(error.code) == 0 else 78
-    except (Exception, KeyboardInterrupt):
+    except (Exception, KeyboardInterrupt, SystemExit):
         print(
             json.dumps(
                 _result_payload(_failure("runtime configuration failed")),

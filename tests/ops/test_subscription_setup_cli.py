@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from forge.ops import subscription_setup
 from forge.ops.subscription_setup import SubscriptionReadiness
 
@@ -129,5 +131,29 @@ def test_cli_keyboard_interrupt_is_generic_and_returns_78(
         == 78
     )
     captured = capsys.readouterr()
+    assert str(tmp_path) not in captured.out + captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("exit_code", [0, "private exit code"])
+def test_cli_setup_system_exit_is_generic_and_returns_78(
+    monkeypatch, tmp_path: Path, capsys, exit_code
+):
+    class InterruptedSetup(FakeSetup):
+        def apply(self):
+            raise SystemExit(exit_code)
+
+    monkeypatch.setattr(
+        subscription_setup, "SubscriptionRuntimeSetup", InterruptedSetup
+    )
+
+    assert (
+        subscription_setup.main(
+            ["apply", "--forge-root", str(tmp_path), "--hermes-root", str(tmp_path)]
+        )
+        == 78
+    )
+    captured = capsys.readouterr()
+    assert "private exit code" not in captured.out + captured.err
     assert str(tmp_path) not in captured.out + captured.err
     assert "Traceback" not in captured.err
