@@ -29,6 +29,8 @@ def _linux_script_path() -> tuple[list[str], str]:
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
     ).stdout.strip()
     return ([wsl, "-e", "bash", "-s"], converted)
 
