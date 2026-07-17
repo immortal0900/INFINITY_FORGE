@@ -512,11 +512,14 @@ def change_gateway_source(source: str) -> str:
 _SUBSCRIPTION_WORKER_HELPERS = f'''def _infinity_forge_required_worker_file(value, label, *, native):
     if not isinstance(value, str) or not value or not os.path.isabs(value):
         raise RuntimeError(f"{{label}} configuration is invalid")
+    resolved = None
+    regular_file = False
     try:
         resolved = Path(value).resolve(strict=True)
-    except OSError as error:
-        raise RuntimeError(f"{{label}} configuration is invalid") from error
-    if not resolved.is_file():
+        regular_file = resolved.is_file()
+    except (OSError, RuntimeError, ValueError):
+        pass
+    if resolved is None or not regular_file:
         raise RuntimeError(f"{{label}} configuration is invalid")
     if native:
         if os.name == "nt":
@@ -545,13 +548,38 @@ def _infinity_forge_subscription_worker_argv(task, cmd, env):
         "INFINITY_FORGE_SUBSCRIPTION_RUNNER",
         native=False,
     )
+    hermes_value = (
+        env.get("INFINITY_FORGE_HERMES_BIN")
+        if "INFINITY_FORGE_HERMES_BIN" in env
+        else env.get("HERMES_BIN")
+    )
     configured_hermes = _infinity_forge_required_worker_file(
-        env.get("INFINITY_FORGE_HERMES_BIN") or env.get("HERMES_BIN"),
+        hermes_value,
         "INFINITY_FORGE_HERMES_BIN or HERMES_BIN",
         native=True,
     )
-    if len(cmd) >= 3 and cmd[1] == "-m":
-        raise RuntimeError("Hermes module-form Python fallback is not allowed")
+    expected_hermes_name = "hermes.exe" if os.name == "nt" else "hermes"
+    if os.path.normcase(configured_hermes.name) != os.path.normcase(
+        expected_hermes_name
+    ):
+        raise RuntimeError("Hermes executable configuration is invalid")
+
+    original_name = (
+        os.path.basename(cmd[0]).lower()
+        if cmd and isinstance(cmd[0], str)
+        else ""
+    )
+    python_interpreter = original_name in ("py", "py.exe") or original_name.startswith(
+        "python"
+    )
+    interpreter_tail = cmd[1] if len(cmd) >= 2 else None
+    python_script = (
+        isinstance(interpreter_tail, str)
+        and os.path.isabs(interpreter_tail)
+        and interpreter_tail.lower().endswith(".py")
+    )
+    if python_interpreter and (interpreter_tail == "-m" or python_script):
+        raise RuntimeError("Hermes Python interpreter form is not allowed")
     original_hermes = _infinity_forge_required_worker_file(
         cmd[0] if cmd else None,
         "original Hermes command",

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -314,7 +315,7 @@ def test_kanban_transform_wraps_both_forge_idempotency_prefixes_exactly(
     python_bin = Path(sys.executable).resolve()
     runner = (tmp_path / "subscription-runner.py").resolve()
     runner.write_text("# runner\n", encoding="utf-8")
-    hermes_bin = python_bin
+    hermes_bin = _native_file(tmp_path, "hermes")
     _set_worker_config(
         monkeypatch,
         python_bin=python_bin,
@@ -480,7 +481,8 @@ def test_kanban_transform_validates_runner_and_hermes_files_before_spawn(
     configured_name: str,
     invalid_kind: str,
 ) -> None:
-    native = Path(sys.executable).resolve()
+    python_bin = Path(sys.executable).resolve()
+    valid_hermes = _native_file(tmp_path, "hermes")
     runner = (tmp_path / "runner.py").resolve()
     runner.write_text("# runner\n", encoding="utf-8")
     if invalid_kind == "relative":
@@ -497,9 +499,9 @@ def test_kanban_transform_validates_runner_and_hermes_files_before_spawn(
             invalid.chmod(0o644)
     _set_worker_config(
         monkeypatch,
-        python_bin=native,
+        python_bin=python_bin,
         runner=invalid if configured_name == "runner" else runner,
-        hermes_bin=invalid if configured_name == "hermes" else native,
+        hermes_bin=invalid if configured_name == "hermes" else valid_hermes,
     )
     expected = (
         "INFINITY_FORGE_SUBSCRIPTION_RUNNER"
@@ -513,7 +515,7 @@ def test_kanban_transform_validates_runner_and_hermes_files_before_spawn(
             monkeypatch,
             tmp_path,
             task=_task("forge-task:abc"),
-            original_argv=[str(native)],
+            original_argv=[str(valid_hermes)],
         )
 
 
@@ -523,7 +525,8 @@ def test_kanban_transform_rejects_invalid_original_hermes_before_spawn(
     monkeypatch: pytest.MonkeyPatch,
     invalid_kind: str,
 ) -> None:
-    native = Path(sys.executable).resolve()
+    python_bin = Path(sys.executable).resolve()
+    configured_hermes = _native_file(tmp_path, "hermes")
     runner = (tmp_path / "runner.py").resolve()
     runner.write_text("# runner\n", encoding="utf-8")
     if invalid_kind == "relative":
@@ -542,9 +545,9 @@ def test_kanban_transform_rejects_invalid_original_hermes_before_spawn(
         original = str(non_native)
     _set_worker_config(
         monkeypatch,
-        python_bin=native,
+        python_bin=python_bin,
         runner=runner,
-        hermes_bin=native,
+        hermes_bin=configured_hermes,
     )
 
     with pytest.raises(RuntimeError, match="original Hermes command"):
@@ -557,7 +560,7 @@ def test_kanban_transform_rejects_invalid_original_hermes_before_spawn(
         )
 
 
-def test_kanban_transform_rejects_hermes_mismatch_and_module_fallback(
+def test_kanban_transform_rejects_hermes_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -582,32 +585,103 @@ def test_kanban_transform_rejects_hermes_mismatch_and_module_fallback(
             original_argv=[str(python_bin)],
         )
 
+
+@pytest.mark.parametrize("interpreter_tail", (("-m", "hermes_cli"), ("script",)))
+def test_kanban_transform_rejects_python_interpreter_forms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interpreter_tail: tuple[str, ...],
+) -> None:
+    python_bin = Path(sys.executable).resolve()
+    runner = (tmp_path / "runner.py").resolve()
+    runner.write_text("# runner\n", encoding="utf-8")
+    configured_hermes = _native_file(tmp_path, "hermes")
     _set_worker_config(
         monkeypatch,
         python_bin=python_bin,
         runner=runner,
-        hermes_bin=python_bin,
+        hermes_bin=configured_hermes,
     )
-    with pytest.raises(RuntimeError, match="module-form"):
+    if interpreter_tail == ("script",):
+        script = (tmp_path / "secret-hermes.py").resolve()
+        script.write_text("# script\n", encoding="utf-8")
+        original_argv = [str(python_bin), str(script)]
+    else:
+        original_argv = [str(python_bin), *interpreter_tail]
+
+    with pytest.raises(RuntimeError, match="interpreter"):
         _run_spawn(
-            changed,
+            installer.change_kanban_db_source(KANBAN_DB_SOURCE),
             monkeypatch,
             tmp_path,
             task=_task("forge-task:abc"),
-            original_argv=[str(python_bin), "-m", "hermes_cli"],
+            original_argv=original_argv,
         )
+
+
+def test_kanban_transform_rejects_arbitrary_matched_hermes_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python_bin = Path(sys.executable).resolve()
+    runner = (tmp_path / "runner.py").resolve()
+    runner.write_text("# runner\n", encoding="utf-8")
+    arbitrary = _native_file(tmp_path, "arbitrary")
+    _set_worker_config(
+        monkeypatch,
+        python_bin=python_bin,
+        runner=runner,
+        hermes_bin=arbitrary,
+    )
+
+    with pytest.raises(RuntimeError, match="Hermes executable"):
+        _run_spawn(
+            installer.change_kanban_db_source(KANBAN_DB_SOURCE),
+            monkeypatch,
+            tmp_path,
+            task=_task("forge-task:abc"),
+            original_argv=[str(arbitrary)],
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Hermes console-script contract")
+def test_kanban_transform_allows_posix_executable_named_hermes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python_bin = Path(sys.executable).resolve()
+    runner = (tmp_path / "runner.py").resolve()
+    runner.write_text("# runner\n", encoding="utf-8")
+    hermes_bin = _native_file(tmp_path, "hermes")
+    _set_worker_config(
+        monkeypatch,
+        python_bin=python_bin,
+        runner=runner,
+        hermes_bin=hermes_bin,
+    )
+
+    call = _run_spawn(
+        installer.change_kanban_db_source(KANBAN_DB_SOURCE),
+        monkeypatch,
+        tmp_path,
+        task=_task("forge-task:abc"),
+        original_argv=[str(hermes_bin)],
+    )
+
+    assert call["env"]["INFINITY_FORGE_HERMES_BIN"] == str(hermes_bin)
 
 
 def test_kanban_transform_uses_hermes_fallback_and_does_not_mutate_parent_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    hermes_bin = Path(sys.executable).resolve()
+    python_bin = Path(sys.executable).resolve()
+    hermes_bin = _native_file(tmp_path, "hermes")
     runner = (tmp_path / "runner.py").resolve()
     runner.write_text("# runner\n", encoding="utf-8")
     _set_worker_config(
         monkeypatch,
-        python_bin=hermes_bin,
+        python_bin=python_bin,
         runner=runner,
         hermes_bin=None,
         fallback_hermes_bin=hermes_bin,
@@ -630,15 +704,16 @@ def test_kanban_transform_does_not_bypass_invalid_primary_hermes_with_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    native = Path(sys.executable).resolve()
+    python_bin = Path(sys.executable).resolve()
+    fallback_hermes = _native_file(tmp_path, "hermes")
     runner = (tmp_path / "runner.py").resolve()
     runner.write_text("# runner\n", encoding="utf-8")
     _set_worker_config(
         monkeypatch,
-        python_bin=native,
+        python_bin=python_bin,
         runner=runner,
         hermes_bin=Path("relative-primary"),
-        fallback_hermes_bin=native,
+        fallback_hermes_bin=fallback_hermes,
     )
 
     with pytest.raises(RuntimeError, match="INFINITY_FORGE_HERMES_BIN"):
@@ -647,8 +722,72 @@ def test_kanban_transform_does_not_bypass_invalid_primary_hermes_with_fallback(
             monkeypatch,
             tmp_path,
             task=_task("forge-task:abc"),
-            original_argv=[str(native)],
+            original_argv=[str(fallback_hermes)],
         )
+
+
+@pytest.mark.parametrize("primary", ("", "   "))
+def test_kanban_transform_rejects_present_empty_primary_without_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary: str,
+) -> None:
+    python_bin = Path(sys.executable).resolve()
+    runner = (tmp_path / "runner.py").resolve()
+    runner.write_text("# runner\n", encoding="utf-8")
+    fallback_hermes = _native_file(tmp_path, "hermes")
+    _set_worker_config(
+        monkeypatch,
+        python_bin=python_bin,
+        runner=runner,
+        hermes_bin=None,
+        fallback_hermes_bin=fallback_hermes,
+    )
+    monkeypatch.setenv("INFINITY_FORGE_HERMES_BIN", primary)
+
+    with pytest.raises(RuntimeError, match="INFINITY_FORGE_HERMES_BIN"):
+        _run_spawn(
+            installer.change_kanban_db_source(KANBAN_DB_SOURCE),
+            monkeypatch,
+            tmp_path,
+            task=_task("forge-task:abc"),
+            original_argv=[str(fallback_hermes)],
+        )
+
+
+def test_kanban_transform_does_not_disclose_invalid_paths_in_error_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python_bin = Path(sys.executable).resolve()
+    runner = (tmp_path / "runner.py").resolve()
+    runner.write_text("# runner\n", encoding="utf-8")
+    secret = "customer-secret-4f81"
+    missing = (tmp_path / secret / ("hermes.exe" if os.name == "nt" else "hermes")).resolve()
+    _set_worker_config(
+        monkeypatch,
+        python_bin=python_bin,
+        runner=runner,
+        hermes_bin=missing,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        _run_spawn(
+            installer.change_kanban_db_source(KANBAN_DB_SOURCE),
+            monkeypatch,
+            tmp_path,
+            task=_task("forge-step:abc"),
+            original_argv=[str(missing)],
+        )
+
+    error = raised.value
+    rendered = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert secret not in rendered
+    assert secret not in str(error)
+    assert secret not in repr(error)
+    assert error.__cause__ is None
 
 
 def test_kanban_transform_rejects_marker_reinstall_and_anchor_drift() -> None:
