@@ -92,6 +92,23 @@ def test_windows_hermes_package_uses_clean_source_archive() -> None:
     assert '$packageVersion = "$Commit-$hermesSourceCommit"' in script
 
 
+def test_windows_hermes_package_temp_names_do_not_repeat_full_shas() -> None:
+    script = _script()
+
+    for long_name in (
+        '".$packageVersion.source-$suffix"',
+        '".$packageVersion.build-$suffix"',
+        '".$packageVersion.archive-$suffix.zip"',
+    ):
+        assert long_name not in script
+    for short_name in (
+        '"._s-$suffix"',
+        '"._b-$suffix"',
+        '"._a-$suffix.zip"',
+    ):
+        assert short_name in script
+
+
 def test_windows_env_updates_are_narrow_and_do_not_print_env() -> None:
     script = _script()
 
