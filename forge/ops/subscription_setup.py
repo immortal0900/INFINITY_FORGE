@@ -1,0 +1,585 @@
+"""Apply and verify subscription-only Codex and Claude runtime configuration."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+import tomllib
+import uuid
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from .codex_subscription_probe import CodexAppServerProbe
+from .subscription_runtime import scrub_subscription_environment
+
+
+_RUNTIME = "codex_app_server"
+_CLAUDE_SERVER = "hermes-tools"
+_CLAUDE_MODULE = "agent.transports.hermes_tools_mcp_server"
+_PREFLIGHT_TIMEOUT_SECONDS = 10.0
+_BACKUP_NAMES = {
+    "hermes": "hermes-config.bin",
+    "codex": "codex-config.bin",
+    "claude": "claude-mcp.bin",
+}
+_BACKUP_SUFFIX = re.compile(r"\A\d{8}T\d{12}Z-[0-9a-f]{8}\Z")
+
+
+@dataclass(frozen=True)
+class SubscriptionReadiness:
+    ready: bool
+    runtime: str | None
+    codex_account: str | None
+    claude_subscription: str | None
+    mcp: bool
+    rollback_required: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    existed: bool
+    content: bytes
+
+
+def _default_runtime_switch_apply(
+    config: dict[str, Any],
+    value: str,
+    *,
+    persist_callback: Callable[[dict[str, Any]], None],
+) -> object:
+    from hermes_cli.codex_runtime_switch import apply
+
+    return apply(config, value, persist_callback=persist_callback)
+
+
+def _default_claude_auth_status(
+    claude_bin: str, env: Mapping[str, str]
+) -> Mapping[str, object]:
+    # RISK(security): bound the credential-bearing auth query and discard stderr.
+    try:
+        completed = subprocess.run(
+            [claude_bin, "auth", "status", "--json"],
+            env=dict(env),
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+            timeout=_PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, Mapping) else {}
+
+
+class SubscriptionRuntimeSetup:
+    """Own the small managed configuration surface and its exact-byte backup."""
+
+    def __init__(
+        self,
+        *,
+        forge_root: Path,
+        hermes_root: Path,
+        codex_home: Path | None = None,
+        hermes_python: Path | None = None,
+        codex_bin: str = "codex",
+        claude_bin: str = "claude",
+        probe: object | None = None,
+        claude_auth_reader: (
+            Callable[[str, Mapping[str, str]], Mapping[str, object]] | None
+        ) = None,
+        runtime_switch_apply: Callable[..., object] | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
+        self.forge_root = Path(forge_root).resolve()
+        self.hermes_root = Path(hermes_root).resolve()
+        self.environment = dict(os.environ if environment is None else environment)
+        # Hermes v0.18.2 migration writes only to this exact home-relative target.
+        configured_codex_home = codex_home or (Path.home() / ".codex")
+        self.codex_home = Path(configured_codex_home).resolve()
+        default_python = (
+            self.hermes_root
+            / "hermes-agent"
+            / "venv"
+            / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        )
+        self.hermes_python = Path(hermes_python or default_python).resolve()
+        self.codex_bin = codex_bin
+        self.claude_bin = claude_bin
+        self._probe = probe or CodexAppServerProbe()
+        self._claude_auth_reader = claude_auth_reader or _default_claude_auth_status
+        self._uses_default_switch = runtime_switch_apply is None
+        self._runtime_switch_apply = (
+            runtime_switch_apply or _default_runtime_switch_apply
+        )
+
+        self.hermes_config_path = self.hermes_root / "config.yaml"
+        self.codex_config_path = self.codex_home / "config.toml"
+        self.managed_root = self.hermes_root / "infinity-forge" / "subscription-runtime"
+        self.claude_mcp_path = self.managed_root / "claude-mcp.json"
+        self.manifest_path = self.managed_root / "backup-manifest.json"
+        self.backup_root = self.managed_root / "backups"
+
+    @property
+    def backup_paths(self) -> tuple[Path, ...]:
+        manifest = self._load_manifest()
+        return self._backup_paths_for(self._backup_suffix(manifest))
+
+    def apply(self) -> SubscriptionReadiness:
+        preflight = self._preflight()
+        if preflight is not None:
+            return preflight
+
+        paths = self._managed_targets()
+        created_baseline = not self.manifest_path.exists()
+        transaction: dict[str, _Snapshot] | None = None
+        try:
+            transaction = {name: _snapshot(path) for name, path in paths.items()}
+            self._ensure_baseline(transaction)
+            config = self._load_hermes_config()
+            expected_mcp = _expected_mcp_names(config)
+            status = self._runtime_switch_apply(
+                config,
+                _RUNTIME,
+                persist_callback=self._save_hermes_config,
+            )
+            if getattr(status, "success", False) is not True:
+                raise RuntimeError("runtime switch rejected")
+            persisted_runtime = (
+                self._load_hermes_config().get("model", {}).get("openai_runtime")
+            )
+            if persisted_runtime != _RUNTIME:
+                raise RuntimeError("runtime post-check failed")
+            if not expected_mcp | {_CLAUDE_SERVER} <= self._codex_mcp_names():
+                raise RuntimeError("MCP migration post-check failed")
+            self._write_claude_mcp()
+            readiness = self.verify()
+            if not readiness.ready:
+                raise RuntimeError("readiness post-check failed")
+            return readiness
+        except Exception:
+            restored = (
+                self._restore_snapshots(paths, transaction)
+                if transaction is not None
+                else True
+            )
+            if created_baseline and restored and self.manifest_path.exists():
+                try:
+                    self._discard_baseline()
+                except OSError:
+                    return _failure(
+                        "runtime configuration failed", rollback_required=True
+                    )
+            return _failure(
+                "runtime configuration failed", rollback_required=not restored
+            )
+
+    def verify(self) -> SubscriptionReadiness:
+        preflight = self._preflight()
+        if preflight is not None:
+            return preflight
+        try:
+            config = self._load_hermes_config()
+            runtime_ready = config.get("model", {}).get("openai_runtime") == _RUNTIME
+            expected = _expected_mcp_names(config) | {_CLAUDE_SERVER}
+            codex_mcp_ready = expected <= self._codex_mcp_names()
+            claude_ready = self._claude_mcp_is_strict()
+            mcp_ready = codex_mcp_ready and claude_ready
+            ready = runtime_ready and mcp_ready
+            return SubscriptionReadiness(
+                ready,
+                _RUNTIME if runtime_ready else None,
+                "chatgpt",
+                "max",
+                mcp_ready,
+                False,
+                None if ready else "runtime verification failed",
+            )
+        except Exception:
+            return _failure("runtime verification failed")
+
+    def rollback(self) -> SubscriptionReadiness:
+        paths = self._managed_targets()
+        mutation_started = False
+        try:
+            if (
+                not self.manifest_path.exists()
+                and not self.manifest_path.is_symlink()
+                and self._has_inactive_baseline()
+            ):
+                return SubscriptionReadiness(
+                    False, None, None, None, False, False, None
+                )
+            current = {name: _snapshot(path) for name, path in paths.items()}
+            baseline = self._baseline_snapshots()
+            # RISK(data-loss): restoration overwrites managed config with exact backups.
+            mutation_started = True
+            if not self._restore_snapshots(paths, baseline):
+                raise OSError
+            self._deactivate_baseline()
+            return SubscriptionReadiness(False, None, None, None, False, False, None)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+            restored = not mutation_started
+            if mutation_started and "current" in locals():
+                restored = self._restore_snapshots(paths, current)
+            return _failure("managed backup is invalid", rollback_required=not restored)
+
+    def _preflight(self) -> SubscriptionReadiness | None:
+        if (
+            not self.forge_root.is_dir()
+            or not self.hermes_root.is_dir()
+            or not self.hermes_config_path.is_file()
+            or self.hermes_config_path.is_symlink()
+            or any(
+                path.is_symlink()
+                for path in (
+                    self.codex_config_path,
+                    self.managed_root,
+                    self.claude_mcp_path,
+                    self.manifest_path,
+                    self.backup_root,
+                )
+            )
+        ):
+            return _failure("managed path preflight failed")
+        if (
+            self._uses_default_switch
+            and self.codex_home != (Path.home() / ".codex").resolve()
+        ):
+            return _failure("managed path preflight failed")
+        if not self.hermes_python.is_absolute() or not self.hermes_python.is_file():
+            return _failure("Hermes runtime preflight failed")
+        try:
+            self._load_hermes_config()
+        except (OSError, UnicodeError, yaml.YAMLError, ValueError):
+            return _failure("Hermes runtime preflight failed")
+        child_environment = scrub_subscription_environment(self.environment)
+        try:
+            # RISK(security): neither auth probe receives API-billing credentials.
+            auth = self._claude_auth_reader(self.claude_bin, child_environment)
+        except Exception:
+            return _failure("Claude Max subscription preflight failed")
+        if not _is_max_auth(auth):
+            return _failure("Claude Max subscription preflight failed")
+        try:
+            snapshot = self._probe.probe(
+                self.codex_bin, child_environment, timeout=10.0
+            )
+        except Exception:
+            return _failure("Codex subscription preflight failed")
+        if getattr(snapshot, "account_type", None) != "chatgpt":
+            return _failure("Codex subscription preflight failed")
+        return None
+
+    def _managed_targets(self) -> dict[str, Path]:
+        return {
+            "hermes": self.hermes_config_path,
+            "codex": self.codex_config_path,
+            "claude": self.claude_mcp_path,
+        }
+
+    def _ensure_baseline(self, snapshots: Mapping[str, _Snapshot]) -> None:
+        if self.manifest_path.exists():
+            self._baseline_snapshots()
+            return
+        created_at = datetime.now(timezone.utc)
+        backup_suffix = created_at.strftime("%Y%m%dT%H%M%S%fZ-") + uuid.uuid4().hex[:8]
+        backup_paths = dict(zip(_BACKUP_NAMES, self._backup_paths_for(backup_suffix)))
+        files: dict[str, object] = {}
+        try:
+            for name, base_filename in _BACKUP_NAMES.items():
+                content = snapshots[name].content
+                backup_path = backup_paths[name]
+                _atomic_write(backup_path, content)
+                files[name] = {
+                    "backup": backup_path.name,
+                    "existed": snapshots[name].existed,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            _atomic_write(
+                self.manifest_path,
+                (
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "created_at": created_at.isoformat(),
+                            "backup_suffix": backup_suffix,
+                            "files": files,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+        except BaseException:
+            for backup_path in backup_paths.values():
+                backup_path.unlink(missing_ok=True)
+            raise
+
+    def _load_manifest(self, path: Path | None = None) -> Mapping[str, Any]:
+        selected = self.manifest_path if path is None else path
+        if selected.is_symlink():
+            raise ValueError
+        payload = json.loads(selected.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != 1
+            or not isinstance(payload.get("files"), dict)
+        ):
+            raise ValueError
+        return payload
+
+    def _baseline_snapshots(
+        self, manifest_path: Path | None = None
+    ) -> dict[str, _Snapshot]:
+        manifest = self._load_manifest(manifest_path)
+        backup_suffix = self._backup_suffix(manifest)
+        baseline: dict[str, _Snapshot] = {}
+        for name, base_filename in _BACKUP_NAMES.items():
+            expected_filename = f"{base_filename}.{backup_suffix}"
+            entry = manifest["files"][name]
+            if (
+                not isinstance(entry, dict)
+                or entry.get("backup") != expected_filename
+                or not isinstance(entry.get("existed"), bool)
+            ):
+                raise ValueError
+            backup_path = self.backup_root / expected_filename
+            if (
+                backup_path.is_symlink()
+                or backup_path.parent.resolve() != self.backup_root.resolve()
+            ):
+                raise ValueError
+            content = backup_path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != entry.get("sha256"):
+                raise ValueError
+            baseline[name] = _Snapshot(entry["existed"], content)
+        return baseline
+
+    def _backup_suffix(self, manifest: Mapping[str, Any]) -> str:
+        suffix = manifest.get("backup_suffix")
+        if not isinstance(suffix, str) or _BACKUP_SUFFIX.fullmatch(suffix) is None:
+            raise ValueError
+        return suffix
+
+    def _backup_paths_for(self, suffix: str) -> tuple[Path, ...]:
+        if _BACKUP_SUFFIX.fullmatch(suffix) is None:
+            raise ValueError
+        return tuple(
+            self.backup_root / f"{base_filename}.{suffix}"
+            for base_filename in _BACKUP_NAMES.values()
+        )
+
+    def _discard_baseline(self) -> None:
+        paths = self.backup_paths
+        for path in paths:
+            path.unlink(missing_ok=True)
+        self.manifest_path.unlink(missing_ok=True)
+
+    def _deactivate_baseline(self) -> None:
+        suffix = self._backup_suffix(self._load_manifest())
+        archived = self.backup_root / f"backup-manifest.{suffix}.json"
+        if archived.exists() or archived.is_symlink():
+            raise FileExistsError
+        # RISK(data-loss): moving the active manifest makes later apply create a new baseline.
+        _replace_with_retry(self.manifest_path, archived)
+        if os.name != "nt":
+            os.chmod(archived, 0o600)
+
+    def _has_inactive_baseline(self) -> bool:
+        prefix = "backup-manifest."
+        suffix_marker = ".json"
+        if not self.backup_root.is_dir() or self.backup_root.is_symlink():
+            return False
+        for archived in self.backup_root.glob(f"{prefix}*{suffix_marker}"):
+            suffix = archived.name[len(prefix) : -len(suffix_marker)]
+            if _BACKUP_SUFFIX.fullmatch(suffix) is None:
+                continue
+            try:
+                if self._backup_suffix(self._load_manifest(archived)) != suffix:
+                    continue
+                self._baseline_snapshots(archived)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+                continue
+            return True
+        return False
+
+    def _restore_snapshots(
+        self,
+        paths: Mapping[str, Path],
+        snapshots: Mapping[str, _Snapshot],
+    ) -> bool:
+        try:
+            for name, path in paths.items():
+                snapshot = snapshots[name]
+                if snapshot.existed:
+                    _atomic_write(path, snapshot.content)
+                else:
+                    path.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+
+    def _load_hermes_config(self) -> dict[str, Any]:
+        payload = yaml.safe_load(self.hermes_config_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Hermes config is invalid")
+        return payload
+
+    def _save_hermes_config(self, config: dict[str, Any]) -> None:
+        _atomic_write(
+            self.hermes_config_path,
+            yaml.safe_dump(config, sort_keys=False, allow_unicode=True).encode("utf-8"),
+        )
+
+    def _codex_mcp_names(self) -> set[str]:
+        payload = tomllib.loads(self.codex_config_path.read_text(encoding="utf-8"))
+        servers = payload.get("mcp_servers", {})
+        if not isinstance(servers, dict):
+            raise ValueError("Codex MCP config is invalid")
+        return set(servers)
+
+    def _write_claude_mcp(self) -> None:
+        payload = {
+            "mcpServers": {
+                _CLAUDE_SERVER: {
+                    "command": str(self.hermes_python),
+                    "args": ["-m", _CLAUDE_MODULE],
+                }
+            }
+        }
+        _atomic_write(
+            self.claude_mcp_path,
+            (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        )
+
+    def _claude_mcp_is_strict(self) -> bool:
+        payload = json.loads(self.claude_mcp_path.read_text(encoding="utf-8"))
+        return payload == {
+            "mcpServers": {
+                _CLAUDE_SERVER: {
+                    "command": str(self.hermes_python),
+                    "args": ["-m", _CLAUDE_MODULE],
+                }
+            }
+        }
+
+
+def _expected_mcp_names(config: Mapping[str, object]) -> set[str]:
+    servers = config.get("mcp_servers") or {}
+    if not isinstance(servers, dict):
+        return set()
+    return {
+        str(name)
+        for name, server in servers.items()
+        if isinstance(server, dict) and bool(server.get("command") or server.get("url"))
+    }
+
+
+def _is_max_auth(auth: Mapping[str, object]) -> bool:
+    return (
+        auth.get("loggedIn") is True
+        and auth.get("authMethod") == "claude.ai"
+        and auth.get("apiProvider") == "firstParty"
+        and auth.get("subscriptionType") == "max"
+    )
+
+
+def _snapshot(path: Path) -> _Snapshot:
+    try:
+        return _Snapshot(True, path.read_bytes())
+    except FileNotFoundError:
+        return _Snapshot(False, b"")
+
+
+def _atomic_write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    # RISK(security): create private same-directory files; never expose partial config.
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        _replace_with_retry(temporary, path)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _replace_with_retry(source: Path, destination: Path) -> None:
+    # RISK(data-loss): retry only transient sharing violations; other errors fail closed.
+    for attempt in range(3):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == 2:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
+def _failure(error: str, *, rollback_required: bool = False) -> SubscriptionReadiness:
+    return SubscriptionReadiness(
+        False, None, None, None, False, rollback_required, error
+    )
+
+
+def _result_payload(result: SubscriptionReadiness) -> dict[str, object]:
+    payload = asdict(result)
+    payload["mcp"] = "ready" if result.mcp else "not_ready"
+    return payload
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="configure-subscription-runtime.py")
+    parser.add_argument("command", choices=("apply", "verify", "rollback"))
+    parser.add_argument("--forge-root", type=Path)
+    parser.add_argument("--hermes-root", type=Path, required=True)
+    try:
+        args = parser.parse_args(argv)
+        if args.command != "rollback" and args.forge_root is None:
+            parser.error("--forge-root is required")
+        setup = SubscriptionRuntimeSetup(
+            forge_root=args.forge_root or Path.cwd(),
+            hermes_root=args.hermes_root,
+        )
+        result = getattr(setup, args.command)()
+        print(json.dumps(_result_payload(result), sort_keys=True))
+        return 0 if result.error is None else 78
+    except SystemExit as error:
+        return int(error.code) if int(error.code) == 0 else 78
+    except Exception:
+        print(
+            json.dumps(
+                _result_payload(_failure("runtime configuration failed")),
+                sort_keys=True,
+            )
+        )
+        return 78
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
