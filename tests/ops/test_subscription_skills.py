@@ -35,6 +35,19 @@ def _block_for(blocks: list[str], token: str) -> str:
     return next(block for block in blocks if token in block)
 
 
+def _is_direct_provider_cli(line: str) -> bool:
+    command = line.strip()
+    if not command or command.startswith("#"):
+        return False
+    command = re.sub(r"^(?:&\s+|command\s+)", "", command)
+    match = re.match(r'''(?:"([^"]+)"|'([^']+)'|(\S+))''', command)
+    if match is None:
+        return False
+    executable = next(part for part in match.groups() if part is not None)
+    basename = executable.replace("\\", "/").rsplit("/", maxsplit=1)[-1].lower()
+    return basename in {"codex", "codex.exe", "claude", "claude.exe"}
+
+
 @pytest.mark.parametrize(("skill_name", "mode"), SKILLS.items())
 def test_managed_subscription_skill_has_local_override_contract(
     skill_name: str, mode: str
@@ -74,9 +87,14 @@ def test_managed_subscription_skill_has_local_override_contract(
     assert "FileShare]::Read" in windows
     assert "$attempt -lt 10" in windows
     assert "WindowsIdentity]::GetCurrent().Name" in windows
-    assert "icacls $promptFile /inheritance:r /grant:r \"${identity}:(R,W)\"" in windows
+    assert "Get-Command icacls.exe -CommandType Application -ErrorAction Stop" in windows
+    assert "$expectedIcacls" in windows
+    assert "[System.StringComparison]::OrdinalIgnoreCase" in windows
+    assert "required Windows ACL utility is unavailable" in windows
+    assert "& $icaclsPath $promptFile /inheritance:r /grant:r \"${identity}:(R,W)\"" in windows
     assert "# RISK(security):" in windows
-    assert windows.index("icacls $promptFile") < windows.index("$writer.Write($prompt)")
+    assert windows.index("$icacls = Get-Command") < windows.index("$writer.Write($prompt)")
+    assert windows.index("& $icaclsPath $promptFile") < windows.index("$writer.Write($prompt)")
     assert windows.index("$writer.Dispose()") < windows.index("$promptStream.Dispose()")
     assert windows.index("$promptStream.Dispose()") < windows.index("Remove-Item -LiteralPath $promptFile -Force")
     assert "$exitCode = $LASTEXITCODE" in windows
@@ -99,10 +117,36 @@ def test_managed_subscription_skill_has_local_override_contract(
     assert all(credential not in content.lower() for credential in PAYG_CREDENTIALS)
     assert content.count(windows_call) == 1
     assert content.count(linux_call) == 1
-    for block in blocks:
-        assert not re.search(
-            r"(?m)^\s*(?:&\s+)?(?:codex|claude)(?:\.exe)?(?:\s|$)", block
-        )
+    assert not any(
+        _is_direct_provider_cli(line)
+        for block in blocks
+        for line in block.splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        '& "codex" exec',
+        "& '.\\claude.exe' -p",
+        '& "C:\\Tools\\codex.exe" exec',
+        "command claude",
+    ),
+)
+def test_direct_provider_cli_detector_rejects_quoted_and_path_commands(line: str) -> None:
+    assert _is_direct_provider_cli(line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "codex-skill --workspace workspace",
+        "claude-skill --workspace workspace",
+        "& $env:INFINITY_FORGE_SUBSCRIPTION_PYTHON $env:INFINITY_FORGE_SUBSCRIPTION_RUNNER",
+    ),
+)
+def test_direct_provider_cli_detector_allows_runner_modes(line: str) -> None:
+    assert not _is_direct_provider_cli(line)
 
 
 def test_codex_skill_reports_the_runner_final_runtime_and_fallback() -> None:

@@ -21,6 +21,14 @@ function Test-FullyQualifiedWindowsPath([string]$path) {
 if (-not $env:INFINITY_FORGE_SUBSCRIPTION_PYTHON -or -not (Test-Path -LiteralPath $env:INFINITY_FORGE_SUBSCRIPTION_PYTHON -PathType Leaf)) { throw "INFINITY_FORGE_SUBSCRIPTION_PYTHON is required" }
 if (-not $env:INFINITY_FORGE_SUBSCRIPTION_RUNNER -or -not (Test-Path -LiteralPath $env:INFINITY_FORGE_SUBSCRIPTION_RUNNER -PathType Leaf)) { throw "INFINITY_FORGE_SUBSCRIPTION_RUNNER is required" }
 if (-not (Test-FullyQualifiedWindowsPath $workspace) -or -not (Test-Path -LiteralPath $workspace -PathType Container)) { throw "workspace must be an existing fully qualified directory" }
+try {
+    $icacls = Get-Command icacls.exe -CommandType Application -ErrorAction Stop
+    $expectedIcacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    $icaclsPath = [System.IO.Path]::GetFullPath($icacls.Path)
+    if (-not (Test-Path -LiteralPath $expectedIcacls -PathType Leaf) -or -not [string]::Equals($icaclsPath, [System.IO.Path]::GetFullPath($expectedIcacls), [System.StringComparison]::OrdinalIgnoreCase)) { throw "untrusted ACL utility" }
+} catch {
+    throw "required Windows ACL utility is unavailable"
+}
 
 $promptFile = $null
 $promptStream = $null
@@ -38,7 +46,7 @@ try {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     if ([string]::IsNullOrWhiteSpace($identity)) { throw "current Windows identity is required" }
     # RISK(security): keep the empty file open so it cannot be replaced while ACLs and prompt content are applied.
-    & icacls $promptFile /inheritance:r /grant:r "${identity}:(R,W)" | Out-Null
+    & $icaclsPath $promptFile /inheritance:r /grant:r "${identity}:(R,W)" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not restrict prompt-file permissions" }
     $writer = [System.IO.StreamWriter]::new($promptStream, [System.Text.UTF8Encoding]::new($false), 1024, $true)
     $writer.Write($prompt)
