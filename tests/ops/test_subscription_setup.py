@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import subprocess
@@ -48,6 +49,8 @@ def make_setup(
     codex_home.mkdir()
     python = tmp_path / ("python.exe" if os.name == "nt" else "python")
     python.write_bytes(b"")
+    if os.name != "nt":
+        python.chmod(0o700)
     hermes_config = hermes_root / "config.yaml"
     hermes_config.write_text(
         yaml.safe_dump(
@@ -87,6 +90,11 @@ def make_setup(
         "claude_bin": "claude",
         "probe": probe or Probe(),
         "runtime_switch_apply": switch,
+        "mcp_migration_apply": lambda config, *, codex_home: SimpleNamespace(
+            written=True,
+            migrated=["external", "hermes-tools"],
+            errors=[],
+        ),
         "environment": {"SAFE": "1"},
     }
     if not use_default_auth_reader:
@@ -165,7 +173,7 @@ def test_rollback_deactivates_baseline_before_a_later_apply(tmp_path: Path):
     assert not setup.manifest_path.exists()
 
 
-def test_repeated_rollback_is_a_safe_noop(tmp_path: Path):
+def test_repeated_rollback_fails_closed_without_an_active_manifest(tmp_path: Path):
     setup, hermes_config, codex_config = make_setup(tmp_path)
     assert setup.apply().ready
     assert setup.rollback().error is None
@@ -173,9 +181,30 @@ def test_repeated_rollback_is_a_safe_noop(tmp_path: Path):
 
     result = setup.rollback()
 
-    assert result.error is None
+    assert result.error == "managed backup is invalid"
     assert result.rollback_required is False
     assert (hermes_config.read_bytes(), codex_config.read_bytes()) == restored
+
+
+def test_missing_cycle_two_manifest_never_uses_a_cycle_one_archive(tmp_path: Path):
+    setup, hermes_config, codex_config = make_setup(tmp_path)
+    assert setup.apply().ready
+    assert setup.rollback().error is None
+    hermes_config.write_text(
+        yaml.safe_dump({"model": {"name": "cycle-two"}, "mcp_servers": {}}),
+        encoding="utf-8",
+    )
+    codex_config.write_text('[user]\ncolour = "green"\n', encoding="utf-8")
+
+    assert setup.apply().ready
+    cycle_two = (hermes_config.read_bytes(), codex_config.read_bytes())
+    setup.manifest_path.unlink()
+
+    result = setup.rollback()
+
+    assert result.error == "managed backup is invalid"
+    assert result.rollback_required is False
+    assert (hermes_config.read_bytes(), codex_config.read_bytes()) == cycle_two
 
 
 @pytest.mark.parametrize(
@@ -219,12 +248,38 @@ def test_postcheck_failure_restores_immediate_pre_apply_state(tmp_path: Path):
         return SimpleNamespace(success=True)
 
     setup._runtime_switch_apply = incomplete_switch
+    setup._mcp_migration_apply = lambda config, *, codex_home: SimpleNamespace(
+        written=False, migrated=["hermes-tools"], errors=[]
+    )
     result = setup.apply()
 
     assert result.ready is False
     assert result.rollback_required is False
     assert (hermes_config.read_bytes(), codex_config.read_bytes()) == original
     assert not setup.claude_mcp_path.exists()
+
+
+def test_authoritative_migration_failure_rejects_stale_matching_mcp_names(
+    tmp_path: Path, capsys, caplog
+):
+    setup, hermes_config, codex_config = make_setup(tmp_path)
+    original = (hermes_config.read_bytes(), codex_config.read_bytes())
+    private = str(tmp_path / "private-config.toml")
+
+    setup._mcp_migration_apply = lambda config, *, codex_home: SimpleNamespace(
+        written=False,
+        migrated=["external", "hermes-tools"],
+        errors=[f"could not write {private}"],
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        result = setup.apply()
+
+    captured = capsys.readouterr()
+    assert result.error == "runtime configuration failed"
+    assert (hermes_config.read_bytes(), codex_config.read_bytes()) == original
+    assert private not in captured.out + captured.err + caplog.text
+    assert "could not write" not in captured.out + captured.err + caplog.text
 
 
 def test_failed_reapply_restores_immediate_state_and_keeps_original_baseline(
@@ -321,6 +376,46 @@ def test_tampered_manifest_cannot_redirect_rollback_write(tmp_path: Path):
     assert outside.read_text(encoding="utf-8") == "safe"
 
 
+def test_link_substitution_before_rollback_cannot_touch_outside_file(
+    tmp_path: Path,
+):
+    setup, _, _ = make_setup(tmp_path)
+    assert setup.apply().ready
+    original_managed_root = setup.managed_root.with_name("subscription-runtime-real")
+    setup.managed_root.rename(original_managed_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("outside-safe", encoding="utf-8")
+    junction_created = False
+    try:
+        setup.managed_root.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        if os.name != "nt":
+            pytest.skip(f"symlinks unavailable: {type(error).__name__}")
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(setup.managed_root), str(outside)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if completed.returncode != 0:
+            pytest.skip("links unavailable")
+        junction_created = True
+
+    try:
+        result = setup.rollback()
+
+        assert result.error == "managed backup is invalid"
+        assert result.rollback_required is False
+        assert sentinel.read_text(encoding="utf-8") == "outside-safe"
+    finally:
+        if junction_created:
+            setup.managed_root.rmdir()
+        elif setup.managed_root.is_symlink():
+            setup.managed_root.unlink()
+
+
 def test_missing_hermes_python_blocks_before_probe_or_mutation(tmp_path: Path):
     setup, hermes_config, codex_config = make_setup(tmp_path)
     setup.hermes_python.unlink()
@@ -368,6 +463,73 @@ def test_default_claude_auth_preflight_is_time_bounded(
     assert not setup.manifest_path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable contract")
+def test_non_executable_hermes_python_blocks_before_mutation(tmp_path: Path):
+    setup, hermes_config, codex_config = make_setup(tmp_path)
+    setup.hermes_python.chmod(0o600)
+    before = (hermes_config.read_bytes(), codex_config.read_bytes())
+
+    result = setup.apply()
+
+    assert result.error == "Hermes runtime preflight failed"
+    assert (hermes_config.read_bytes(), codex_config.read_bytes()) == before
+    assert not setup.manifest_path.exists()
+
+
+def test_runtime_switch_persist_failure_is_captured_without_private_logging(
+    tmp_path: Path, capsys, caplog
+):
+    setup, hermes_config, codex_config = make_setup(tmp_path)
+    original = (hermes_config.read_bytes(), codex_config.read_bytes())
+    private = str(tmp_path / "private-config.yaml")
+
+    def fail_persist(config):
+        raise OSError(private)
+
+    def logging_switch(config, value, *, persist_callback):
+        try:
+            persist_callback(config)
+        except Exception:
+            logging.getLogger("fake-hermes-helper").exception(
+                "persist failed for %s", private
+            )
+        return SimpleNamespace(success=True)
+
+    setup._save_hermes_config = fail_persist
+    setup._runtime_switch_apply = logging_switch
+
+    with caplog.at_level(logging.DEBUG):
+        result = setup.apply()
+
+    captured = capsys.readouterr()
+    emitted = captured.out + captured.err + caplog.text
+    assert result.error == "runtime configuration failed"
+    assert (hermes_config.read_bytes(), codex_config.read_bytes()) == original
+    assert private not in emitted
+    assert "Traceback" not in emitted
+
+
+def test_keyboard_interrupt_during_mutation_restores_immediate_snapshots(
+    tmp_path: Path,
+):
+    setup, hermes_config, codex_config = make_setup(tmp_path)
+    original = (hermes_config.read_bytes(), codex_config.read_bytes())
+
+    def interrupted_switch(config, value, *, persist_callback):
+        hermes_config.write_text("partial: true\n", encoding="utf-8")
+        raise KeyboardInterrupt(str(tmp_path / "private-config.yaml"))
+
+    setup._runtime_switch_apply = interrupted_switch
+
+    result = setup.apply()
+
+    assert result.error == "runtime configuration failed"
+    assert result.rollback_required is False
+    assert (hermes_config.read_bytes(), codex_config.read_bytes()) == original
+    assert not setup.manifest_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing violation contract")
 def test_atomic_write_retries_a_transient_windows_sharing_violation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -109,3 +109,25 @@ def test_cli_unexpected_adapter_error_is_generic_and_has_no_traceback(
     captured = capsys.readouterr()
     assert str(tmp_path) not in captured.out + captured.err
     assert "Traceback" not in captured.err
+
+
+def test_cli_keyboard_interrupt_is_generic_and_returns_78(
+    monkeypatch, tmp_path: Path, capsys
+):
+    class InterruptedSetup(FakeSetup):
+        def apply(self):
+            raise KeyboardInterrupt(str(tmp_path / "private-config.yaml"))
+
+    monkeypatch.setattr(
+        subscription_setup, "SubscriptionRuntimeSetup", InterruptedSetup
+    )
+
+    assert (
+        subscription_setup.main(
+            ["apply", "--forge-root", str(tmp_path), "--hermes-root", str(tmp_path)]
+        )
+        == 78
+    )
+    captured = capsys.readouterr()
+    assert str(tmp_path) not in captured.out + captured.err
+    assert "Traceback" not in captured.err
