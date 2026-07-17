@@ -205,12 +205,9 @@ def test_server_deploy_upgrades_physical_plugin_to_atomic_version_link() -> None
         'mv -Tf "$PLUGIN_LINK_STAGE/infinity-forge" "$PLUGIN_LINK"'
         in deploy
     )
-    assert 'PLUGIN_ROLLBACK_OK=true' in deploy
-    assert (
-        'if [ "$PLUGIN_ROLLBACK_OK" = true ] && '
-        '[ "$PLUGIN_RELEASE_CREATED" = true ]'
-        in deploy
-    )
+    assert "PLUGIN_ROLLBACK_OK" not in deploy
+    assert "PLUGIN_RELEASE_CREATED" not in deploy
+    assert 'rm -rf -- "$PLUGIN_RELEASE"' not in deploy
     assert 'mkdir -p "$PLUGIN_DIR"' not in deploy
     assert '[ ! -L "$PLUGIN_RELEASE" ]' in deploy
     assert '[ ! -L "$FORGE_RELEASE" ]' in deploy
@@ -232,6 +229,81 @@ def test_server_deploy_saves_and_can_restore_only_three_runtime_keys() -> None:
     assert '"$TASK_DATA_DIR"/.env-backup.*) rm -f -- "$ENV_BACKUP"' in deploy
     assert "runtime settings rollback failed" in deploy
     assert "print(payload)" not in deploy
+
+
+def test_both_server_deploy_layers_run_the_same_actual_chooser_smoke() -> None:
+    server_deploy = DEPLOY.read_text(encoding="utf-8")
+    local_deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+    begin = "# INFINITY_FORGE_CHOOSER_SMOKE_BEGIN"
+    end = "# INFINITY_FORGE_CHOOSER_SMOKE_END"
+
+    def smoke_block(script: str) -> str:
+        assert script.count(begin) == 1
+        assert script.count(end) == 1
+        return script.split(begin, 1)[1].split(end, 1)[0]
+
+    server_smoke = smoke_block(server_deploy)
+    local_smoke = smoke_block(local_deploy)
+
+    assert server_smoke == local_smoke
+    assert 'CHOOSER_EXPECTED_COMMIT="$DEPLOYED_COMMIT"' in server_deploy
+    assert 'CHOOSER_EXPECTED_COMMIT="$EXPECTED_COMMIT"' in local_deploy
+    for script in (server_deploy, local_deploy):
+        assert 'CHOOSER_HERMES_ROOT="$HERMES_ROOT"' in script
+        assert 'CHOOSER_EXPECTED_REPOSITORY="$REPOSITORY"' in script
+        assert 'CHOOSER_EXPECTED_TASK_SETTINGS_DB="$TASK_SETTINGS_DB"' in script
+        assert 'CHOOSER_EXPECTED_GH_PATH="$GH_BIN"' in script
+    for contract in (
+        'CHOOSER_SMOKE_CWD="$(mktemp -d ',
+        'chmod 700 "$CHOOSER_SMOKE_CWD"',
+        'rmdir -- "$CHOOSER_SMOKE_CWD" 2>/dev/null || true',
+        'cd "$CHOOSER_SMOKE_CWD"',
+        "-u PYTHONPATH",
+        "-u PYTHONHOME",
+        "-u INFINITY_FORGE_REPOSITORY",
+        "-u INFINITY_FORGE_TASK_SETTINGS_DB",
+        "-u INFINITY_FORGE_GH_PATH",
+        'HERMES_HOME="$HOME/.hermes"',
+        "PYTHONDONTWRITEBYTECODE=1",
+        'CHOOSER_HERMES_ROOT="$CHOOSER_HERMES_ROOT"',
+        'CHOOSER_EXPECTED_REPOSITORY="$CHOOSER_EXPECTED_REPOSITORY"',
+        'CHOOSER_EXPECTED_TASK_SETTINGS_DB="$CHOOSER_EXPECTED_TASK_SETTINGS_DB"',
+        'CHOOSER_EXPECTED_GH_PATH="$CHOOSER_EXPECTED_GH_PATH"',
+        "from hermes_cli.env_loader import load_hermes_dotenv",
+        'load_hermes_dotenv(project_env=hermes_project_root / ".env")',
+        'os.environ["INFINITY_FORGE_REPOSITORY"]',
+        'os.environ["CHOOSER_EXPECTED_REPOSITORY"]',
+        'os.environ["INFINITY_FORGE_TASK_SETTINGS_DB"]',
+        'os.environ["CHOOSER_EXPECTED_TASK_SETTINGS_DB"]',
+        'os.environ["INFINITY_FORGE_GH_PATH"]',
+        'os.environ["CHOOSER_EXPECTED_GH_PATH"]',
+        "from hermes_cli.plugins import discover_plugins",
+        "from hermes_cli.plugins import get_plugin_manager",
+        "from hermes_cli.plugins import has_hook",
+        "discover_plugins(force=True)",
+        'manager._plugins["infinity-forge"]',
+        "loaded.enabled is True",
+        "loaded.error is None",
+        '"pre_user_turn" in loaded.hooks_registered',
+        'has_hook("pre_user_turn")',
+        "loaded.module is not None",
+        "loaded.manifest.path is not None",
+        'getattr(module, "_MANAGED_RELEASE", None)',
+        "module.set_task_service(forbid_task_service)",
+        "module.before_user_turn(",
+        'result["action"] == "handled"',
+        '[choice["id"] for choice in result["choices"]] == ["chat", "task"]',
+        'raise AssertionError("Task service must not run during chooser smoke")',
+    ):
+        assert contract in server_smoke
+    assert server_smoke.index("load_hermes_dotenv(") < server_smoke.index(
+        "from hermes_cli.plugins import"
+    )
+    assert "invoke_hook" not in server_smoke
+    assert "PYTHONPATH=" not in server_smoke
+    assert "sys.path" not in server_smoke
+    assert "print(" not in server_smoke
+    assert 'rm -rf -- "$CHOOSER_SMOKE_CWD"' not in server_smoke
 
 
 def test_hermes_change_package_is_version_bound_and_committed_atomically() -> None:

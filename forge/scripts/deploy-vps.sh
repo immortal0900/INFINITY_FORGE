@@ -468,6 +468,102 @@ PY
 TASK_SETTINGS_DB="$TASK_SETTINGS_DB" PYTHONPATH="$FORGE_RELEASE" "$HERMES_PY" -c \
   "import os; from forge.ops.task_settings import TaskSettingsStore; from forge.ops.task_outbox import TaskOutbox, task_outbox_path; store=TaskSettingsStore(os.environ['TASK_SETTINGS_DB']); TaskOutbox(task_outbox_path(store.database_path))"
 
+CHOOSER_EXPECTED_COMMIT="$DEPLOYED_COMMIT"
+CHOOSER_HERMES_ROOT="$HERMES_ROOT"
+CHOOSER_EXPECTED_REPOSITORY="$REPOSITORY"
+CHOOSER_EXPECTED_TASK_SETTINGS_DB="$TASK_SETTINGS_DB"
+CHOOSER_EXPECTED_GH_PATH="$GH_BIN"
+# INFINITY_FORGE_CHOOSER_SMOKE_BEGIN
+(
+  CHOOSER_SMOKE_CWD="$(mktemp -d "${TMPDIR:-/tmp}/infinity-forge-chooser-smoke.XXXXXX")"
+  chmod 700 "$CHOOSER_SMOKE_CWD"
+  trap 'rmdir -- "$CHOOSER_SMOKE_CWD" 2>/dev/null || true' EXIT
+  cd "$CHOOSER_SMOKE_CWD"
+  env \
+    -u PYTHONPATH \
+    -u PYTHONHOME \
+    -u INFINITY_FORGE_REPOSITORY \
+    -u INFINITY_FORGE_TASK_SETTINGS_DB \
+    -u INFINITY_FORGE_GH_PATH \
+    HERMES_HOME="$HOME/.hermes" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CHOOSER_EXPECTED_COMMIT="$CHOOSER_EXPECTED_COMMIT" \
+    CHOOSER_HERMES_ROOT="$CHOOSER_HERMES_ROOT" \
+    CHOOSER_EXPECTED_REPOSITORY="$CHOOSER_EXPECTED_REPOSITORY" \
+    CHOOSER_EXPECTED_TASK_SETTINGS_DB="$CHOOSER_EXPECTED_TASK_SETTINGS_DB" \
+    CHOOSER_EXPECTED_GH_PATH="$CHOOSER_EXPECTED_GH_PATH" \
+    "$HERMES_PY" - <<'PY'
+import os
+from pathlib import Path
+
+from hermes_cli.env_loader import load_hermes_dotenv
+
+hermes_root = Path(os.environ["HERMES_HOME"]).resolve()
+hermes_project_root = Path(os.environ["CHOOSER_HERMES_ROOT"]).resolve()
+expected_commit = os.environ["CHOOSER_EXPECTED_COMMIT"]
+load_hermes_dotenv(project_env=hermes_project_root / ".env")
+assert (
+    os.environ["INFINITY_FORGE_REPOSITORY"]
+    == os.environ["CHOOSER_EXPECTED_REPOSITORY"]
+)
+assert (
+    os.environ["INFINITY_FORGE_TASK_SETTINGS_DB"]
+    == os.environ["CHOOSER_EXPECTED_TASK_SETTINGS_DB"]
+)
+assert (
+    os.environ["INFINITY_FORGE_GH_PATH"]
+    == os.environ["CHOOSER_EXPECTED_GH_PATH"]
+)
+
+from hermes_cli.plugins import discover_plugins
+from hermes_cli.plugins import get_plugin_manager
+from hermes_cli.plugins import has_hook
+
+discover_plugins(force=True)
+manager = get_plugin_manager()
+loaded = manager._plugins["infinity-forge"]
+assert loaded.enabled is True
+assert loaded.error is None
+assert loaded.module is not None
+assert loaded.manifest.path is not None
+assert "pre_user_turn" in loaded.hooks_registered
+assert has_hook("pre_user_turn")
+
+module = loaded.module
+plugin_path = Path(loaded.manifest.path).resolve()
+expected_plugin_path = (hermes_root / "plugins" / "infinity-forge").resolve()
+assert plugin_path == expected_plugin_path
+module_file = getattr(module, "__file__", None)
+assert module_file is not None
+assert Path(module_file).resolve() == (plugin_path / "__init__.py").resolve()
+
+managed_release = getattr(module, "_MANAGED_RELEASE", None)
+assert managed_release is not None
+expected_release = (
+    hermes_root / "infinity-forge" / "releases" / expected_commit
+).resolve()
+assert Path(managed_release).resolve() == expected_release
+assert expected_release.name == expected_commit
+
+
+def forbid_task_service(_request):
+    raise AssertionError("Task service must not run during chooser smoke")
+
+
+module.set_task_service(forbid_task_service)
+result = module.before_user_turn(
+    session_id=f"chooser-smoke-{expected_commit}",
+    user_id="deploy-verifier",
+    surface="cli",
+    text="diagnostic",
+    is_new_session=True,
+)
+assert result["action"] == "handled"
+assert [choice["id"] for choice in result["choices"]] == ["chat", "task"]
+PY
+)
+# INFINITY_FORGE_CHOOSER_SMOKE_END
+
 echo "[deploy] four Task profiles..."
 profile() { "$HERMES_PY" -m hermes_cli.main profile "$@"; }
 # OLD_PROFILE_MIGRATION_BEGIN: remove only the superseded profile IDs.
