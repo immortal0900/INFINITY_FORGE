@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "capability-eval.yml"
 DEPLOY = ROOT / "forge" / "scripts" / "deploy-vps.sh"
 LOCAL_DEPLOY = ROOT / "forge" / "scripts" / "deploy.ps1"
+WINDOWS_DEPLOY = ROOT / "forge" / "scripts" / "deploy-windows.ps1"
 
 
 def test_eval_is_the_single_stable_ruleset_context() -> None:
@@ -218,6 +219,84 @@ def test_local_deploy_sends_remote_bash_without_windows_line_endings() -> None:
     assert "base64 --decode | bash -s --" in deploy
     assert "$RemotePrepareScript | ssh" not in deploy
     assert "$VerificationScript | ssh" not in deploy
+
+
+def test_all_selected_preflights_finish_before_first_apply() -> None:
+    deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+
+    ec2_preflight = deploy.index(
+        'Test-ForgeServerPreflight -Name "EC2"'
+    )
+    vps_preflight = deploy.index(
+        'Test-ForgeServerPreflight -Name "VPS"'
+    )
+    windows_preflight = deploy.index('-Mode "Preflight"')
+    first_apply = deploy.index('Invoke-ForgeServerDeploy -Name "EC2"')
+
+    assert max(ec2_preflight, vps_preflight, windows_preflight) < first_apply
+
+
+def test_server_preflight_does_not_update_remote_repository() -> None:
+    deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+    start = deploy.index("function Test-ForgeServerPreflight")
+    end = deploy.index("function Invoke-ForgeServerDeploy", start)
+    preflight = deploy[start:end]
+
+    assert "git -C $RemoteRepo ls-remote origin refs/heads/main" in preflight
+    assert "git fetch" not in preflight
+    assert "git merge" not in preflight
+    assert "deploy-vps.sh" not in preflight
+    assert "merge-base --is-ancestor $RemoteCommit $Commit" in preflight
+
+
+def test_three_environment_apply_order_is_ec2_vps_windows() -> None:
+    deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+
+    ec2 = deploy.index('Invoke-ForgeServerDeploy -Name "EC2"')
+    vps = deploy.index('Invoke-ForgeServerDeploy -Name "VPS"')
+    windows = deploy.index('-Mode "Apply"')
+
+    assert ec2 < vps < windows
+
+
+def test_orchestrator_records_atomic_non_secret_deployment_report() -> None:
+    deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+
+    assert "deployment-report.json" in deploy
+    assert "formatVersion = 1" in deploy
+    assert "requestedCommit = $Commit" in deploy
+    assert "startedAtUtc = $StartedAtUtc" in deploy
+    assert "finishedAtUtc" in deploy
+    assert "targets = $TargetResults" in deploy
+    assert "skipped =" in deploy
+    assert "Set-Content -LiteralPath $ReportTemp" in deploy
+    assert "Move-Item -Force -LiteralPath $ReportTemp" in deploy
+    assert "RISK(security)" in deploy
+    assert "Get-Content $EnvFile" not in deploy
+
+
+def test_skip_switches_are_reported_instead_of_full_success() -> None:
+    deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+
+    for switch, target in (
+        ("$SkipEC2", '"EC2"'),
+        ("$SkipVPS", '"VPS"'),
+        ("$SkipLocal", '"Windows"'),
+    ):
+        assert f"if ({switch})" in deploy
+        assert f"Set-TargetSkipped -Name {target}" in deploy
+    assert "선택한 대상 확인 완료" in deploy
+
+
+def test_runbook_documents_the_single_three_target_command() -> None:
+    runbook = (ROOT / "docs" / "user-runbook.md").read_text(encoding="utf-8")
+
+    assert "Windows·EC2·VPS 단일 명령 배포" in runbook
+    assert "pwsh -NoProfile -File forge/scripts/deploy.ps1" in runbook
+    assert "%LOCALAPPDATA%\\InfinityForge\\state\\deployment-report.json" in runbook
+    assert "EC2 → VPS → Windows" in runbook
+    assert "같은 SHA로 다시 실행" in runbook
+    assert "git pull --ff-only origin main" not in runbook
 
 
 def test_local_deploy_verifies_complete_runtime_and_smokes_workers() -> None:

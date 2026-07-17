@@ -1,4 +1,4 @@
-# INFINITY_FORGE — 검증된 main 커밋을 EC2와 VPS에 반영합니다.
+# INFINITY_FORGE — 검증된 main 커밋을 Windows, EC2, VPS에 반영합니다.
 # 이 스크립트는 파일을 stage하거나 commit하지 않습니다.
 param(
   [switch]$SkipPush,
@@ -37,6 +37,78 @@ if ($Commit -ne $ProductionCommit) {
   throw "서버 배포는 origin/main의 검증된 commit만 허용합니다. PR을 병합한 뒤 다시 실행하세요."
 }
 
+$GhCommand = Get-Command gh.exe -ErrorAction Stop
+$Repository = (& $GhCommand.Source repo view --json nameWithOwner --jq .nameWithOwner).Trim()
+if ($LASTEXITCODE -ne 0 -or $Repository -notmatch '^[^/]+/[^/]+$') {
+  throw "배포 대상 GitHub 저장소를 확인할 수 없습니다."
+}
+$WindowsAdapter = Join-Path $PSScriptRoot "deploy-windows.ps1"
+if (-not (Test-Path -LiteralPath $WindowsAdapter)) {
+  throw "Windows 배포 adapter를 찾을 수 없습니다."
+}
+
+$StartedAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
+$ReportRoot = Join-Path $env:LOCALAPPDATA "InfinityForge\state"
+$ReportPath = Join-Path $ReportRoot "deployment-report.json"
+$TargetResults = [ordered]@{}
+foreach ($Target in @("EC2", "VPS", "Windows")) {
+  $TargetResults[$Target] = [ordered]@{
+    status = "pending"
+    preflight = "pending"
+    apply = "pending"
+    verify = "pending"
+    commit = $null
+    runtime = [ordered]@{}
+    error = $null
+  }
+}
+
+function Set-TargetSkipped {
+  param([Parameter(Mandatory = $true)][string]$Name)
+  $TargetResults[$Name].status = "skipped"
+  $TargetResults[$Name].preflight = "skipped"
+  $TargetResults[$Name].apply = "skipped"
+  $TargetResults[$Name].verify = "skipped"
+}
+
+function Set-TargetPhase {
+  param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][ValidateSet("preflight", "apply", "verify")][string]$Phase,
+    [Parameter(Mandatory = $true)][string]$Status
+  )
+  $TargetResults[$Name][$Phase] = $Status
+}
+
+function Get-SafeDeploymentError {
+  param([Parameter(Mandatory = $true)][string]$Message)
+  # RISK(security): report에는 환경 dump나 전체 command가 아니라 짧은 오류만 남긴다.
+  $safe = ($Message -replace '[\r\n]+', ' ').Trim()
+  if ($safe.Length -gt 500) { return $safe.Substring(0, 500) }
+  return $safe
+}
+
+function Write-DeploymentReport {
+  New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
+  $ReportTemp = Join-Path $ReportRoot ".deployment-report-$PID.json"
+  $SkippedTargets = @(
+    $TargetResults.Keys | Where-Object {
+      $TargetResults[$_].status -eq "skipped"
+    }
+  )
+  [ordered]@{
+    formatVersion = 1
+    requestedCommit = $Commit
+    startedAtUtc = $StartedAtUtc
+    finishedAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
+    user = [Environment]::UserName
+    targets = $TargetResults
+    skipped = $SkippedTargets
+  } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ReportTemp `
+    -Encoding utf8NoBOM
+  Move-Item -Force -LiteralPath $ReportTemp -Destination $ReportPath
+}
+
 function Invoke-RemoteBashScript {
   param(
     [Parameter(Mandatory = $true)][string]$HostName,
@@ -64,6 +136,48 @@ function Invoke-RemoteBashScript {
   )
   ssh $HostName $RemoteCommand
   if ($LASTEXITCODE -ne 0) { throw $FailureMessage }
+}
+
+function Test-ForgeServerPreflight {
+  param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][string]$HostName,
+    [Parameter(Mandatory = $true)][string]$RemoteRepo
+  )
+
+  Write-Host "[preflight] $Name 확인..."
+  $RemoteBranch = (
+    ssh $HostName git -C $RemoteRepo symbolic-ref --short HEAD
+  ).Trim()
+  if ($LASTEXITCODE -ne 0 -or $RemoteBranch -ne "main") {
+    throw "$Name 저장소가 main 브랜치가 아닙니다."
+  }
+  $RemoteChanges = @(
+    ssh $HostName git -C $RemoteRepo status --porcelain=v1 --untracked-files=all
+  )
+  if ($LASTEXITCODE -ne 0) { throw "$Name 작업 트리를 확인할 수 없습니다." }
+  if ($RemoteChanges.Count -ne 0) {
+    throw "$Name 저장소가 깨끗하지 않습니다. 서버에서 manual named stash를 만든 뒤 다시 실행하세요."
+  }
+  $RemoteCommit = (ssh $HostName git -C $RemoteRepo rev-parse HEAD).Trim()
+  if ($LASTEXITCODE -ne 0 -or $RemoteCommit -notmatch '^[0-9a-f]{40}$') {
+    throw "$Name 현재 commit을 확인할 수 없습니다."
+  }
+  $RemoteMainLine = (
+    ssh $HostName git -C $RemoteRepo ls-remote origin refs/heads/main
+  ).Trim()
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($RemoteMainLine)) {
+    throw "$Name origin/main을 읽을 수 없습니다."
+  }
+  $RemoteMainCommit = ($RemoteMainLine -split '\s+')[0]
+  if ($RemoteMainCommit -ne $Commit) {
+    throw "$Name origin/main이 요청 commit과 다릅니다."
+  }
+  git -C $Repo merge-base --is-ancestor $RemoteCommit $Commit
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Name 저장소는 요청 commit으로 fast-forward할 수 없습니다."
+  }
+  Write-Host "[preflight] $Name 확인 완료"
 }
 
 function Invoke-ForgeServerDeploy {
@@ -194,49 +308,105 @@ PYTHONPATH="$REPO_DIR" "$HERMES_PY" "$REPO_DIR/forge/scripts/issue-status-sync.p
   Write-Host "[deploy] $Name 확인 완료: $($Commit.Substring(0, 8))"
 }
 
-if (-not $SkipEC2) {
-  Invoke-ForgeServerDeploy -Name "EC2" -HostName "My-EC2" -RemoteRepo "/home/ec2-user/work/INFINITY_FORGE"
-}
-if (-not $SkipVPS) {
-  Invoke-ForgeServerDeploy -Name "VPS" -HostName "ubuntu@51.222.27.48" -RemoteRepo "/home/ubuntu/work/INFINITY_FORGE"
-}
+if ($SkipEC2) { Set-TargetSkipped -Name "EC2" }
+if ($SkipVPS) { Set-TargetSkipped -Name "VPS" }
+if ($SkipLocal) { Set-TargetSkipped -Name "Windows" }
 
-if (-not $SkipLocal) {
-  Write-Host "[deploy] local Hermes skills..."
-  $LocalSkills = "$env:LOCALAPPDATA\hermes\skills"
-  foreach ($S in @(
-    "forge-ops",
-    "memex",
-    "code-design-principles",
-    "forge-labels",
-    "easy-answer",
-    "code-problem-doc"
-  )) {
-    if (Test-Path "$Repo\forge\skills\$S") {
-      Copy-Item -Recurse -Force "$Repo\forge\skills\$S" $LocalSkills
+$ActiveTarget = $null
+$ActivePhase = $null
+try {
+  # 모든 선택 대상의 read-only preflight가 끝난 뒤에만 첫 apply를 시작한다.
+  if (-not $SkipEC2) {
+    $ActiveTarget = "EC2"
+    $ActivePhase = "preflight"
+    Test-ForgeServerPreflight -Name "EC2" -HostName "My-EC2" `
+      -RemoteRepo "/home/ec2-user/work/INFINITY_FORGE"
+    Set-TargetPhase -Name "EC2" -Phase "preflight" -Status "verified"
+  }
+  if (-not $SkipVPS) {
+    $ActiveTarget = "VPS"
+    $ActivePhase = "preflight"
+    Test-ForgeServerPreflight -Name "VPS" `
+      -HostName "ubuntu@51.222.27.48" `
+      -RemoteRepo "/home/ubuntu/work/INFINITY_FORGE"
+    Set-TargetPhase -Name "VPS" -Phase "preflight" -Status "verified"
+  }
+  if (-not $SkipLocal) {
+    $ActiveTarget = "Windows"
+    $ActivePhase = "preflight"
+    & $WindowsAdapter -Repo $Repo -Commit $Commit -Repository $Repository `
+      -Mode "Preflight" | Out-Host
+    Set-TargetPhase -Name "Windows" -Phase "preflight" -Status "verified"
+  }
+
+  if (-not $SkipEC2) {
+    $ActiveTarget = "EC2"
+    $ActivePhase = "apply"
+    Set-TargetPhase -Name "EC2" -Phase "apply" -Status "running"
+    Invoke-ForgeServerDeploy -Name "EC2" -HostName "My-EC2" `
+      -RemoteRepo "/home/ec2-user/work/INFINITY_FORGE"
+    Set-TargetPhase -Name "EC2" -Phase "apply" -Status "verified"
+    Set-TargetPhase -Name "EC2" -Phase "verify" -Status "verified"
+    $TargetResults.EC2.status = "verified"
+    $TargetResults.EC2.commit = $Commit
+    $TargetResults.EC2.runtime = [ordered]@{
+      gateway = "active"; timers = "active"; autoMergeEnabled = $false
     }
   }
-
-  $RoleMap = @{
-    "builder"      = @("build-task")
-    "reviewer"     = @("review-task", "code-problem-doc")
-    "deep_checker" = @("deep-check")
-    "fix"          = @("fix-task")
-  }
-  foreach ($Profile in $RoleMap.Keys) {
-    $ProfileSkills = "$env:LOCALAPPDATA\hermes\profiles\$Profile\skills"
-    if (-not (Test-Path $ProfileSkills)) { continue }
-    foreach ($Skill in (@(
-      "forge-ops",
-      "memex",
-      "code-design-principles",
-      "forge-labels"
-    ) + $RoleMap[$Profile])) {
-      if (Test-Path "$Repo\forge\skills\$Skill") {
-        Copy-Item -Recurse -Force "$Repo\forge\skills\$Skill" $ProfileSkills
-      }
+  if (-not $SkipVPS) {
+    $ActiveTarget = "VPS"
+    $ActivePhase = "apply"
+    Set-TargetPhase -Name "VPS" -Phase "apply" -Status "running"
+    Invoke-ForgeServerDeploy -Name "VPS" `
+      -HostName "ubuntu@51.222.27.48" `
+      -RemoteRepo "/home/ubuntu/work/INFINITY_FORGE"
+    Set-TargetPhase -Name "VPS" -Phase "apply" -Status "verified"
+    Set-TargetPhase -Name "VPS" -Phase "verify" -Status "verified"
+    $TargetResults.VPS.status = "verified"
+    $TargetResults.VPS.commit = $Commit
+    $TargetResults.VPS.runtime = [ordered]@{
+      gateway = "active"; timers = "active"; autoMergeEnabled = $false
     }
   }
+  if (-not $SkipLocal) {
+    $ActiveTarget = "Windows"
+    $ActivePhase = "apply"
+    Set-TargetPhase -Name "Windows" -Phase "apply" -Status "running"
+    & $WindowsAdapter -Repo $Repo -Commit $Commit -Repository $Repository `
+      -Mode "Apply" | Out-Host
+    Set-TargetPhase -Name "Windows" -Phase "apply" -Status "verified"
+    $ActivePhase = "verify"
+    & $WindowsAdapter -Repo $Repo -Commit $Commit -Repository $Repository `
+      -Mode "Verify" | Out-Host
+    Set-TargetPhase -Name "Windows" -Phase "verify" -Status "verified"
+    $TargetResults.Windows.status = "verified"
+    $TargetResults.Windows.commit = $Commit
+    $TargetResults.Windows.runtime = [ordered]@{
+      gateway = "preserved"; plugin = "enabled"
+    }
+  }
+  Write-DeploymentReport
+} catch {
+  if ($null -ne $ActiveTarget -and
+      $TargetResults[$ActiveTarget].status -ne "skipped") {
+    $TargetResults[$ActiveTarget].status = "failed"
+    if ($null -ne $ActivePhase) {
+      $TargetResults[$ActiveTarget][$ActivePhase] = "failed"
+    }
+    $TargetResults[$ActiveTarget].error = Get-SafeDeploymentError `
+      -Message $_.Exception.Message
+  }
+  Write-DeploymentReport
+  throw
 }
 
-Write-Host "[deploy] 모든 대상 확인 완료: $($Commit.Substring(0, 8))"
+$SkippedCount = @(
+  $TargetResults.Keys | Where-Object {
+    $TargetResults[$_].status -eq "skipped"
+  }
+).Count
+if ($SkippedCount -eq 0) {
+  Write-Host "[deploy] 모든 대상 확인 완료: $($Commit.Substring(0, 8))"
+} else {
+  Write-Host "[deploy] 선택한 대상 확인 완료: $($Commit.Substring(0, 8)); 생략 $SkippedCount"
+}

@@ -90,11 +90,11 @@ def test_active_runtime_docs_and_skills_use_only_plain_forge_names() -> None:
 
 def test_deploy_profiles_use_the_four_plain_roles() -> None:
     bash = (SCRIPTS / "deploy-vps.sh").read_text(encoding="utf-8")
-    powershell = (SCRIPTS / "deploy.ps1").read_text(encoding="utf-8")
+    windows = (SCRIPTS / "deploy-windows.ps1").read_text(encoding="utf-8")
 
     for role in ("builder", "reviewer", "deep_checker", "fix"):
         assert role in bash
-        assert f'"{role}"' in powershell
+        assert role in windows
     active_bash = re.sub(
         r"# OLD_(?:PROFILE_MIGRATION|INSTALLATION_CLEANUP)_BEGIN.*?"
         r"# OLD_(?:PROFILE_MIGRATION|INSTALLATION_CLEANUP)_END",
@@ -103,7 +103,10 @@ def test_deploy_profiles_use_the_four_plain_roles() -> None:
         flags=re.DOTALL,
     )
     assert not re.search(r"\b(?:executor|critic)\b", active_bash)
-    assert not re.search(r'"(?:executor|critic)"', powershell)
+    role_map_start = windows.index("$roleSkills =")
+    role_map_end = windows.index("foreach ($skill", role_map_start)
+    active_windows_roles = windows[role_map_start:role_map_end]
+    assert not re.search(r"\b(?:executor|critic|issuefinder)\b", active_windows_roles)
 
 
 def test_merge_worker_is_disabled_by_default() -> None:
