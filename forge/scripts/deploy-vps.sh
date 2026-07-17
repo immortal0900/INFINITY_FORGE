@@ -203,6 +203,13 @@ restore_runtime_after_error() {
   STATUS=$?
   set +e
   if [ "$STATUS" -ne 0 ]; then
+    # 새 코드를 실행할 수 있는 모든 managed process를 먼저 멈춘 뒤
+    # plugin link와 release를 되돌린다.
+    systemctl --user stop hermes-gateway >/dev/null 2>&1 || true
+    for T in $MANAGED_TIMERS; do
+      systemctl --user stop "forge-$T.timer" >/dev/null 2>&1 || true
+      systemctl --user stop "forge-$T.service" >/dev/null 2>&1 || true
+    done
     if ! restore_forge_environment; then
       echo "[deploy] WARNING: runtime settings rollback needs manual review: $ENV_BACKUP" >&2
     else
@@ -214,12 +221,12 @@ restore_runtime_after_error() {
     else
       PLUGIN_ROLLBACK_OK=true
     fi
-    if [ "$PLUGIN_ROLLBACK_OK" = true ] && [ "$PLUGIN_RELEASE_CREATED" = true ] && [ -d "$PLUGIN_RELEASE" ]; then
+    if [ "$PLUGIN_ROLLBACK_OK" = true ] && [ "$PLUGIN_RELEASE_CREATED" = true ] && [ -d "$PLUGIN_RELEASE" ] && [ ! -L "$PLUGIN_RELEASE" ]; then
       case "$PLUGIN_RELEASE" in
         "$PLUGIN_RELEASE_ROOT/$DEPLOYED_COMMIT") rm -rf -- "$PLUGIN_RELEASE" ;;
       esac
     fi
-    if [ "$PLUGIN_ROLLBACK_OK" = true ] && [ "$RELEASE_CREATED" = true ] && [ -d "$FORGE_RELEASE" ]; then
+    if [ "$PLUGIN_ROLLBACK_OK" = true ] && [ "$RELEASE_CREATED" = true ] && [ -d "$FORGE_RELEASE" ] && [ ! -L "$FORGE_RELEASE" ]; then
       case "$FORGE_RELEASE" in
         "$FORGE_RELEASE_ROOT/$DEPLOYED_COMMIT")
           chmod -R u+w "$FORGE_RELEASE"
@@ -228,9 +235,7 @@ restore_runtime_after_error() {
       esac
     fi
     cleanup_deploy_temporaries
-    systemctl --user stop hermes-gateway >/dev/null 2>&1 || true
     for T in $MANAGED_TIMERS; do
-      systemctl --user stop "forge-$T.timer" >/dev/null 2>&1 || true
       case " $ENABLED_TIMERS " in
         *" $T "*) systemctl --user enable "forge-$T.timer" >/dev/null 2>&1 || true ;;
         *) systemctl --user disable "forge-$T.timer" >/dev/null 2>&1 || true ;;
@@ -273,6 +278,11 @@ echo "[deploy] Hermes user-turn chooser..."
 
 # 커밋 스냅샷을 별도 release로 만든다. 실행 중인 CLI는 기존 모듈을
 # 계속 사용하고, 새 CLI만 완성된 release를 보게 된다.
+if git ls-tree -r "$DEPLOYED_COMMIT" | awk \
+  '$1 == "120000" { found=1 } END { exit(found ? 0 : 1) }'; then
+  echo "[deploy] managed release cannot contain symbolic links" >&2
+  exit 1
+fi
 RELEASE_TEMP="$(mktemp -d "$FORGE_RELEASE_ROOT/.build-$DEPLOYED_COMMIT.XXXXXX")"
 git archive "$DEPLOYED_COMMIT" | tar -x -C "$RELEASE_TEMP"
 for REQUIRED_RELEASE_FILE in \

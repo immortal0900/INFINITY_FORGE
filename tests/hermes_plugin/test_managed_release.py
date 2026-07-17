@@ -95,6 +95,37 @@ def test_valid_linux_pointer_prepends_release(
     assert Path(sys.path[0]) == expected_release.resolve()
 
 
+def test_linux_versioned_plugin_symlink_uses_fixed_release_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    hermes_home = tmp_path / "hermes"
+    sha = "a" * 40
+    versioned_plugin = hermes_home / "plugin-releases" / sha
+    versioned_plugin.mkdir(parents=True)
+    (versioned_plugin / "__init__.py").write_text("", encoding="utf-8")
+    release = hermes_home / "infinity-forge" / "releases" / sha
+    (release / "forge" / "ops").mkdir(parents=True)
+    (release / "forge" / "__init__.py").write_text("", encoding="utf-8")
+    (release / "forge" / "ops" / "task_setup.py").write_text(
+        "", encoding="utf-8"
+    )
+    (versioned_plugin / "release-path.txt").write_text(
+        str(release), encoding="utf-8"
+    )
+    stable_plugin = hermes_home / "plugins" / "infinity-forge"
+    stable_plugin.parent.mkdir(parents=True)
+    try:
+        stable_plugin.symlink_to(versioned_plugin, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    result = plugin._activate_managed_release(stable_plugin / "__init__.py")
+
+    assert result == release.resolve()
+    assert Path(sys.path[0]) == release.resolve()
+
+
 def test_repeated_activation_does_not_duplicate_release_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

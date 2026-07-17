@@ -144,6 +144,15 @@ def test_runtime_is_stopped_before_legacy_recheck_and_restored_on_error() -> Non
     assert 'systemctl --user start "forge-$T.timer"' in deploy
     assert 'systemctl --user stop hermes-gateway' in deploy
     assert 'trap restore_runtime_after_error EXIT' in deploy
+    rollback_start = deploy.index("restore_runtime_after_error()")
+    rollback_end = deploy.index("trap restore_runtime_after_error EXIT")
+    rollback = deploy[rollback_start:rollback_end]
+    assert rollback.index('systemctl --user stop hermes-gateway') < rollback.index(
+        "restore_forge_environment"
+    )
+    assert rollback.index('systemctl --user stop "forge-$T.service"') < rollback.index(
+        "restore_plugin_state"
+    )
 
 
 def test_deploy_enables_plugin_without_waiting_for_operator_input() -> None:
@@ -167,6 +176,8 @@ def test_server_deploy_publishes_clean_commit_release_atomically() -> None:
     assert 'FORGE_RELEASE="$FORGE_RELEASE_ROOT/$DEPLOYED_COMMIT"' in deploy
     assert 'FORGE_RELEASE_ROOT="$TASK_DATA_DIR/releases"' not in deploy
     assert 'RELEASE_TEMP="$(mktemp -d ' in deploy
+    assert 'git ls-tree -r "$DEPLOYED_COMMIT"' in deploy
+    assert 'managed release cannot contain symbolic links' in deploy
     assert 'git archive "$DEPLOYED_COMMIT" | tar -x -C "$RELEASE_TEMP"' in deploy
     assert 'diff -qr "$RELEASE_TEMP" "$FORGE_RELEASE"' in deploy
     assert 'mv -T "$RELEASE_TEMP" "$FORGE_RELEASE"' in deploy
@@ -197,6 +208,8 @@ def test_server_deploy_upgrades_physical_plugin_to_atomic_version_link() -> None
         in deploy
     )
     assert 'mkdir -p "$PLUGIN_DIR"' not in deploy
+    assert '[ ! -L "$PLUGIN_RELEASE" ]' in deploy
+    assert '[ ! -L "$FORGE_RELEASE" ]' in deploy
 
 
 def test_server_deploy_saves_and_can_restore_only_three_runtime_keys() -> None:
