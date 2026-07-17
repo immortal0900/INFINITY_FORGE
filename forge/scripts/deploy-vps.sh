@@ -295,6 +295,10 @@ for REQUIRED_RELEASE_FILE in \
   }
 done
 if [ -d "$FORGE_RELEASE" ] && [ ! -L "$FORGE_RELEASE" ]; then
+  if [ -n "$(find "$FORGE_RELEASE" -type l -print -quit)" ]; then
+    echo "[deploy] existing managed release contains a symbolic link" >&2
+    exit 1
+  fi
   if ! diff -qr "$RELEASE_TEMP" "$FORGE_RELEASE" >/dev/null; then
     echo "[deploy] existing managed release does not match its Git commit" >&2
     exit 1
@@ -353,6 +357,10 @@ install -m 644 "$FORGE_RELEASE/forge/hermes_plugin/infinity_forge/__init__.py" "
 printf '%s\n' "$FORGE_RELEASE" > "$PLUGIN_TEMP/release-path.txt"
 chmod 644 "$PLUGIN_TEMP/release-path.txt"
 if [ -d "$PLUGIN_RELEASE" ] && [ ! -L "$PLUGIN_RELEASE" ]; then
+  if [ -n "$(find "$PLUGIN_RELEASE" -type l -print -quit)" ]; then
+    echo "[deploy] existing plugin release contains a symbolic link" >&2
+    exit 1
+  fi
   for PLUGIN_FILE in plugin.yaml __init__.py release-path.txt; do
     if ! cmp -s "$PLUGIN_TEMP/$PLUGIN_FILE" "$PLUGIN_RELEASE/$PLUGIN_FILE"; then
       echo "[deploy] existing plugin release does not match its Git commit" >&2

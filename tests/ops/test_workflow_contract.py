@@ -178,6 +178,8 @@ def test_server_deploy_publishes_clean_commit_release_atomically() -> None:
     assert 'RELEASE_TEMP="$(mktemp -d ' in deploy
     assert 'git ls-tree -r "$DEPLOYED_COMMIT"' in deploy
     assert 'managed release cannot contain symbolic links' in deploy
+    assert 'find "$FORGE_RELEASE" -type l -print -quit' in deploy
+    assert 'existing managed release contains a symbolic link' in deploy
     assert 'git archive "$DEPLOYED_COMMIT" | tar -x -C "$RELEASE_TEMP"' in deploy
     assert 'diff -qr "$RELEASE_TEMP" "$FORGE_RELEASE"' in deploy
     assert 'mv -T "$RELEASE_TEMP" "$FORGE_RELEASE"' in deploy
@@ -194,6 +196,8 @@ def test_server_deploy_upgrades_physical_plugin_to_atomic_version_link() -> None
     assert 'PLUGIN_RELEASE="$PLUGIN_RELEASE_ROOT/$DEPLOYED_COMMIT"' in deploy
     assert 'PLUGIN_LINK="$HOME/.hermes/plugins/infinity-forge"' in deploy
     assert 'release-path.txt' in deploy
+    assert 'find "$PLUGIN_RELEASE" -type l -print -quit' in deploy
+    assert 'existing plugin release contains a symbolic link' in deploy
     assert 'if [ -d "$PLUGIN_LINK" ] && [ ! -L "$PLUGIN_LINK" ]' in deploy
     assert 'mv -T "$PLUGIN_LINK" "$PLUGIN_BACKUP"' in deploy
     assert 'ln -s -- "$PLUGIN_RELEASE" "$PLUGIN_LINK_STAGE/infinity-forge"' in deploy
