@@ -9,10 +9,44 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$HermesChangeTargets = @(
+  "hermes_cli\plugins.py",
+  "agent\conversation_loop.py",
+  "run_agent.py",
+  "cli.py",
+  "tui_gateway\server.py",
+  "gateway\run.py"
+)
 
 function Assert-ExternalCommand {
   param([Parameter(Mandatory = $true)][string]$Message)
   if ($LASTEXITCODE -ne 0) { throw $Message }
+}
+
+function Get-HermesRuntimeFingerprint {
+  param([Parameter(Mandatory = $true)][pscustomobject]$Paths)
+  $fingerprintScript = @'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+for relative in sys.argv[2:]:
+    digest.update(relative.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update((root / relative).read_bytes())
+print(digest.hexdigest()[:40])
+'@
+  $fingerprint = (
+    & $Paths.HermesPython -c $fingerprintScript `
+      $Paths.HermesRoot @HermesChangeTargets
+  ).Trim()
+  Assert-ExternalCommand "Hermes runtime fingerprint cannot be computed."
+  if ($fingerprint -notmatch '^[0-9a-f]{40}$') {
+    throw "Hermes runtime fingerprint is invalid."
+  }
+  return $fingerprint
 }
 
 function Remove-DeploymentPath {
@@ -112,11 +146,14 @@ function Test-ForgeWindowsPreflight {
   if ($repoCommit -ne $Commit) {
     throw "Requested Forge commit did not resolve exactly."
   }
-  $hermesSourceCommit = (& git -C $paths.HermesRoot rev-parse HEAD).Trim()
-  Assert-ExternalCommand "Hermes source commit cannot be read."
-  if ($hermesSourceCommit -notmatch '^[0-9a-f]{40}$') {
-    throw "Hermes source commit is not a full Git SHA."
+  foreach ($target in $HermesChangeTargets) {
+    if (-not (Test-Path -PathType Leaf -LiteralPath (
+      Join-Path $paths.HermesRoot $target
+    ))) {
+      throw "Hermes runtime target is missing: $target"
+    }
   }
+  $null = Get-HermesRuntimeFingerprint -Paths $paths
 
   $legacyCheck = @'
 import sqlite3
@@ -254,9 +291,8 @@ function New-HermesChangePackage {
     [Parameter(Mandatory = $true)][string]$ReleasePath
   )
   New-Item -ItemType Directory -Force -Path $Paths.PackageRoot | Out-Null
-  $hermesSourceCommit = (& git -C $paths.HermesRoot rev-parse HEAD).Trim()
-  Assert-ExternalCommand "Hermes source commit cannot be read."
-  $packageVersion = "$Commit-$hermesSourceCommit"
+  $hermesRuntimeVersion = Get-HermesRuntimeFingerprint -Paths $Paths
+  $packageVersion = "$Commit-$hermesRuntimeVersion"
   $packagePath = Join-Path $Paths.PackageRoot $packageVersion
   $manifestPath = Join-Path $packagePath "installed-files-list.json"
   if (Test-Path -LiteralPath $packagePath) {
@@ -270,7 +306,7 @@ function New-HermesChangePackage {
     return [pscustomobject]@{
       Path = $packagePath
       Version = $packageVersion
-      HermesCommit = $hermesSourceCommit
+      HermesVersion = $hermesRuntimeVersion
     }
   }
 
@@ -279,12 +315,17 @@ function New-HermesChangePackage {
   # 있도록 두 SHA는 최종 directory에만 두고 sibling 임시 이름은 짧게 유지한다.
   $sourceTemp = Join-Path $Paths.PackageRoot "._s-$suffix"
   $packageTemp = Join-Path $Paths.PackageRoot "._b-$suffix"
-  $archive = Join-Path $Paths.PackageRoot "._a-$suffix.zip"
   try {
-    git -C $paths.HermesRoot archive --format=zip `
-      "--output=$archive" $hermesSourceCommit
-    Assert-ExternalCommand "Hermes source archive failed."
-    Expand-Archive -LiteralPath $archive -DestinationPath $sourceTemp
+    New-Item -ItemType Directory -Path $sourceTemp | Out-Null
+    # Gateway가 중지된 동안 실제 Desktop runtime의 여섯 source만 snapshot한다.
+    foreach ($target in $HermesChangeTargets) {
+      $destination = Join-Path $sourceTemp $target
+      New-Item -ItemType Directory -Force -Path (
+        Split-Path -Parent $destination
+      ) | Out-Null
+      Copy-Item -LiteralPath (Join-Path $Paths.HermesRoot $target) `
+        -Destination $destination
+    }
     & $Paths.HermesPython (
       Join-Path $ReleasePath "forge\scripts\install-hermes-change.py"
     ) "build" --hermes-root $sourceTemp --package $packageTemp `
@@ -292,8 +333,6 @@ function New-HermesChangePackage {
     Assert-ExternalCommand "Hermes change package build failed."
     Move-Item -LiteralPath $packageTemp -Destination $packagePath
   } finally {
-    Remove-DeploymentPath -Path $archive -ExpectedParent $Paths.PackageRoot `
-      -ExpectedPrefix "._a-"
     Remove-DeploymentPath -Path $sourceTemp -ExpectedParent $Paths.PackageRoot `
       -ExpectedPrefix "._s-"
     Remove-DeploymentPath -Path $packageTemp -ExpectedParent $Paths.PackageRoot `
@@ -302,24 +341,32 @@ function New-HermesChangePackage {
   return [pscustomobject]@{
     Path = $packagePath
     Version = $packageVersion
-    HermesCommit = $hermesSourceCommit
+    HermesVersion = $hermesRuntimeVersion
   }
 }
 
 function Get-PreviousHermesPackage {
-  param(
-    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
-    [Parameter(Mandatory = $true)][string]$HermesCommit
-  )
-  $pointer = Join-Path $Paths.PluginDir "release-path.txt"
-  if (-not (Test-Path -LiteralPath $pointer)) { return $null }
-  $oldRelease = (Get-Content -Raw -LiteralPath $pointer).Trim()
-  $oldCommit = [IO.Path]::GetFileName($oldRelease)
-  if ($oldCommit -notmatch '^[0-9a-f]{40}$') { return $null }
-  $oldPackage = Join-Path $Paths.PackageRoot "$oldCommit-$HermesCommit"
-  if (-not (Test-Path -LiteralPath (
+  param([Parameter(Mandatory = $true)][pscustomobject]$Paths)
+  if (-not (Test-Path -LiteralPath $Paths.StateFile)) { return $null }
+  $state = Get-Content -Raw -LiteralPath $Paths.StateFile | ConvertFrom-Json
+  if ($state.packagePath -isnot [string] -or
+      [string]::IsNullOrWhiteSpace($state.packagePath)) {
+    throw "Previous Windows deployment package path is invalid."
+  }
+  $oldPackage = [IO.Path]::GetFullPath($state.packagePath)
+  if ([IO.Path]::GetDirectoryName($oldPackage) -ne
+      [IO.Path]::GetFullPath($Paths.PackageRoot)) {
+    throw "Previous Windows deployment package is outside package root."
+  }
+  if ([IO.Path]::GetFileName($oldPackage) -notmatch
+      '^[0-9a-f]{40}-[0-9a-f]{40}$') {
+    throw "Previous Windows deployment package name is invalid."
+  }
+  if (-not (Test-Path -PathType Leaf -LiteralPath (
     Join-Path $oldPackage "installed-files-list.json"
-  ))) { return $null }
+  ))) {
+    throw "Previous Windows deployment package is incomplete."
+  }
   return $oldPackage
 }
 
@@ -641,11 +688,9 @@ function Invoke-ForgeWindowsApply {
   param([Parameter(Mandatory = $true)][pscustomobject]$Paths)
   $gatewayWasRunning = Test-HermesGatewayRunning -Paths $Paths
   $releasePath = Install-ForgeWindowsRelease -Paths $Paths
-  $package = New-HermesChangePackage -Paths $Paths -ReleasePath $releasePath
-  $oldPackage = Get-PreviousHermesPackage -Paths $Paths `
-    -HermesCommit $package.HermesCommit
+  $oldPackage = Get-PreviousHermesPackage -Paths $Paths
   $transaction = @{
-    NewPackage = $package.Path
+    NewPackage = $null
     NewPackageInstalled = $false
     OldPackage = $oldPackage
     OldPackageRestored = $false
@@ -654,11 +699,13 @@ function Invoke-ForgeWindowsApply {
   }
   try {
     if ($gatewayWasRunning) { Stop-HermesGateway -Paths $Paths }
-    if ($null -ne $oldPackage -and $oldPackage -ne $package.Path) {
+    if ($null -ne $oldPackage) {
       Invoke-HermesChange -Paths $Paths -ReleasePath $releasePath `
         -Action "restore" -Package $oldPackage
       $transaction.OldPackageRestored = $true
     }
+    $package = New-HermesChangePackage -Paths $Paths -ReleasePath $releasePath
+    $transaction.NewPackage = $package.Path
     Invoke-HermesChange -Paths $Paths -ReleasePath $releasePath `
       -Action "install" -Package $package.Path
     $transaction.NewPackageInstalled = $true
