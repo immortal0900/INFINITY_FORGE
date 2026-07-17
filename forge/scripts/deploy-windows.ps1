@@ -424,6 +424,8 @@ function Set-InfinityForgeEnvironment {
     [Parameter(Mandatory = $true)][string]$ReleasePath
   )
   $env:HERMES_HOME = $Paths.HermesHome
+  # Hermes의 보안 저장 helper는 비 ASCII 문자를 정리하므로 확장 가능한 ASCII 값으로 저장한다.
+  $taskSettingsExpression = '${LOCALAPPDATA}\hermes\infinity-forge\task-settings.db'
   $saveEnvironment = @'
 import sys
 from hermes_cli.config import save_env_value
@@ -436,7 +438,7 @@ for key, value in pairs:
   Invoke-WithReleasePythonPath -ReleasePath $ReleasePath -Action {
     & $Paths.HermesPython -c $saveEnvironment `
       "INFINITY_FORGE_REPOSITORY" $Repository `
-      "INFINITY_FORGE_TASK_SETTINGS_DB" $Paths.TaskSettingsDB `
+      "INFINITY_FORGE_TASK_SETTINGS_DB" $taskSettingsExpression `
       "INFINITY_FORGE_GH_PATH" $Paths.Gh
     Assert-ExternalCommand "Infinity Forge environment update failed."
   }
@@ -476,15 +478,7 @@ function Install-InfinityForgeProfilesAndSkills {
     [Parameter(Mandatory = $true)][pscustomobject]$Paths,
     [Parameter(Mandatory = $true)][string]$ReleasePath
   )
-  # RISK(data-loss): active legacy Task가 0일 때만 교체된 profile ID를 이관한다.
-  if ((Test-Path (Join-Path $Paths.ProfilesRoot "executor")) -and
-      -not (Test-Path (Join-Path $Paths.ProfilesRoot "builder"))) {
-    Invoke-HermesProfile -Paths $Paths -Arguments @("rename", "executor", "builder")
-  }
-  if ((Test-Path (Join-Path $Paths.ProfilesRoot "critic")) -and
-      -not (Test-Path (Join-Path $Paths.ProfilesRoot "deep_checker"))) {
-    Invoke-HermesProfile -Paths $Paths -Arguments @("rename", "critic", "deep_checker")
-  }
+  # 기존 profile은 외부 Task가 참조할 수 있으므로 배포 중 이름 변경하거나 삭제하지 않는다.
   if (-not (Test-Path (Join-Path $Paths.ProfilesRoot "reviewer"))) {
     throw "The reviewer profile required for Task roles is missing."
   }
@@ -503,10 +497,6 @@ function Install-InfinityForgeProfilesAndSkills {
       "create", "fix", "--clone-from", "builder", "--no-alias"
     )
   }
-  if (Test-Path (Join-Path $Paths.ProfilesRoot "issuefinder")) {
-    Invoke-HermesProfile -Paths $Paths -Arguments @("delete", "issuefinder", "--yes")
-  }
-
   New-Item -ItemType Directory -Force -Path $Paths.SkillsRoot | Out-Null
   $commonSkills = @(
     "forge-ops", "memex", "code-design-principles", "forge-labels"
@@ -569,11 +559,6 @@ function Test-ForgeWindowsRuntime {
     throw "Windows release marker does not match the requested commit."
   }
 
-  $pluginList = (& $Paths.HermesCli plugins list --enabled --user --plain) -join "`n"
-  Assert-ExternalCommand "Hermes plugin list failed."
-  if ($pluginList -notmatch '(?m)^infinity-forge(?:\s|$)') {
-    throw "Infinity Forge plugin is not enabled."
-  }
   foreach ($markerFile in @(
     "hermes_cli\plugins.py",
     "agent\conversation_loop.py",
@@ -603,10 +588,19 @@ import sys
 release = pathlib.Path(sys.argv[1])
 package = pathlib.Path(sys.argv[2])
 hermes = pathlib.Path(sys.argv[3])
-databases = [pathlib.Path(value) for value in sys.argv[4:]]
+env_file = pathlib.Path(sys.argv[4])
+databases = [pathlib.Path(value) for value in sys.argv[5:]]
 sys.path.insert(0, str(release))
+from dotenv import dotenv_values
+from hermes_cli.config import load_config
 from forge.ops.task_setup import TASK_CONTENT_TEMPLATE
 
+enabled_plugins = load_config().get("plugins", {}).get("enabled", [])
+assert "infinity-forge" in enabled_plugins
+environment = dotenv_values(env_file)
+assert pathlib.Path(
+    environment["INFINITY_FORGE_TASK_SETTINGS_DB"]
+) == databases[0]
 for marker in ("[SPEC-NNN]", "[AC-01]", "## 확정된 제약"):
     assert marker in TASK_CONTENT_TEMPLATE
 manifest = json.loads(
@@ -624,7 +618,8 @@ for database in databases:
 '@
   Invoke-WithReleasePythonPath -ReleasePath $ReleasePath -Action {
     & $Paths.HermesPython -c $verifyPython $ReleasePath $PackagePath `
-      $Paths.HermesRoot $Paths.TaskSettingsDB $Paths.TaskOutboxDB $Paths.KanbanDB
+      $Paths.HermesRoot $Paths.EnvFile $Paths.TaskSettingsDB `
+      $Paths.TaskOutboxDB $Paths.KanbanDB
     Assert-ExternalCommand "Windows Infinity Forge runtime verification failed."
   }
   $gatewayRunning = Test-HermesGatewayRunning -Paths $Paths

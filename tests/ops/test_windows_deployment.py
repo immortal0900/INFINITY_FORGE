@@ -133,6 +133,9 @@ def test_windows_env_updates_are_narrow_and_do_not_print_env() -> None:
     script = _script()
 
     assert "from hermes_cli.config import save_env_value" in script
+    assert "${LOCALAPPDATA}\\hermes\\infinity-forge\\task-settings.db" in script
+    assert "from dotenv import dotenv_values" in script
+    assert 'environment["INFINITY_FORGE_TASK_SETTINGS_DB"]' in script
     for key in (
         "INFINITY_FORGE_REPOSITORY",
         "INFINITY_FORGE_TASK_SETTINGS_DB",
@@ -151,7 +154,29 @@ def test_windows_plugin_is_built_as_sibling_then_enabled_noninteractively() -> N
     assert '"$($paths.PluginDir).staging-' in script
     assert "Move-Item -LiteralPath $pluginTemp -Destination $paths.PluginDir" in script
     assert "plugins enable infinity-forge --no-allow-tool-override" in script
-    assert "RISK(data-loss)" in script
+
+
+def test_windows_plugin_verification_reads_exact_enabled_config() -> None:
+    script = _script()
+
+    assert "from hermes_cli.config import load_config" in script
+    assert '"infinity-forge" in enabled_plugins' in script
+    assert "plugins list --enabled --user --plain" not in script
+
+
+def test_windows_profile_provisioning_preserves_existing_profiles() -> None:
+    script = _script()
+    start = script.index("function Install-InfinityForgeProfilesAndSkills")
+    end = script.index("function Enable-InfinityForgePlugin", start)
+    provisioning = script[start:end]
+
+    assert '"create", "builder", "--clone-from", "reviewer"' in provisioning
+    assert '"create", "deep_checker", "--clone-from", "reviewer"' in provisioning
+    assert '"create", "fix", "--clone-from", "builder"' in provisioning
+    assert '"rename"' not in provisioning
+    assert '"delete"' not in provisioning
+    assert "issuefinder" not in provisioning
+    assert "RISK(data-loss)" not in provisioning
 
 
 def test_windows_gateway_running_state_is_preserved_on_success_and_failure() -> None:
@@ -189,7 +214,8 @@ def test_windows_verification_checks_runtime_contracts_without_creating_task() -
     script = _script()
 
     for contract in (
-        "plugins list --enabled --user --plain",
+        "from hermes_cli.config import load_config",
+        "from dotenv import dotenv_values",
         "INFINITY_FORGE_PRE_USER_TURN_V1",
         "TASK_CONTENT_TEMPLATE",
         "[SPEC-NNN]",
