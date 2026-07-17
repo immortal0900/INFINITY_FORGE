@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 import sys
 from collections.abc import Callable, Mapping
@@ -10,6 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from .subscription_runtime import CodexSubscriptionSnapshot
+
+
+_WINDOWS_NATIVE_TARGETS = {
+    "amd64": ("codex-win32-x64", "x86_64-pc-windows-msvc"),
+    "x86_64": ("codex-win32-x64", "x86_64-pc-windows-msvc"),
+    "arm64": ("codex-win32-arm64", "aarch64-pc-windows-msvc"),
+    "aarch64": ("codex-win32-arm64", "aarch64-pc-windows-msvc"),
+}
 
 
 class ProbeError(RuntimeError):
@@ -151,28 +160,51 @@ def _resolve_codex_bin(codex_bin: str) -> str:
 
 
 def _npm_native_executable() -> str | None:
-    """Return the packaged npm native Codex executable when it is installed."""
+    """Return the exact native executable next to the resolved npm shim."""
 
-    app_data = os.environ.get("APPDATA")
-    if not app_data:
+    shim = shutil.which("codex.cmd")
+    if shim is None:
         return None
-    package_root = (
-        Path(app_data)
-        / "npm"
-        / "node_modules"
-        / "@openai"
-        / "codex"
-        / "node_modules"
-        / "@openai"
-    )
+    shim_path = Path(shim)
+    if not shim_path.is_absolute():
+        return None
+    target = _WINDOWS_NATIVE_TARGETS.get(_machine_name().lower())
+    if target is None:
+        return None
+    package, vendor = target
     try:
-        candidates = sorted(
-            package_root.glob("codex-win32-*/vendor/*/bin/codex.exe")
-        )
+        resolved_shim = shim_path.resolve(strict=True)
+        if not resolved_shim.is_file() or resolved_shim.suffix.lower() != ".cmd":
+            return None
+        package_root = (
+            resolved_shim.parent
+            / "node_modules"
+            / "@openai"
+            / "codex"
+        ).resolve(strict=True)
+        candidate = (
+            package_root
+            / "node_modules"
+            / "@openai"
+            / package
+            / "vendor"
+            / vendor
+            / "bin"
+            / "codex.exe"
+        ).resolve(strict=True)
     except OSError:
         return None
-    for candidate in candidates:
-        if candidate.is_file() and candidate.is_absolute():
-            # RISK(security): select only the package's fixed native .exe path.
-            return str(candidate)
-    return None
+    if (
+        not package_root.is_dir()
+        or not candidate.is_file()
+        or not candidate.is_relative_to(package_root)
+    ):
+        return None
+    # RISK(security): only this resolved shim-relative native path may cross Popen.
+    return str(candidate)
+
+
+def _machine_name() -> str:
+    """Return the host architecture through a private test seam."""
+
+    return platform.machine()

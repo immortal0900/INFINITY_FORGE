@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import platform
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,30 @@ class FakeClient:
         result = self.results[method]
         assert isinstance(result, dict)
         return result
+
+
+def _npm_native_executable(
+    prefix: Path, package: str, vendor: str
+) -> tuple[Path, Path]:
+    shim = prefix / "codex.cmd"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.touch()
+    executable = (
+        prefix
+        / "node_modules"
+        / "@openai"
+        / "codex"
+        / "node_modules"
+        / "@openai"
+        / package
+        / "vendor"
+        / vendor
+        / "bin"
+        / "codex.exe"
+    )
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    return shim, executable
 
 
 def test_probe_reads_account_and_rate_limits() -> None:
@@ -158,22 +183,11 @@ def test_windows_probe_uses_npm_native_executable_when_which_finds_windows_apps(
             "account/rateLimits/read": {"rateLimits": {}},
         }
     )
-    vendor_executable = (
-        tmp_path
-        / "npm"
-        / "node_modules"
-        / "@openai"
-        / "codex"
-        / "node_modules"
-        / "@openai"
-        / "codex-win32-x64"
-        / "vendor"
-        / "x86_64-pc-windows-msvc"
-        / "bin"
-        / "codex.exe"
+    shim, vendor_executable = _npm_native_executable(
+        tmp_path / "trusted-npm",
+        "codex-win32-x64",
+        "x86_64-pc-windows-msvc",
     )
-    vendor_executable.parent.mkdir(parents=True)
-    vendor_executable.touch()
     factory_calls: list[dict[str, object]] = []
 
     def factory(**kwargs: object) -> FakeClient:
@@ -181,16 +195,132 @@ def test_windows_probe_uses_npm_native_executable_when_which_finds_windows_apps(
         return client
 
     monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(
         shutil,
         "which",
-        lambda name: r"C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe",
+        lambda name: (
+            r"C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe"
+            if name == "codex.exe"
+            else str(shim) if name == "codex.cmd" else None
+        ),
+    )
+    monkeypatch.setenv("APPDATA", str(tmp_path / "untrusted"))
+
+    CodexAppServerProbe(factory).probe("codex", {}, 1)
+
+    assert factory_calls[0]["codex_bin"] == str(vendor_executable)
+
+
+def test_windows_probe_ignores_lookalike_and_wrong_arch_candidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = FakeClient(
+        {
+            "account/read": {"account": {"type": "chatgpt"}},
+            "account/rateLimits/read": {"rateLimits": {}},
+        }
+    )
+    prefix = tmp_path / "npm"
+    shim, expected_executable = _npm_native_executable(
+        prefix, "codex-win32-x64", "x86_64-pc-windows-msvc"
+    )
+    _, wrong_arch_executable = _npm_native_executable(
+        prefix, "codex-win32-arm64", "aarch64-pc-windows-msvc"
+    )
+    lookalike = (
+        tmp_path
+        / "lookalike"
+        / "codex-win32-x64"
+        / "vendor"
+        / "x86_64-pc-windows-msvc"
+        / "bin"
+        / "codex.exe"
+    )
+    lookalike.parent.mkdir(parents=True)
+    lookalike.touch()
+    factory_calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> FakeClient:
+        factory_calls.append(kwargs)
+        return client
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: (
+            r"C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe"
+            if name == "codex.exe"
+            else str(shim) if name == "codex.cmd" else None
+        ),
     )
     monkeypatch.setenv("APPDATA", str(tmp_path))
 
     CodexAppServerProbe(factory).probe("codex", {}, 1)
 
-    assert factory_calls[0]["codex_bin"] == str(vendor_executable)
+    assert factory_calls[0]["codex_bin"] == str(expected_executable)
+    assert factory_calls[0]["codex_bin"] != str(wrong_arch_executable)
+    assert factory_calls[0]["codex_bin"] != str(lookalike)
+
+
+def test_windows_probe_rejects_unsupported_machine_architecture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    shim, _ = _npm_native_executable(
+        tmp_path / "npm", "codex-win32-x64", "x86_64-pc-windows-msvc"
+    )
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(platform, "machine", lambda: "mips64")
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: (
+            r"C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe"
+            if name == "codex.exe"
+            else str(shim) if name == "codex.cmd" else None
+        ),
+    )
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+    with pytest.raises(ProbeError, match="native .exe"):
+        CodexAppServerProbe().probe("codex", {}, 1)
+
+
+def test_windows_probe_rejects_native_executable_resolving_outside_package_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    shim, executable = _npm_native_executable(
+        tmp_path / "npm", "codex-win32-x64", "x86_64-pc-windows-msvc"
+    )
+    outside = tmp_path / "outside.exe"
+    outside.touch()
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, strict: bool = False) -> Path:
+        resolved = original_resolve(path, strict=strict)
+        if resolved == executable:
+            return outside
+        return resolved
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: (
+            r"C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe"
+            if name == "codex.exe"
+            else str(shim) if name == "codex.cmd" else None
+        ),
+    )
+    monkeypatch.setattr(Path, "resolve", resolve)
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+    with pytest.raises(ProbeError, match="native .exe"):
+        CodexAppServerProbe().probe("codex", {}, 1)
 
 
 def test_windows_probe_rejects_unlaunchable_windows_apps_candidate(
@@ -206,9 +336,12 @@ def test_windows_probe_rejects_unlaunchable_windows_apps_candidate(
     monkeypatch.setattr(
         shutil,
         "which",
-        lambda name: r"C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe",
+        lambda name: (
+            r"C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe"
+            if name == "codex.exe"
+            else None
+        ),
     )
-    monkeypatch.setenv("APPDATA", str(tmp_path))
 
     with pytest.raises(ProbeError, match="native .exe"):
         CodexAppServerProbe(factory).probe("codex", {}, 1)
