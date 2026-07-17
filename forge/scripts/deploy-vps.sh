@@ -2,8 +2,41 @@
 # INFINITY_FORGE — 서버의 검증된 main 커밋과 Hermes 자산을 반영합니다.
 # 실행 위치: 서버의 INFINITY_FORGE clone. 로컬 변경은 운영자가 먼저 보관해야 합니다.
 set -euo pipefail
+
+acquire_deploy_lock() {
+  DEPLOY_LOCK_FILE="$HOME/.hermes/infinity-forge/deploy.lock"
+  if [ ! -x /usr/bin/flock ]; then
+    echo "[deploy] /usr/bin/flock is required for deployment locking" >&2
+    exit 1
+  fi
+  mkdir -p "$HOME/.hermes/infinity-forge"
+
+  # fast-forward 후 exec로 재진입하면 같은 FD와 lock을 그대로 사용한다.
+  # 환경 marker만 위조됐거나 FD가 사라졌다면 반드시 다시 lock을 잡는다.
+  if [ "${INFINITY_FORGE_DEPLOY_LOCK_FD9:-}" = "$DEPLOY_LOCK_FILE" ]; then
+    LOCK_FD_TARGET="$(readlink -f "/proc/$$/fd/9" 2>/dev/null || true)"
+    LOCK_FILE_TARGET="$(readlink -f "$DEPLOY_LOCK_FILE" 2>/dev/null || true)"
+    if [ -n "$LOCK_FD_TARGET" ] && [ "$LOCK_FD_TARGET" = "$LOCK_FILE_TARGET" ]; then
+      if /usr/bin/flock --nonblock 9; then
+        return 0
+      fi
+      echo "[deploy] another Infinity Forge deployment is already running" >&2
+      exit 1
+    fi
+  fi
+
+  exec 9>"$DEPLOY_LOCK_FILE"
+  if ! /usr/bin/flock --nonblock 9; then
+    echo "[deploy] another Infinity Forge deployment is already running" >&2
+    exec 9>&-
+    exit 1
+  fi
+  export INFINITY_FORGE_DEPLOY_LOCK_FD9="$DEPLOY_LOCK_FILE"
+}
+
 # main 함수로 전체를 감싸서 fast-forward가 이 파일을 갱신해도 현재 실행을 안전하게 끝낸다.
 main() {
+acquire_deploy_lock
 REPO_DIR="${FORGE_REPO_DIR:-$HOME/work/INFINITY_FORGE}"
 cd "$REPO_DIR"
 
@@ -91,9 +124,7 @@ CHANGE_PACKAGE_ROOT="$TASK_DATA_DIR/hermes-user-turn-changes"
 PACKAGE_TEMP=""
 HERMES_SOURCE_TEMP=""
 RELEASE_TEMP=""
-RELEASE_CREATED=false
 PLUGIN_TEMP=""
-PLUGIN_RELEASE_CREATED=false
 PLUGIN_LINK_STAGE=""
 PLUGIN_PREVIOUS_KIND=""
 PLUGIN_PREVIOUS_LINK=""
@@ -215,24 +246,8 @@ restore_runtime_after_error() {
     else
       ENV_CHANGED=false
     fi
-    PLUGIN_ROLLBACK_OK=false
     if ! restore_plugin_state; then
       echo "[deploy] WARNING: plugin rollback needs manual review" >&2
-    else
-      PLUGIN_ROLLBACK_OK=true
-    fi
-    if [ "$PLUGIN_ROLLBACK_OK" = true ] && [ "$PLUGIN_RELEASE_CREATED" = true ] && [ -d "$PLUGIN_RELEASE" ] && [ ! -L "$PLUGIN_RELEASE" ]; then
-      case "$PLUGIN_RELEASE" in
-        "$PLUGIN_RELEASE_ROOT/$DEPLOYED_COMMIT") rm -rf -- "$PLUGIN_RELEASE" ;;
-      esac
-    fi
-    if [ "$PLUGIN_ROLLBACK_OK" = true ] && [ "$RELEASE_CREATED" = true ] && [ -d "$FORGE_RELEASE" ] && [ ! -L "$FORGE_RELEASE" ]; then
-      case "$FORGE_RELEASE" in
-        "$FORGE_RELEASE_ROOT/$DEPLOYED_COMMIT")
-          chmod -R u+w "$FORGE_RELEASE"
-          rm -rf -- "$FORGE_RELEASE"
-          ;;
-      esac
     fi
     cleanup_deploy_temporaries
     for T in $MANAGED_TIMERS; do
@@ -314,7 +329,6 @@ else
   chmod -R a-w "$RELEASE_TEMP"
   mv -T "$RELEASE_TEMP" "$FORGE_RELEASE"
   RELEASE_TEMP=""
-  RELEASE_CREATED=true
 fi
 
 HERMES_SOURCE_VERSION="$(git -C "$HERMES_ROOT" rev-parse HEAD)"
@@ -375,7 +389,6 @@ elif [ -e "$PLUGIN_RELEASE" ] || [ -L "$PLUGIN_RELEASE" ]; then
 else
   mv -T "$PLUGIN_TEMP" "$PLUGIN_RELEASE"
   PLUGIN_TEMP=""
-  PLUGIN_RELEASE_CREATED=true
 fi
 
 if [ -L "$PLUGIN_LINK" ]; then
