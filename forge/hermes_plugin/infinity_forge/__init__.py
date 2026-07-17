@@ -2,12 +2,69 @@
 
 from __future__ import annotations
 
+# ruff: noqa: E402  # Managed release activation must precede forge imports.
+
 import os
+import re
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import RLock
 from typing import Any
+
+
+_RELEASE_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _activate_managed_release(
+    plugin_file: Path = Path(__file__),
+) -> Path | None:
+    pointer = plugin_file.resolve().parent / "release-path.txt"
+    if not pointer.exists():
+        return None
+    try:
+        raw = pointer.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            "Infinity Forge managed release pointer cannot be read"
+        ) from exc
+
+    candidate = Path(raw)
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if not raw or not candidate.is_absolute() or not local_app_data:
+        raise RuntimeError("invalid Infinity Forge managed release pointer")
+
+    # RISK(security): 이 경로가 사용자 관리 release root를 벗어나면
+    # plugin import를 통해 임의 Python 코드를 실행할 수 있다.
+    release_root = (
+        Path(local_app_data).resolve() / "InfinityForge" / "releases"
+    )
+    resolved = candidate.resolve()
+    if resolved.parent != release_root:
+        raise RuntimeError(
+            "Infinity Forge managed release is outside managed release root"
+        )
+    if _RELEASE_SHA.fullmatch(resolved.name) is None:
+        raise RuntimeError(
+            "Infinity Forge managed release must use a "
+            "40-character lowercase Git SHA"
+        )
+    for required in (
+        resolved / "forge" / "__init__.py",
+        resolved / "forge" / "ops" / "task_setup.py",
+    ):
+        if not required.is_file():
+            raise RuntimeError("Infinity Forge managed release is incomplete")
+
+    release_path = str(resolved)
+    sys.path[:] = [entry for entry in sys.path if entry != release_path]
+    sys.path.insert(0, release_path)
+    return resolved
+
+
+_MANAGED_RELEASE = _activate_managed_release()
 
 from forge.ops.github import GitHubTaskIssueClient
 from forge.ops.task_outbox import TaskOutbox, task_outbox_path
