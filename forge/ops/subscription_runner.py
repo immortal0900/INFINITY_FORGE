@@ -1051,8 +1051,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = _parser().parse_args(list(argv) if argv is not None else None)
-    except SystemExit:
-        return EXIT_CONFIGURATION
+    except SystemExit as error:
+        return 0 if error.code == 0 else EXIT_CONFIGURATION
     env = dict(os.environ)
     runner = _build_runner(env)
     if args.mode == "worker":

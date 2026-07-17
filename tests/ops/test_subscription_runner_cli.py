@@ -103,6 +103,10 @@ def test_cli_returns_78_for_invalid_or_missing_required_input(argv: list[str]) -
     assert subscription_runner.main(argv) == 78
 
 
+def test_cli_help_returns_success() -> None:
+    assert subscription_runner.main(["--help"]) == 0
+
+
 def test_cli_rejects_workspace_that_differs_from_worker_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -136,6 +140,26 @@ def test_stable_script_uses_repository_env_when_run_outside_repo(tmp_path: Path)
 
     assert completed.returncode == 78
     assert "ModuleNotFoundError" not in completed.stderr
+
+
+def test_stable_script_help_returns_success_with_usage(tmp_path: Path) -> None:
+    script = Path("forge/scripts/subscription-runner.py").resolve()
+    environment = dict(os.environ)
+    environment["INFINITY_FORGE_REPO"] = str(Path.cwd())
+
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "usage: subscription-runner.py" in completed.stdout
 
 
 def test_default_kanban_uses_exact_show_and_block_argv(
