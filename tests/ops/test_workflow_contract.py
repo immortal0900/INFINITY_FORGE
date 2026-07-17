@@ -218,3 +218,10 @@ def test_local_deploy_verifies_complete_runtime_and_smokes_workers() -> None:
         assert contract in deploy
     assert 'REPOSITORY="$(cd "$REPO_DIR" && "$GH_BIN" repo view' in deploy
     assert "repo view --repo" not in deploy
+
+
+def test_deploy_verification_includes_subscription_worker_patch() -> None:
+    deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
+
+    assert "hermes_cli/kanban_db.py" in deploy
+    assert "INFINITY_FORGE_SUBSCRIPTION_WORKER_V1" in deploy

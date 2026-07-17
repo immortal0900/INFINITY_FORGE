@@ -106,6 +106,15 @@ def test_deploy_profiles_use_the_four_plain_roles() -> None:
     assert not re.search(r'"(?:executor|critic)"', powershell)
 
 
+def test_subscription_skills_are_installed_for_plain_profiles() -> None:
+    bash = (SCRIPTS / "deploy-vps.sh").read_text(encoding="utf-8")
+    powershell = (SCRIPTS / "deploy.ps1").read_text(encoding="utf-8")
+
+    for skill in ("codex", "claude-code"):
+        assert "for S in codex claude-code" in bash
+        assert f'"{skill}"' in powershell
+
+
 def test_merge_worker_is_disabled_by_default() -> None:
     module = _load_script("merge-worker.py")
     assert module.AUTO_MERGE_ENABLED_DEFAULT is False
