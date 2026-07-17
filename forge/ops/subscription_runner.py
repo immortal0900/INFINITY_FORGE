@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -41,6 +42,7 @@ class CompletedAttempt:
     events: tuple[Mapping[str, object], ...] = ()
     started_at: str = ""
     ended_at: str = ""
+    failure_class: ExitClass | None = None
 
 
 @dataclass(frozen=True)
@@ -103,48 +105,111 @@ def default_process_runner(
     stdin_text: str | None,
     stdout_path: Path | None,
 ) -> CompletedAttempt:
-    """Execute one runtime while retaining only parsed JSON object events."""
+    """Stream one runtime and retain only quota-classification event fields."""
 
     del stdout_path
     started_at = _utc_now()
-    # RISK(side-effect): this is the single external runtime process boundary.
-    completed = subprocess.run(
-        list(argv),
-        cwd=cwd,
-        env=dict(env),
-        input=stdin_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        shell=False,
-        check=False,
-    )
     events: list[Mapping[str, object]] = []
-    for line in completed.stdout.splitlines():
+    process: subprocess.Popen[str] | None = None
+    stdin_file = None
+    try:
+        if stdin_text is not None:
+            stdin_file = tempfile.TemporaryFile()
+            stdin_file.write(stdin_text.encode("utf-8", errors="strict"))
+            stdin_file.seek(0)
+        # RISK(side-effect): this is the single external runtime process boundary.
+        process = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=dict(env),
+            stdin=stdin_file,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            shell=False,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            try:
+                value = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(value, Mapping):
+                continue
+            projected: dict[str, object] = {}
+            for key in ("type", "subtype", "error"):
+                if isinstance(value.get(key), str):
+                    projected[key] = value[key]
+            if isinstance(value.get("is_error"), bool):
+                projected["is_error"] = value["is_error"]
+            if projected:
+                events.append(projected)
+        return CompletedAttempt(
+            process.wait(), tuple(events), started_at, _utc_now()
+        )
+    except KeyboardInterrupt:
+        _terminate_process(process)
+        return CompletedAttempt(
+            130,
+            tuple(events),
+            started_at,
+            _utc_now(),
+            ExitClass.CANCELLED,
+        )
+    except subprocess.TimeoutExpired:
+        _terminate_process(process)
+        return CompletedAttempt(
+            124, tuple(events), started_at, _utc_now(), ExitClass.TIMEOUT
+        )
+    except UnicodeError:
+        _terminate_process(process)
+        return CompletedAttempt(
+            EXIT_CONTRACT, tuple(events), started_at, _utc_now(), ExitClass.UNKNOWN
+        )
+    except OSError:
+        _terminate_process(process)
+        raise
+    finally:
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+        if stdin_file is not None:
+            stdin_file.close()
+
+
+def _terminate_process(process: subprocess.Popen[str] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
         try:
-            value = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if isinstance(value, Mapping):
-            events.append(value)
-    return CompletedAttempt(
-        completed.returncode, tuple(events), started_at, _utc_now()
-    )
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    except OSError:
+        return
 
 
 def default_claude_auth_status(
     claude_bin: str, env: Mapping[str, str]
 ) -> Mapping[str, object]:
     # RISK(security): query subscription auth without exposing stdout or credentials.
-    completed = subprocess.run(
-        [claude_bin, "auth", "status", "--json"],
-        env=dict(env),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        shell=False,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [claude_bin, "auth", "status", "--json"],
+            env=dict(env),
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+        )
+    except (OSError, UnicodeError):
+        return {}
     if completed.returncode != 0:
         return {}
     try:
@@ -168,12 +233,14 @@ def default_git_context(workspace: str, env: Mapping[str, str]) -> GitContext:
                 cwd=workspace,
                 env=dict(env),
                 text=True,
+                encoding="utf-8",
+                errors="strict",
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 shell=False,
                 check=False,
             )
-        except OSError:
+        except (OSError, UnicodeError):
             outputs.append("")
             errors.append(f"{label} could not start")
             continue
@@ -188,13 +255,16 @@ class SubprocessKanban:
 
     def status(self, task_id: str, env: Mapping[str, str]) -> str:
         hermes_bin = self._hermes_bin(env)
+        child_env = _kanban_child_env(env)
         # RISK(side-effect): status is a read-only subprocess with fixed argument order.
         completed = subprocess.run(
             [hermes_bin, "kanban", "show", task_id, "--json"],
-            env=dict(env),
+            env=child_env,
             text=True,
+            encoding="utf-8",
+            errors="strict",
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             shell=False,
             check=False,
         )
@@ -212,6 +282,7 @@ class SubprocessKanban:
 
     def block(self, task_id: str, reason: str, env: Mapping[str, str]) -> int:
         hermes_bin = self._hermes_bin(env)
+        child_env = _kanban_child_env(env)
         # RISK(side-effect): this command deliberately writes the task terminal state.
         completed = subprocess.run(
             [
@@ -223,10 +294,12 @@ class SubprocessKanban:
                 task_id,
                 reason,
             ],
-            env=dict(env),
+            env=child_env,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="strict",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             shell=False,
             check=False,
         )
@@ -234,17 +307,35 @@ class SubprocessKanban:
 
     @staticmethod
     def _hermes_bin(env: Mapping[str, str]) -> str:
-        value = (
-            env.get("INFINITY_FORGE_HERMES_BIN") or env.get("HERMES_BIN") or ""
-        ).strip()
-        path = Path(value)
-        if not value or not path.is_absolute() or not path.is_file():
-            raise ConfigurationError(
-                "an absolute native Hermes command path must be configured"
-            )
-        if os.name == "nt" and path.suffix.lower() != ".exe":
-            raise ConfigurationError("Hermes command must be a native executable")
-        return str(path)
+        return str(_configured_hermes_binary(env))
+
+
+def _kanban_child_env(env: Mapping[str, str]) -> dict[str, str]:
+    child_env = dict(env)
+    child_env["PYTHONUTF8"] = "1"
+    return child_env
+
+
+def _configured_hermes_binary(env: Mapping[str, str]) -> Path:
+    value = (
+        env.get("INFINITY_FORGE_HERMES_BIN") or env.get("HERMES_BIN") or ""
+    ).strip()
+    supplied = Path(value)
+    if not value or not supplied.is_absolute():
+        raise ConfigurationError("Hermes executable configuration is invalid")
+    try:
+        # RISK(security): only a strict-resolved native command may cross Popen.
+        resolved = supplied.resolve(strict=True)
+    except OSError as error:
+        raise ConfigurationError("Hermes executable configuration is invalid") from error
+    if not resolved.is_file():
+        raise ConfigurationError("Hermes executable configuration is invalid")
+    if os.name == "nt":
+        if resolved.suffix.lower() != ".exe":
+            raise ConfigurationError("Hermes executable configuration is invalid")
+    elif not os.access(resolved, os.X_OK):
+        raise ConfigurationError("Hermes executable configuration is invalid")
+    return resolved
 
 
 def build_claude_continuation_prompt(
@@ -326,6 +417,19 @@ class SubscriptionRunner:
         if context is None:
             return self._finish("worker", None, None, RuntimeKind.CODEX, None, None, (), EXIT_CONFIGURATION)
         task_id, run_id, branch = context
+        try:
+            worker_argv = self._validated_worker_argv(request, child_env)
+        except ConfigurationError:
+            return self._finish(
+                "worker",
+                task_id,
+                run_id,
+                RuntimeKind.CODEX,
+                None,
+                None,
+                (),
+                EXIT_CONFIGURATION,
+            )
 
         preflight_quota = self._codex_quota(child_env)
         if preflight_quota:
@@ -333,8 +437,8 @@ class SubscriptionRunner:
                 request, child_env, task_id, run_id, branch, ()
             )
 
-        completed = self._process_runner(
-            request.original_argv, request.workspace, child_env, None, None
+        completed = self._invoke_process(
+            worker_argv, request.workspace, child_env, None, None
         )
         codex_class = ExitClass.SUCCESS if completed.returncode == 0 else ExitClass.UNKNOWN
         codex_attempt = self._attempt(RuntimeKind.CODEX, completed, codex_class)
@@ -372,7 +476,7 @@ class SubscriptionRunner:
 
     def run_codex_skill(self, request: SkillRequest) -> SubscriptionRunResult:
         child_env = scrub_subscription_environment(request.env)
-        completed = self._process_runner(
+        completed = self._invoke_process(
             self._codex_skill_argv(request.workspace),
             request.workspace,
             child_env,
@@ -385,7 +489,7 @@ class SubscriptionRunner:
             return self._finish(
                 "codex-skill", None, None, RuntimeKind.CODEX, RuntimeKind.CODEX, None, (codex_attempt,), 0
             )
-        if not self._codex_quota(child_env):
+        if completed.failure_class is not None or not self._codex_quota(child_env):
             return self._finish(
                 "codex-skill",
                 None,
@@ -445,7 +549,7 @@ class SubscriptionRunner:
             git_context=self._git_context(request.workspace, child_env),
         )
         # RISK(security): bypassPermissions is fixed by the approved worker contract.
-        completed = self._process_runner(
+        completed = self._invoke_process(
             self._claude_argv(), request.workspace, child_env, prompt, None
         )
         exit_class = self._claude_exit_class(completed, auth)
@@ -506,7 +610,7 @@ class SubscriptionRunner:
                 EXIT_CONFIGURATION,
             )
         # RISK(security): bypassPermissions is fixed by the approved skill contract.
-        completed = self._process_runner(
+        completed = self._invoke_process(
             self._claude_argv(), request.workspace, child_env, prompt, None
         )
         exit_class = self._claude_exit_class(completed, auth)
@@ -535,9 +639,13 @@ class SubscriptionRunner:
         run_id = request.env["HERMES_KANBAN_RUN_ID"]
         try:
             status = self._kanban.status(task_id, child_env)
-        except ConfigurationError:
-            returncode = EXIT_CONFIGURATION
         except Exception:
+            self._block(
+                task_id,
+                "runtime exited successfully but Task terminal status could not be verified",
+                child_env,
+                quota=False,
+            )
             returncode = EXIT_CONTRACT
         else:
             if status in _TERMINAL_STATUSES:
@@ -608,6 +716,8 @@ class SubscriptionRunner:
         completed: CompletedAttempt,
         auth: Mapping[str, object],
     ) -> ExitClass:
+        if completed.failure_class is not None:
+            return completed.failure_class
         classified = classify_claude_stream(completed.events, auth)
         if classified is ExitClass.SUCCESS and completed.returncode != 0:
             return ExitClass.UNKNOWN
@@ -620,7 +730,7 @@ class SubscriptionRunner:
         return AttemptResult(
             runtime,
             completed.returncode,
-            exit_class,
+            completed.failure_class or exit_class,
             completed.started_at or now,
             completed.ended_at or now,
         )
@@ -651,8 +761,6 @@ class SubscriptionRunner:
     def _worker_context(
         self, request: WorkerRequest
     ) -> tuple[str, str, str] | None:
-        if not request.original_argv:
-            return None
         values = tuple(
             request.env.get(key, "").strip()
             for key in (
@@ -666,6 +774,49 @@ class SubscriptionRunner:
         if not all(values) or workspace != request.workspace:
             return None
         return task_id, run_id, branch
+
+    def _validated_worker_argv(
+        self, request: WorkerRequest, env: Mapping[str, str]
+    ) -> tuple[str, ...]:
+        configured = _configured_hermes_binary(env)
+        if not request.original_argv:
+            raise ConfigurationError("worker executable configuration is invalid")
+        original = Path(request.original_argv[0])
+        if not original.is_absolute():
+            raise ConfigurationError("worker executable configuration is invalid")
+        try:
+            resolved = original.resolve(strict=True)
+        except OSError as error:
+            raise ConfigurationError(
+                "worker executable configuration is invalid"
+            ) from error
+        if resolved != configured or not resolved.is_file():
+            raise ConfigurationError("worker executable configuration is invalid")
+        return (str(configured), *request.original_argv[1:])
+
+    def _invoke_process(
+        self,
+        argv: Sequence[str],
+        cwd: str,
+        env: Mapping[str, str],
+        stdin_text: str | None,
+        stdout_path: Path | None,
+    ) -> CompletedAttempt:
+        started_at = _utc_now()
+        try:
+            return self._process_runner(argv, cwd, env, stdin_text, stdout_path)
+        except subprocess.TimeoutExpired:
+            return CompletedAttempt(
+                124, (), started_at, _utc_now(), ExitClass.TIMEOUT
+            )
+        except KeyboardInterrupt:
+            return CompletedAttempt(
+                130, (), started_at, _utc_now(), ExitClass.CANCELLED
+            )
+        except OSError:
+            return CompletedAttempt(
+                EXIT_CONTRACT, (), started_at, _utc_now(), ExitClass.UNKNOWN
+            )
 
     def _codex_skill_argv(self, workspace: str) -> list[str]:
         return [

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -10,6 +13,7 @@ from forge.ops.subscription_runner import (
     CompletedAttempt,
     GitContext,
     SkillRequest,
+    SubprocessKanban,
     SubscriptionRunner,
     WorkerRequest,
     build_claude_continuation_prompt,
@@ -106,12 +110,19 @@ class FakeKanban:
         return self.block_code
 
 
+class FailingStatusKanban(FakeKanban):
+    def status(self, task_id: str, env: Mapping[str, str]) -> str:
+        self.status_calls.append((task_id, dict(env)))
+        raise RuntimeError("malformed show response")
+
+
 def worker_request(
     *, workspace: str = "C:/work/한글 작업", secret: str = "do-not-leak"
 ) -> WorkerRequest:
+    hermes_bin = str(Path(sys.executable).resolve())
     return WorkerRequest(
         workspace=workspace,
-        original_argv=("C:/Hermes/hermes.exe", "chat", "--resume", "abc -- x"),
+        original_argv=(hermes_bin, "chat", "--resume", "abc -- x"),
         env={
             "PATH": "kept",
             "OPENAI_API_KEY": secret,
@@ -120,6 +131,7 @@ def worker_request(
             "HERMES_KANBAN_RUN_ID": "run-42",
             "HERMES_KANBAN_WORKSPACE": workspace,
             "HERMES_KANBAN_BRANCH": "wt/task-42",
+            "INFINITY_FORGE_HERMES_BIN": hermes_bin,
         },
     )
 
@@ -153,7 +165,7 @@ def test_worker_falls_back_once_only_after_confirmed_quota() -> None:
     outcome = make_runner(process, probe).run_worker(worker_request())
 
     assert [Path(call["argv"][0]).name for call in process.calls] == [
-        "hermes.exe",
+        Path(sys.executable).name,
         "claude",
     ]
     assert outcome.returncode == 0
@@ -182,6 +194,63 @@ def test_worker_success_requires_a_terminal_task() -> None:
     assert outcome.returncode == 70
     assert len(kanban.block_calls) == 1
     assert "terminal" in kanban.block_calls[0][1]
+
+
+def test_worker_status_exception_attempts_one_block_with_same_scrubbed_env() -> None:
+    process = SequenceProcess([result(0)])
+    kanban = FailingStatusKanban()
+
+    outcome = make_runner(
+        process, SequenceProbe([available_snapshot()]), kanban=kanban
+    ).run_worker(worker_request())
+
+    assert outcome.returncode == 70
+    assert len(kanban.status_calls) == 1
+    assert len(kanban.block_calls) == 1
+    task_id, reason, block_env = kanban.block_calls[0]
+    assert task_id == "task-42"
+    assert "terminal" in reason
+    assert block_env == kanban.status_calls[0][1]
+    assert "OPENAI_API_KEY" not in block_env
+
+
+def test_worker_status_exception_remains_70_when_block_fails() -> None:
+    process = SequenceProcess([result(0)])
+    kanban = FailingStatusKanban(block_code=9)
+
+    outcome = make_runner(
+        process, SequenceProbe([available_snapshot()]), kanban=kanban
+    ).run_worker(worker_request())
+
+    assert outcome.returncode == 70
+    assert len(kanban.block_calls) == 1
+
+
+def test_worker_malformed_default_show_blocks_once_with_utf8_child_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = SequenceProcess([result(0)])
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs))
+        stdout = '{"task":{"title":"깨짐 🧪𐐷"}}' if "show" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr("forge.ops.subscription_runner.subprocess.run", run)
+
+    outcome = make_runner(
+        process,
+        SequenceProbe([available_snapshot()]),
+        kanban=SubprocessKanban(),  # type: ignore[arg-type]
+    ).run_worker(worker_request())
+
+    assert outcome.returncode == 70
+    assert ["show" in call[0] for call in calls] == [True, False]
+    assert calls[1][0][2:6] == ["block", "--kind", "capability", "task-42"]
+    assert calls[0][1]["env"] == calls[1][1]["env"]
+    assert calls[0][1]["env"]["PYTHONUTF8"] == "1"
+    assert "OPENAI_API_KEY" not in calls[0][1]["env"]
 
 
 @pytest.mark.parametrize("status", sorted(TERMINAL))
@@ -311,6 +380,200 @@ def test_worker_preserves_original_argv_unicode_workspace_and_scrubs_child_env()
     assert request.env["OPENAI_API_KEY"] == "do-not-leak"
 
 
+@pytest.mark.parametrize("argv0", ["hermes", "relative/hermes"])
+def test_worker_rejects_relative_or_path_lookup_executable_before_runtime(
+    argv0: str,
+) -> None:
+    request = worker_request()
+    request = WorkerRequest(request.workspace, (argv0, *request.original_argv[1:]), request.env)
+    process = SequenceProcess([])
+    receipts: list[object] = []
+
+    outcome = make_runner(
+        process, SequenceProbe([]), receipts=receipts
+    ).run_worker(request)
+
+    assert outcome.returncode == 78
+    assert outcome.final_runtime is None
+    assert outcome.receipt is receipts[0]
+    assert outcome.receipt.attempts == ()
+    assert process.calls == []
+    assert argv0 not in json.dumps(outcome.receipt, default=str)
+
+
+def test_worker_rejects_nonexistent_original_executable_before_runtime(
+    tmp_path: Path,
+) -> None:
+    request = worker_request()
+    missing = tmp_path / ("missing.exe" if os.name == "nt" else "missing")
+    request = WorkerRequest(
+        request.workspace, (str(missing), *request.original_argv[1:]), request.env
+    )
+    process = SequenceProcess([])
+
+    outcome = make_runner(process, SequenceProbe([])).run_worker(request)
+
+    assert outcome.returncode == 78
+    assert outcome.final_runtime is None
+    assert outcome.receipt.attempts == ()
+    assert process.calls == []
+    assert str(missing) not in json.dumps(outcome.receipt, default=str)
+
+
+def test_worker_rejects_missing_configured_executable_before_runtime() -> None:
+    request = worker_request()
+    env = dict(request.env)
+    env.pop("INFINITY_FORGE_HERMES_BIN")
+    process = SequenceProcess([])
+
+    outcome = make_runner(process, SequenceProbe([])).run_worker(
+        WorkerRequest(request.workspace, request.original_argv, env)
+    )
+
+    assert outcome.returncode == 78
+    assert outcome.final_runtime is None
+    assert outcome.receipt.attempts == ()
+    assert process.calls == []
+
+
+def test_worker_rejects_missing_original_executable_and_keeps_receipt_identity() -> None:
+    request = worker_request()
+    process = SequenceProcess([])
+
+    outcome = make_runner(process, SequenceProbe([])).run_worker(
+        WorkerRequest(request.workspace, (), request.env)
+    )
+
+    assert outcome.returncode == 78
+    assert outcome.final_runtime is None
+    assert outcome.receipt.task_id == "task-42"
+    assert outcome.receipt.run_id == "run-42"
+    assert outcome.receipt.attempts == ()
+    assert process.calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable-bit contract")
+def test_worker_rejects_non_executable_posix_binary(tmp_path: Path) -> None:
+    binary = tmp_path / "hermes"
+    binary.write_bytes(b"not executable")
+    binary.chmod(0o644)
+    request = worker_request()
+    env = dict(request.env, INFINITY_FORGE_HERMES_BIN=str(binary))
+    process = SequenceProcess([])
+
+    outcome = make_runner(process, SequenceProbe([])).run_worker(
+        WorkerRequest(request.workspace, (str(binary), "chat"), env)
+    )
+
+    assert outcome.returncode == 78
+    assert outcome.final_runtime is None
+    assert outcome.receipt.attempts == ()
+    assert process.calls == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native executable contract")
+def test_worker_rejects_windows_script_shim_before_runtime(tmp_path: Path) -> None:
+    shim = tmp_path / "hermes.cmd"
+    shim.touch()
+    request = worker_request()
+    env = dict(request.env, INFINITY_FORGE_HERMES_BIN=str(shim))
+    request = WorkerRequest(request.workspace, (str(shim), "chat"), env)
+    process = SequenceProcess([])
+
+    outcome = make_runner(process, SequenceProbe([])).run_worker(request)
+
+    assert outcome.returncode == 78
+    assert outcome.final_runtime is None
+    assert outcome.receipt.attempts == ()
+    assert process.calls == []
+
+
+def test_worker_rejects_configured_executable_mismatch_before_runtime(
+    tmp_path: Path,
+) -> None:
+    suffix = ".exe" if os.name == "nt" else ""
+    other = tmp_path / f"other-hermes{suffix}"
+    other.write_bytes(b"not executed")
+    if os.name != "nt":
+        other.chmod(0o755)
+    request = worker_request()
+    env = dict(request.env, INFINITY_FORGE_HERMES_BIN=str(other))
+    request = WorkerRequest(request.workspace, request.original_argv, env)
+    process = SequenceProcess([])
+
+    outcome = make_runner(process, SequenceProbe([])).run_worker(request)
+
+    assert outcome.returncode == 78
+    assert outcome.final_runtime is None
+    assert outcome.receipt.attempts == ()
+    assert process.calls == []
+
+
+def test_worker_runs_resolved_configured_executable_and_preserves_tail() -> None:
+    request = worker_request()
+    process = SequenceProcess([result(23)])
+
+    outcome = make_runner(
+        process, SequenceProbe([available_snapshot()])
+    ).run_worker(request)
+
+    assert outcome.returncode == 23
+    assert process.calls[0]["argv"][0] == str(Path(sys.executable).resolve())
+    assert process.calls[0]["argv"][1:] == list(request.original_argv[1:])
+
+
+def test_worker_uses_hermes_bin_only_when_primary_config_is_absent() -> None:
+    request = worker_request()
+    env = dict(request.env)
+    hermes_bin = env.pop("INFINITY_FORGE_HERMES_BIN")
+    env["HERMES_BIN"] = hermes_bin
+    process = SequenceProcess([result(23)])
+
+    outcome = make_runner(
+        process, SequenceProbe([available_snapshot()])
+    ).run_worker(WorkerRequest(request.workspace, request.original_argv, env))
+
+    assert outcome.returncode == 23
+    assert process.calls[0]["argv"][0] == hermes_bin
+
+
+def test_worker_does_not_fall_through_invalid_primary_config(tmp_path: Path) -> None:
+    request = worker_request()
+    missing = tmp_path / ("missing.exe" if os.name == "nt" else "missing")
+    env = dict(
+        request.env,
+        INFINITY_FORGE_HERMES_BIN=str(missing),
+        HERMES_BIN=request.original_argv[0],
+    )
+    process = SequenceProcess([])
+
+    outcome = make_runner(process, SequenceProbe([])).run_worker(
+        WorkerRequest(request.workspace, request.original_argv, env)
+    )
+
+    assert outcome.returncode == 78
+    assert outcome.receipt.attempts == ()
+    assert process.calls == []
+
+
+def test_worker_spawn_oserror_becomes_unknown_contract_attempt() -> None:
+    class SpawnFailure(SequenceProcess):
+        def __call__(self, *args: object, **kwargs: object) -> CompletedAttempt:
+            raise OSError("raw path must not escape")
+
+    process = SpawnFailure([])
+
+    outcome = make_runner(
+        process, SequenceProbe([available_snapshot()])
+    ).run_worker(worker_request())
+
+    assert outcome.returncode == 70
+    assert outcome.final_runtime is RuntimeKind.CODEX
+    assert len(outcome.receipt.attempts) == 1
+    assert outcome.receipt.attempts[0].exit_class is ExitClass.UNKNOWN
+    assert "raw path" not in json.dumps(outcome.receipt, default=str)
+
+
 def test_claude_prompt_contains_continuation_context_without_environment_secret() -> None:
     process = SequenceProcess([result(0)])
     receipts: list[object] = []
@@ -427,6 +690,37 @@ def test_codex_skill_returns_original_failure_when_probe_errors() -> None:
 
     assert outcome.returncode == 41
     assert len(process.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "returncode", "exit_class"),
+    [
+        (OSError("spawn failed"), 70, ExitClass.UNKNOWN),
+        (
+            subprocess.TimeoutExpired(["codex"], 1),
+            124,
+            ExitClass.TIMEOUT,
+        ),
+        (KeyboardInterrupt(), 130, ExitClass.CANCELLED),
+    ],
+)
+def test_codex_skill_process_boundary_failures_never_probe_or_fallback(
+    error: BaseException, returncode: int, exit_class: ExitClass
+) -> None:
+    class FailingProcess(SequenceProcess):
+        def __call__(self, *args: object, **kwargs: object) -> CompletedAttempt:
+            raise error
+
+    process = FailingProcess([])
+    probe = SequenceProbe([])
+
+    outcome = make_runner(process, probe).run_codex_skill(
+        SkillRequest("C:/work", "finish", {})
+    )
+
+    assert outcome.returncode == returncode
+    assert outcome.receipt.attempts[0].exit_class is exit_class
+    assert probe.calls == []
 
 
 def test_claude_skill_never_calls_codex_and_maps_exact_quota_to_75() -> None:
