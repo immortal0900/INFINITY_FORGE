@@ -1,6 +1,6 @@
 # Windows·EC2·VPS 단일 명령 배포 설계
 
-- 상태: 사용자 설계 검토 대기
+- 상태: 구현 완료, production 검증 대기
 - 작성일: 2026-07-17
 - 적용 대상: Windows 로컬 Hermes, EC2, OVH VPS
 - 배포 기준: 검사를 통과해 `origin/main`에 병합된 커밋
@@ -353,3 +353,4 @@ Hermes source SHA가 달라져 새 patch package가 만들어진다. 기존 patc
 ## 변경이력
 
 - 2026-07-17 | 세 환경 단일 명령 배포 설계 | 변경: 기존 EC2·VPS orchestrator에 Windows immutable release와 plugin runtime을 포함하는 main-only 배포 구조를 정의 | 이유: 변경마다 Windows·EC2·VPS를 따로 반영하는 비용과 환경 drift를 줄이기 위해 | 검증: 현재 deploy script, Windows Hermes launcher, EC2·VPS commit·service 상태를 읽기 전용으로 대조
+- 2026-07-17 | 설계 구현 상태 반영 | 변경: managed release bootstrap, Windows adapter, 전체 preflight, 배포 보고서 구현을 연결 | 이유: 사용자 설계 승인 뒤 실제 배포 전 검증 가능한 상태를 명확히 구분하기 위해 | 검증: 관련 pytest, Ruff, PowerShell parser와 Windows read-only preflight

@@ -719,31 +719,33 @@ gh api "repos/immortal0900/INFINITY_FORGE/rulesets/$rulesetId"
 
 이 ruleset은 PR 경유·최신 main·`eval` 성공만 강제한다. **원본 이슈의 `forge:ready-to-merge`은 사람이 별도로 확인해야 한다.** `--admin`이나 새 bypass actor로 우회하지 않는다.
 
-### 13.2 production 전환과 EC2·VPS 반영 확인
+### 13.2 Windows·EC2·VPS 단일 명령 배포
 
-전체 자동 테스트가 통과한 변경을 사람이 `main`에 병합한 뒤에만 배포한다. feature branch나 로컬 파일을 production에 직접 복사하지 않는다. 원격 저장소가 수정된 상태라면 배포를 중단하고 차이를 먼저 보존·검토한다.
+전체 자동 테스트와 GitHub `eval`을 통과한 변경을 bypass 없이 `main`에 병합한 뒤에만 배포한다. 실행 위치는 `origin/main`과 같은 commit의 clean 로컬 `main`이어야 한다. feature branch, 미커밋 파일, 서버의 dirty repository는 배포하지 않는다.
 
-```powershell
-$expected = gh api repos/immortal0900/INFINITY_FORGE/commits/main --jq .sha
-
-ssh My-EC2 'cd "$HOME/work/INFINITY_FORGE" && test "$(git branch --show-current)" = main && test -z "$(git status --porcelain)" && git fetch origin main && git pull --ff-only origin main && bash forge/scripts/deploy-vps.sh'
-ssh ubuntu@51.222.27.48 'cd "$HOME/work/INFINITY_FORGE" && test "$(git branch --show-current)" = main && test -z "$(git status --porcelain)" && git fetch origin main && git pull --ff-only origin main && bash forge/scripts/deploy-vps.sh'
-```
-
-배포 결과를 순서대로 읽어 확인한다.
+위 조건을 확인한 뒤 다음 명령을 한 번 실행한다.
 
 ```powershell
-ssh My-EC2 'cd "$HOME/work/INFINITY_FORGE" && git rev-parse HEAD && systemctl --user is-active forge-stage.timer forge-mirror.timer forge-merge.timer'
-ssh ubuntu@51.222.27.48 'cd "$HOME/work/INFINITY_FORGE" && git rev-parse HEAD && systemctl --user is-active forge-stage.timer forge-mirror.timer forge-merge.timer'
-
-ssh My-EC2 'cd "$HOME/work/INFINITY_FORGE" && PYTHONPATH="$PWD" python3 forge/scripts/task-flow-worker.py --check-port && PYTHONPATH="$PWD" python3 forge/scripts/issue-status-sync.py --check-port'
-ssh ubuntu@51.222.27.48 'cd "$HOME/work/INFINITY_FORGE" && PYTHONPATH="$PWD" python3 forge/scripts/task-flow-worker.py --check-port && PYTHONPATH="$PWD" python3 forge/scripts/issue-status-sync.py --check-port'
-
-ssh My-EC2 'journalctl --user -u forge-stage.service -u forge-mirror.service -u forge-merge.service -n 100 --no-pager'
-ssh ubuntu@51.222.27.48 'journalctl --user -u forge-stage.service -u forge-mirror.service -u forge-merge.service -n 100 --no-pager'
+pwsh -NoProfile -File forge/scripts/deploy.ps1
 ```
 
-두 서버의 `git rev-parse HEAD`가 모두 `$expected`와 같고 세 timer가 모두 `active`이며 최근 service 로그에 인자 누락·DB 불일치·GitHub 권한 오류가 없어야 반영 완료다. `--check-port`는 import만 확인하므로 timer가 active인 것만으로 기능 완료를 선언하지 않는다. 마지막으로 작은 **Build + Review + Deep Check + Manual** Task를 실제로 실행한다. 자동 병합은 이 시험과 Safe Files 전용 시험 PR을 통과한 뒤에도 별도 승인 없이 켜지 않는다.
+스크립트는 Windows·EC2·VPS의 사전 조건을 먼저 모두 읽는다. 하나라도 실패하면 어떤 대상에도 release를 설치하지 않는다. 전체 preflight가 끝나면 **EC2 → VPS → Windows** 순서로 같은 40자리 SHA를 적용하고 각 환경을 즉시 검증한다.
+
+- EC2·VPS: clean `main` fast-forward, Gateway, Forge timer, worker dry-run, DB, plugin, `AUTO_MERGE_ENABLED=false`를 확인한다.
+- Windows: immutable release, Hermes user-turn 변경, Infinity Forge plugin, Task DB, 네 profile과 skill, 표준 Task 양식, 배포 전 Gateway 실행 상태 보존을 확인한다.
+- `-SkipEC2`, `-SkipVPS`, `-SkipLocal`은 장애 조사용이다. 생략한 대상이 있으면 "모든 대상 완료"로 기록하지 않는다.
+
+결과는 `%LOCALAPPDATA%\InfinityForge\state\deployment-report.json`에 원자적으로 기록된다.
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\InfinityForge\state\deployment-report.json" |
+  ConvertFrom-Json |
+  ConvertTo-Json -Depth 8
+```
+
+`requestedCommit`과 세 대상의 `commit`이 같고, 선택한 대상의 `preflight`, `apply`, `verify`, `status`가 모두 `verified`여야 전체 반영 완료다. 나중 대상이 실패해도 먼저 검증된 환경을 자동으로 과거 코드로 되돌리지 않는다. 보고서의 실패 대상과 단계를 확인해 원인을 고친 뒤 **같은 SHA로 다시 실행**한다.
+
+작은 **Build + Review + Deep Check + Manual** 운영 Task는 GitHub 이슈와 카드를 실제 생성하므로 배포 명령이 자동 실행하지 않는다. 별도 운영 시험으로 승인해 실행하며, 자동 병합은 그 시험 뒤에도 별도 승인 없이 켜지 않는다.
 
 ## 14. 현재 환경 점검표
 
@@ -815,8 +817,9 @@ GitHub 화면과 CLI의 공식 사용법은 다음 문서를 기준으로 확인
 - [Keeping a pull request in sync with the base branch](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/keeping-your-pull-request-in-sync-with-the-base-branch)
 - [Available rules for rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 
-**한마디 요약**: Chat/Task 선택, 세 실행 단계, 세 병합 방식과 실제 Task·GitHub·Hermes worker 연결은 저장소에 구현됐다. 자동 병합은 기본적으로 꺼져 있으며, production 완료는 EC2와 VPS의 commit·timer·실제 Manual 시험 Task를 모두 확인한 뒤에만 선언한다.
+**한마디 요약**: Chat/Task 선택, 세 실행 단계, 세 병합 방식과 실제 Task·GitHub·Hermes worker 연결은 저장소에 구현됐다. 자동 병합은 기본적으로 꺼져 있으며, production 완료는 Windows·EC2·VPS의 동일 commit과 runtime 검증을 모두 확인한 뒤에만 선언한다.
 
 ## 변경이력
 
 - 2026-07-17 | Task 입력 표준 양식 반영 | 변경: Task 내용 프롬프트와 6.2절을 SPEC·AC ID 기반 양식으로 통일 | 검증: `uv run --no-project --with pytest python -m pytest tests/ops/test_task_setup.py -q`
+- 2026-07-17 | 3환경 단일 명령 배포 절차 반영 | 변경: 개별 SSH 배포를 전체 preflight 후 EC2 → VPS → Windows에 같은 SHA를 적용하는 한 명령으로 교체 | 검증: `python -m pytest tests/ops/test_workflow_contract.py tests/ops/test_windows_deployment.py -q`

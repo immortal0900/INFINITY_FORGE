@@ -288,6 +288,17 @@ def test_skip_switches_are_reported_instead_of_full_success() -> None:
     assert "선택한 대상 확인 완료" in deploy
 
 
+def test_runbook_documents_the_single_three_target_command() -> None:
+    runbook = (ROOT / "docs" / "user-runbook.md").read_text(encoding="utf-8")
+
+    assert "Windows·EC2·VPS 단일 명령 배포" in runbook
+    assert "pwsh -NoProfile -File forge/scripts/deploy.ps1" in runbook
+    assert "%LOCALAPPDATA%\\InfinityForge\\state\\deployment-report.json" in runbook
+    assert "EC2 → VPS → Windows" in runbook
+    assert "같은 SHA로 다시 실행" in runbook
+    assert "git pull --ff-only origin main" not in runbook
+
+
 def test_local_deploy_verifies_complete_runtime_and_smokes_workers() -> None:
     deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
 
