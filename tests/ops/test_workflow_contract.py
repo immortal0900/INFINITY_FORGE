@@ -160,6 +160,63 @@ def test_deploy_enables_plugin_without_waiting_for_operator_input() -> None:
     )
 
 
+def test_server_deploy_publishes_clean_commit_release_atomically() -> None:
+    deploy = DEPLOY.read_text(encoding="utf-8")
+
+    assert 'FORGE_RELEASE_ROOT="$HOME/.hermes/infinity-forge/releases"' in deploy
+    assert 'FORGE_RELEASE="$FORGE_RELEASE_ROOT/$DEPLOYED_COMMIT"' in deploy
+    assert 'FORGE_RELEASE_ROOT="$TASK_DATA_DIR/releases"' not in deploy
+    assert 'RELEASE_TEMP="$(mktemp -d ' in deploy
+    assert 'git archive "$DEPLOYED_COMMIT" | tar -x -C "$RELEASE_TEMP"' in deploy
+    assert 'diff -qr "$RELEASE_TEMP" "$FORGE_RELEASE"' in deploy
+    assert 'mv -T "$RELEASE_TEMP" "$FORGE_RELEASE"' in deploy
+    assert deploy.index('git archive "$DEPLOYED_COMMIT"') < deploy.index(
+        'mv -T "$RELEASE_TEMP" "$FORGE_RELEASE"'
+    )
+    assert '"$FORGE_RELEASE_ROOT"/.build-*) rm -rf -- "$RELEASE_TEMP"' in deploy
+
+
+def test_server_deploy_upgrades_physical_plugin_to_atomic_version_link() -> None:
+    deploy = DEPLOY.read_text(encoding="utf-8")
+
+    assert 'PLUGIN_RELEASE_ROOT="$HOME/.hermes/plugin-releases"' in deploy
+    assert 'PLUGIN_RELEASE="$PLUGIN_RELEASE_ROOT/$DEPLOYED_COMMIT"' in deploy
+    assert 'PLUGIN_LINK="$HOME/.hermes/plugins/infinity-forge"' in deploy
+    assert 'release-path.txt' in deploy
+    assert 'if [ -d "$PLUGIN_LINK" ] && [ ! -L "$PLUGIN_LINK" ]' in deploy
+    assert 'mv -T "$PLUGIN_LINK" "$PLUGIN_BACKUP"' in deploy
+    assert 'ln -s -- "$PLUGIN_RELEASE" "$PLUGIN_LINK_STAGE/infinity-forge"' in deploy
+    assert (
+        'mv -Tf "$PLUGIN_LINK_STAGE/infinity-forge" "$PLUGIN_LINK"'
+        in deploy
+    )
+    assert 'PLUGIN_ROLLBACK_OK=true' in deploy
+    assert (
+        'if [ "$PLUGIN_ROLLBACK_OK" = true ] && '
+        '[ "$PLUGIN_RELEASE_CREATED" = true ]'
+        in deploy
+    )
+    assert 'mkdir -p "$PLUGIN_DIR"' not in deploy
+
+
+def test_server_deploy_saves_and_can_restore_only_three_runtime_keys() -> None:
+    deploy = DEPLOY.read_text(encoding="utf-8")
+
+    assert "from hermes_cli.config import save_env_value" in deploy
+    assert "from hermes_cli.config import remove_env_value" in deploy
+    assert 'ENV_BACKUP="$(mktemp "$TASK_DATA_DIR/.env-backup.' in deploy
+    assert 'ENV_CHANGED=true' in deploy
+    for key in (
+        "INFINITY_FORGE_REPOSITORY",
+        "INFINITY_FORGE_TASK_SETTINGS_DB",
+        "INFINITY_FORGE_GH_PATH",
+    ):
+        assert key in deploy
+    assert '"$TASK_DATA_DIR"/.env-backup.*) rm -f -- "$ENV_BACKUP"' in deploy
+    assert "runtime settings rollback failed" in deploy
+    assert "print(payload)" not in deploy
+
+
 def test_hermes_change_package_is_version_bound_and_committed_atomically() -> None:
     deploy = DEPLOY.read_text(encoding="utf-8")
 
