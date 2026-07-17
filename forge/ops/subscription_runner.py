@@ -176,13 +176,13 @@ def default_process_runner(
             _join_thread(reader)
 
         events = fold.finish()
+        if reader_failure.is_set():
+            events = ()
         if failure_class is not None:
             returncode = EXIT_CONTRACT
         elif returncode == 0 and (writer_failure.is_set() or reader_failure.is_set()):
             returncode = EXIT_CONTRACT
             failure_class = ExitClass.UNKNOWN
-        elif reader_failure.is_set():
-            events = ()
         return CompletedAttempt(
             returncode,
             events,

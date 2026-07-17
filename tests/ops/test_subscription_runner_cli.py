@@ -474,6 +474,46 @@ def test_reader_decode_failure_discards_partial_evidence_and_preserves_nonzero(
     assert completed.events == ()
 
 
+@pytest.mark.parametrize(
+    ("child_returncode", "expected_returncode", "expected_failure"),
+    [
+        (0, 70, ExitClass.UNKNOWN),
+        (23, 23, None),
+    ],
+)
+def test_injected_reader_failure_always_discards_already_folded_event(
+    child_returncode: int,
+    expected_returncode: int,
+    expected_failure: ExitClass | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_after_valid_event(
+        stream: object,
+        fold: object,
+        reader_failure: threading.Event,
+    ) -> None:
+        fold.add(
+            {"type": "system", "subtype": "api_retry", "error": "rate_limit"}
+        )
+        reader_failure.set()
+        subscription_runner._close_stream(stream)
+
+    monkeypatch.setattr(subscription_runner, "_read_stdout", fail_after_valid_event)
+
+    completed = subscription_runner.default_process_runner(
+        [sys.executable, "-c", f"raise SystemExit({child_returncode})"],
+        str(tmp_path),
+        dict(os.environ, PYTHONUTF8="1"),
+        "prompt",
+        None,
+    )
+
+    assert completed.returncode == expected_returncode
+    assert completed.failure_class is expected_failure
+    assert completed.events == ()
+
+
 def test_auth_status_parses_unicode_json_with_strict_utf8(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
