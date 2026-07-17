@@ -58,7 +58,7 @@ def test_preflight_rejects_missing_tools_and_active_legacy_tasks() -> None:
         "venv\\Scripts\\hermes.exe",
         "Get-Command gh.exe",
         "git -C $Repo rev-parse $Commit",
-        "git -C $paths.HermesRoot rev-parse HEAD",
+        "Get-HermesRuntimeFingerprint -Paths $paths",
         "LEGACY_ACTIVE",
         "github-issue:%",
         "forge-stage:%",
@@ -80,16 +80,39 @@ def test_windows_release_is_archive_based_and_atomically_promoted() -> None:
     assert "Remove-Item -Recurse -Force $paths.ReleaseRoot" not in script
 
 
-def test_windows_hermes_package_uses_clean_source_archive() -> None:
+def test_windows_hermes_package_uses_live_runtime_snapshot() -> None:
     script = _script()
 
-    assert "git -C $paths.HermesRoot archive --format=zip" in script
+    assert "$HermesChangeTargets = @(" in script
+    assert "function Get-HermesRuntimeFingerprint" in script
+    assert (
+        "Copy-Item -LiteralPath (Join-Path $Paths.HermesRoot $target)"
+        in script
+    )
+    assert "git -C $paths.HermesRoot archive --format=zip" not in script
     assert "install-hermes-change.py" in script
     assert '"build"' in script
     assert '"install"' in script
     assert '"restore"' in script
     assert "installed-files-list.json" in script
-    assert '$packageVersion = "$Commit-$hermesSourceCommit"' in script
+    assert '$packageVersion = "$Commit-$hermesRuntimeVersion"' in script
+
+
+def test_previous_package_is_restored_before_new_runtime_snapshot() -> None:
+    script = _script()
+    start = script.index("function Invoke-ForgeWindowsApply")
+    apply = script[start:]
+
+    previous = apply.index("$oldPackage = Get-PreviousHermesPackage")
+    restore = apply.index('-Action "restore" -Package $oldPackage')
+    snapshot = apply.index("$package = New-HermesChangePackage")
+
+    assert previous < restore < snapshot
+    previous_function = script[
+        script.index("function Get-PreviousHermesPackage") : start
+    ]
+    assert "$Paths.StateFile" in previous_function
+    assert "$state.packagePath" in previous_function
 
 
 def test_windows_hermes_package_temp_names_do_not_repeat_full_shas() -> None:
@@ -101,12 +124,9 @@ def test_windows_hermes_package_temp_names_do_not_repeat_full_shas() -> None:
         '".$packageVersion.archive-$suffix.zip"',
     ):
         assert long_name not in script
-    for short_name in (
-        '"._s-$suffix"',
-        '"._b-$suffix"',
-        '"._a-$suffix.zip"',
-    ):
+    for short_name in ('"._s-$suffix"', '"._b-$suffix"'):
         assert short_name in script
+    assert '"._a-$suffix.zip"' not in script
 
 
 def test_windows_env_updates_are_narrow_and_do_not_print_env() -> None:
