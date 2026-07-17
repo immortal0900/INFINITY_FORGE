@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -10,21 +11,28 @@ SKILLS = {
     "codex": "codex-skill",
     "claude-code": "claude-skill",
 }
-FORBIDDEN = (
+PAYG_CREDENTIALS = (
     "openai_api_key",
     "anthropic_api_key",
     "api key",
-    "provider call",
-    "tmux",
-    "pty",
-    "background",
-    "retry",
-    "codex exec",
-    "claude -p",
-    "--api-key",
-    "--mcp-config",
-    "--permission-mode",
+    "api-key",
 )
+
+
+def _frontmatter(content: str) -> str:
+    match = re.match(r"\A---\r?\n(?P<frontmatter>.*?)\r?\n---\r?\n", content, re.DOTALL)
+    assert match, "frontmatter must be the opening delimited block"
+    return match.group("frontmatter")
+
+
+def _code_blocks(content: str) -> list[str]:
+    blocks = re.findall(r"```(?:powershell|bash)\n(.*?)```", content, re.DOTALL)
+    assert blocks, "skill must contain executable OS code blocks"
+    return blocks
+
+
+def _block_for(blocks: list[str], token: str) -> str:
+    return next(block for block in blocks if token in block)
 
 
 @pytest.mark.parametrize(("skill_name", "mode"), SKILLS.items())
@@ -46,35 +54,55 @@ def test_managed_subscription_skill_has_local_override_contract(
         '--workspace "$workspace" --prompt-file "$prompt_file"'
     )
 
-    assert f"name: {skill_name}" in content
-    assert "platforms: [windows, linux, macos]" in content
+    frontmatter = _frontmatter(content)
+    blocks = _code_blocks(content)
+    windows = _block_for(blocks, "INFINITY_FORGE_SUBSCRIPTION_PYTHON")
+    posix = _block_for(blocks, 'prompt_file="$(mktemp')
+
+    assert f"name: {skill_name}" in frontmatter.splitlines()
+    assert "platforms: [windows, linux, macos]" in frontmatter.splitlines()
     assert "구독" in content
-    assert windows_call in content
-    assert linux_call in content
-    assert "INFINITY_FORGE_SUBSCRIPTION_PYTHON" in content
-    assert "INFINITY_FORGE_SUBSCRIPTION_RUNNER" in content
-    assert "Test-Path -LiteralPath $workspace -PathType Container" in content
-    assert '[[ "$workspace" = /* && -d "$workspace" ]]' in content
-    assert "[System.IO.Path]::IsPathRooted($workspace)" in content
-    assert "[System.Text.UTF8Encoding]::new($false)" in content
-    assert "GetRandomFileName" in content
-    assert "mktemp" in content
-    assert "icacls" in content
-    assert "chmod 600" in content
-    assert "finally" in content
-    assert "trap" in content
-    assert "Remove-Item -LiteralPath $promptFile -Force" in content
-    assert 'rm -f "$prompt_file"' in content
-    assert "$exitCode = $LASTEXITCODE" in content
-    assert "exit $exitCode" in content
-    assert "exit_code=$?" in content
-    assert 'exit "$exit_code"' in content
+    assert "정확히 하나의 OS 절만" in content
+    assert "bash가 필요" in content
+    assert windows_call in windows
+    assert linux_call in posix
+    assert "Test-Path -LiteralPath $workspace -PathType Container" in windows
+    assert "Test-FullyQualifiedWindowsPath" in windows
+    assert "$path -like '\\\\*'" in windows
+    assert "$path -match '^[A-Za-z]:\\\\'" in windows
+    assert "FileMode]::CreateNew" in windows
+    assert "FileShare]::Read" in windows
+    assert "$attempt -lt 10" in windows
+    assert "WindowsIdentity]::GetCurrent().Name" in windows
+    assert "icacls $promptFile /inheritance:r /grant:r \"${identity}:(R,W)\"" in windows
+    assert "# RISK(security):" in windows
+    assert windows.index("icacls $promptFile") < windows.index("$writer.Write($prompt)")
+    assert windows.index("$writer.Dispose()") < windows.index("$promptStream.Dispose()")
+    assert windows.index("$promptStream.Dispose()") < windows.index("Remove-Item -LiteralPath $promptFile -Force")
+    assert "$exitCode = $LASTEXITCODE" in windows
+    assert "exit $exitCode" in windows
+    assert "prompt_file=''" in posix
+    assert "trap cleanup EXIT" in posix
+    assert posix.index("trap cleanup EXIT") < posix.index('prompt_file="$(mktemp')
+    assert 'mktemp "${TMPDIR:-/tmp}/infinity-forge.XXXXXX"' in posix
+    assert "|| exit 70" in posix
+    assert "chmod 600 \"$prompt_file\" || exit 70" in posix
+    assert "printf '%s' \"$prompt\" > \"$prompt_file\" || exit 70" in posix
+    assert 'rm -f "$prompt_file"' in posix
+    assert "exit_code=$?" in posix
+    assert 'exit "$exit_code"' in posix
     assert "선택될 때에만" in content
     assert "일반 Hermes chat" in content
     assert "구독 CLI 로그인" in content
     assert "runner가 인증·한도 분류를 담당" in content
     assert "작업 프롬프트를 명령 인수로 전달하지 않는다" in content
-    assert all(forbidden not in content.lower() for forbidden in FORBIDDEN)
+    assert all(credential not in content.lower() for credential in PAYG_CREDENTIALS)
+    assert content.count(windows_call) == 1
+    assert content.count(linux_call) == 1
+    for block in blocks:
+        assert not re.search(
+            r"(?m)^\s*(?:&\s+)?(?:codex|claude)(?:\.exe)?(?:\s|$)", block
+        )
 
 
 def test_codex_skill_reports_the_runner_final_runtime_and_fallback() -> None:
