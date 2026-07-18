@@ -420,6 +420,26 @@ def test_active_guard_serializes_external_write_with_lifecycle_end(
     assert store.get_active(active.request_id) is None
 
 
+def test_active_guard_allows_same_store_status_read(tmp_path: Path) -> None:
+    store = TaskSettingsStore(tmp_path / "task-settings.db")
+    active = _activate_one(store)
+
+    with store.guard_active(active):
+        assert store.get_active(active.request_id) == active
+
+
+def test_active_guard_allows_other_store_status_read(tmp_path: Path) -> None:
+    database_path = tmp_path / "task-settings.db"
+    store = TaskSettingsStore(database_path)
+    other_store = TaskSettingsStore(database_path)
+    active = _activate_one(store)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with store.guard_active(active):
+            status_read = pool.submit(other_store.get_active, active.request_id)
+            assert status_read.result(timeout=1) == active
+
+
 def test_active_guard_rejects_a_task_that_already_ended(tmp_path: Path) -> None:
     store = TaskSettingsStore(tmp_path / "task-settings.db")
     active = _activate_one(store)

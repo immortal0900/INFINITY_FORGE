@@ -4,7 +4,10 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 import threading
+import time
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -260,6 +263,71 @@ def _surface_event_ids(database: TaskDatabase) -> list[str]:
         ]
 
 
+def _subprocess_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    repository_root = str(Path(__file__).resolve().parents[2])
+    existing_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        f"{repository_root}{os.pathsep}{existing_path}"
+        if existing_path
+        else repository_root
+    )
+    return environment
+
+
+def _leave_committed_wal(database_path: Path, event_id: str) -> None:
+    script = '''
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+connection.execute("PRAGMA wal_autocheckpoint = 0")
+connection.execute("BEGIN IMMEDIATE")
+connection.execute("DELETE FROM surface_events")
+connection.execute(
+    """
+    INSERT INTO surface_events (
+        source_event_id,
+        subject_id,
+        session_id,
+        surface,
+        payload_hash,
+        state,
+        received_at,
+        retention_until
+    ) VALUES (?, 'user-1', 'session-1', 'cli', ?, 'received', 'now', 'later')
+    """,
+    (sys.argv[2], "b" * 64),
+)
+connection.commit()
+os._exit(0)
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(database_path), event_id],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env=_subprocess_environment(),
+    )
+    assert result.returncode == 0, result.stderr
+    wal_path = Path(f"{database_path}-wal")
+    assert wal_path.is_file()
+    assert wal_path.stat().st_size > 32
+
+
+def _database_with_abrupt_wal(
+    tmp_path: Path,
+) -> tuple[TaskDatabase, Path]:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "archived-event")
+    backup_path = database.backup(tmp_path / "backup.db")
+    _leave_committed_wal(database.database_path, "live-wal-event")
+    return database, backup_path
+
+
 def test_seeded_v1_migration_preserves_rows_events_and_public_readback(
     tmp_path: Path,
 ) -> None:
@@ -418,6 +486,13 @@ def test_shared_transaction_facade_commits_and_rolls_back(tmp_path: Path) -> Non
     assert [tuple(row) for row in stored] == [("event-1",)]
 
 
+def test_transaction_allows_same_thread_nested_quick_check(tmp_path: Path) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+
+    with database.transaction():
+        assert database.quick_check() == "ok"
+
+
 def test_database_permissions_are_owner_only(tmp_path: Path) -> None:
     database = TaskDatabase(tmp_path / "task-settings.db")
 
@@ -481,6 +556,45 @@ def _database_with_different_live_and_backup(
     backup_path = database.backup(tmp_path / "backup.db")
     _replace_surface_events(database, "live-event")
     return database, backup_path
+
+
+def test_restore_accepts_a_valid_abrupt_exit_wal_database(tmp_path: Path) -> None:
+    database, backup_path = _database_with_abrupt_wal(tmp_path)
+
+    database.restore(backup_path)
+
+    assert _surface_event_ids(database) == ["archived-event"]
+    assert not Path(f"{database.database_path}-wal").exists()
+    assert not Path(f"{database.database_path}-shm").exists()
+
+
+def test_restore_rolls_back_abrupt_exit_wal_data_after_publish_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, backup_path = _database_with_abrupt_wal(tmp_path)
+    real_apply = task_database_module._apply_owner_only_permissions
+    publish_was_attempted = False
+
+    def fail_first_live_acl(path: Path) -> None:
+        nonlocal publish_was_attempted
+        if path == database.database_path and not publish_was_attempted:
+            publish_was_attempted = True
+            raise TaskDatabaseError("forced ACL failure")
+        real_apply(path)
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_apply_owner_only_permissions",
+        fail_first_live_acl,
+    )
+
+    with pytest.raises(TaskDatabaseError, match="could not be restored safely"):
+        database.restore(backup_path)
+
+    assert publish_was_attempted
+    assert _surface_event_ids(database) == ["live-wal-event"]
+    assert database.quick_check() == "ok"
 
 
 def test_restore_rolls_back_live_database_when_post_publish_acl_fails(
@@ -570,6 +684,77 @@ def test_restore_rejects_a_concurrent_write_before_publish(tmp_path: Path) -> No
         future.result(timeout=5)
 
     assert _surface_event_ids(database) == ["live-event"]
+
+
+def test_restore_rejects_an_unmanaged_active_writer(tmp_path: Path) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+
+    with sqlite3.connect(database.database_path) as unmanaged_writer:
+        unmanaged_writer.execute("BEGIN IMMEDIATE")
+        with pytest.raises(TaskDatabaseError, match="offline"):
+            database.restore(backup_path)
+
+    assert _surface_event_ids(database) == ["live-event"]
+
+
+def test_restore_is_excluded_by_a_restore_in_another_process(tmp_path: Path) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+    ready_path = tmp_path / "restore-ready"
+    release_path = tmp_path / "restore-release"
+    script = '''
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+import forge.ops.task_database as module
+from forge.ops.task_database import TaskDatabase
+
+database_path, backup_path, ready_path, release_path = map(Path, sys.argv[1:])
+original_gate = module._offline_database_gate
+
+@contextmanager
+def paused_gate(path):
+    ready_path.write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while not release_path.exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("release marker timed out")
+        time.sleep(0.01)
+    with original_gate(path) as connection:
+        yield connection
+
+module._offline_database_gate = paused_gate
+TaskDatabase(database_path).restore(backup_path)
+'''
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(database.database_path),
+            str(backup_path),
+            str(ready_path),
+            str(release_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_subprocess_environment(),
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready_path.exists() and process.poll() is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert ready_path.exists()
+
+        with pytest.raises(TaskDatabaseError, match="offline"):
+            database.restore(backup_path)
+    finally:
+        release_path.touch()
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, f"{stdout}\n{stderr}"
 
 
 def test_backup_cannot_overwrite_the_live_database(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -11,17 +12,20 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
 TASK_DATABASE_SCHEMA_VERSION = 2
 _OPERATION_LOCK_TIMEOUT_SECONDS = 5.0
 _OPERATION_LOCK_RETRY_SECONDS = 0.01
+_WINDOWS_OPERATION_LOCK_BYTES = 256
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_RESTORE_OFFLINE_MESSAGE = "Task database restore requires offline access"
 
 _V1_TASK_SETTINGS_SQL = """
 CREATE TABLE task_settings (
@@ -476,12 +480,36 @@ class TaskDatabaseError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class _RestorePreimage:
-    files: dict[str, Path]
-    digests: dict[str, str]
+    artifact: Path
+    file_hash: str
+    content_hash: str
 
     @property
     def rollback_artifact(self) -> Path:
-        return self.files[""]
+        return self.artifact
+
+
+@dataclass(frozen=True, slots=True)
+class _HeldOperationFileLock:
+    descriptor: int
+    reader_slot: int | None
+
+
+@dataclass(slots=True)
+class _OperationBarrierState:
+    condition: threading.Condition = field(
+        default_factory=lambda: threading.Condition(threading.RLock())
+    )
+    shared_count: int = 0
+    shared_file_lock: _HeldOperationFileLock | None = None
+    exclusive_pending: bool = False
+    exclusive_owner: int | None = None
+    exclusive_depth: int = 0
+    exclusive_file_lock: _HeldOperationFileLock | None = None
+
+
+_OPERATION_BARRIERS_LOCK = threading.Lock()
+_OPERATION_BARRIERS: dict[str, _OperationBarrierState] = {}
 
 
 class TaskDatabase:
@@ -608,8 +636,9 @@ class TaskDatabase:
         _require_distinct_paths(self.database_path, backup)
         with _database_operation_lock(
             self._operation_lock_path,
+            exclusive=True,
             timeout_seconds=0.0,
-            busy_message="Task database restore requires offline access",
+            busy_message=_RESTORE_OFFLINE_MESSAGE,
         ):
             self._restore_locked(backup)
 
@@ -638,15 +667,17 @@ class TaskDatabase:
             with _offline_database_gate(self.database_path) as live:
                 _quick_check(live)
                 _validate_supported_schema(live)
-                preimage = _capture_restore_preimage(self.database_path)
-            _assert_live_matches_preimage(self.database_path, preimage)
+                preimage = _capture_restore_preimage(
+                    live,
+                    self.database_path,
+                )
 
             # RISK(data-loss): restore is an explicit offline replacement boundary.
-            # A verified owner-only preimage remains beside the live file until every
-            # post-publish check succeeds or the exact original files are restored.
+            # A checked standalone SQLite preimage remains beside the live file until
+            # every post-publish check succeeds or its logical data is restored.
+            _remove_sqlite_sidecars(self.database_path)
             os.replace(temporary, self.database_path)
             published = True
-            _remove_sqlite_sidecars(self.database_path)
             _apply_owner_only_permissions(self.database_path)
             self._initialize(_operation_locked=True)
             self.quick_check(_operation_locked=True)
@@ -665,6 +696,12 @@ class TaskDatabase:
                         f"rollback artifact: {preimage.rollback_artifact}"
                     ) from rollback_error
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            if (
+                not published
+                and isinstance(error, TaskDatabaseError)
+                and str(error) == _RESTORE_OFFLINE_MESSAGE
+            ):
                 raise
             raise TaskDatabaseError(
                 "Task database backup could not be restored safely"
@@ -898,6 +935,18 @@ def _prepare_operation_lock_path(database_path: Path) -> Path:
     lock_path = database_path.with_name(f"{database_path.name}.operation.lock")
     _assert_no_symlink_components(lock_path)
     _ensure_secure_database_file(lock_path)
+    if os.name == "nt":
+        descriptor = _open_operation_lock_file(lock_path)
+        try:
+            if os.fstat(descriptor).st_size < _WINDOWS_OPERATION_LOCK_BYTES:
+                os.ftruncate(descriptor, _WINDOWS_OPERATION_LOCK_BYTES)
+                os.fsync(descriptor)
+        except OSError as error:
+            raise TaskDatabaseError(
+                "Task database operation lock could not be initialized"
+            ) from error
+        finally:
+            os.close(descriptor)
     return lock_path
 
 
@@ -905,9 +954,147 @@ def _prepare_operation_lock_path(database_path: Path) -> Path:
 def _database_operation_lock(
     lock_path: Path,
     *,
+    exclusive: bool = False,
     timeout_seconds: float = _OPERATION_LOCK_TIMEOUT_SECONDS,
     busy_message: str = "Task database operation lock timed out",
 ) -> Iterator[None]:
+    state = _operation_barrier_state(lock_path)
+    if exclusive:
+        _enter_exclusive_operation(
+            state,
+            lock_path,
+            timeout_seconds=timeout_seconds,
+            busy_message=busy_message,
+        )
+        try:
+            yield
+        finally:
+            _leave_exclusive_operation(state)
+        return
+
+    nested_exclusive = _enter_shared_operation(
+        state,
+        lock_path,
+        timeout_seconds=timeout_seconds,
+        busy_message=busy_message,
+    )
+    try:
+        yield
+    finally:
+        if not nested_exclusive:
+            _leave_shared_operation(state)
+
+
+def _operation_barrier_state(lock_path: Path) -> _OperationBarrierState:
+    key = os.path.normcase(str(lock_path))
+    with _OPERATION_BARRIERS_LOCK:
+        return _OPERATION_BARRIERS.setdefault(key, _OperationBarrierState())
+
+
+def _enter_shared_operation(
+    state: _OperationBarrierState,
+    lock_path: Path,
+    *,
+    timeout_seconds: float,
+    busy_message: str,
+) -> bool:
+    thread_id = threading.get_ident()
+    deadline = time.monotonic() + timeout_seconds
+    with state.condition:
+        if state.exclusive_owner == thread_id:
+            return True
+        while state.exclusive_owner is not None or state.exclusive_pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TaskDatabaseError(busy_message)
+            state.condition.wait(min(remaining, _OPERATION_LOCK_RETRY_SECONDS))
+        if state.shared_count == 0:
+            state.shared_file_lock = _acquire_operation_file_lock(
+                lock_path,
+                exclusive=False,
+                timeout_seconds=max(0.0, deadline - time.monotonic()),
+                busy_message=busy_message,
+            )
+        state.shared_count += 1
+    return False
+
+
+def _leave_shared_operation(state: _OperationBarrierState) -> None:
+    held_lock: _HeldOperationFileLock | None = None
+    with state.condition:
+        if state.shared_count <= 0:
+            raise TaskDatabaseError("Task database shared lock state is invalid")
+        state.shared_count -= 1
+        if state.shared_count == 0:
+            held_lock = state.shared_file_lock
+            state.shared_file_lock = None
+    if held_lock is not None:
+        try:
+            _release_operation_file_lock(held_lock, exclusive=False)
+        finally:
+            with state.condition:
+                state.condition.notify_all()
+
+
+def _enter_exclusive_operation(
+    state: _OperationBarrierState,
+    lock_path: Path,
+    *,
+    timeout_seconds: float,
+    busy_message: str,
+) -> None:
+    thread_id = threading.get_ident()
+    with state.condition:
+        if state.exclusive_owner == thread_id:
+            state.exclusive_depth += 1
+            return
+        if (
+            state.shared_count > 0
+            or state.exclusive_owner is not None
+            or state.exclusive_pending
+        ):
+            raise TaskDatabaseError(busy_message)
+        state.exclusive_pending = True
+        try:
+            held_lock = _acquire_operation_file_lock(
+                lock_path,
+                exclusive=True,
+                timeout_seconds=timeout_seconds,
+                busy_message=busy_message,
+            )
+        except BaseException:
+            state.exclusive_pending = False
+            state.condition.notify_all()
+            raise
+        state.exclusive_pending = False
+        state.exclusive_owner = thread_id
+        state.exclusive_depth = 1
+        state.exclusive_file_lock = held_lock
+        state.condition.notify_all()
+
+
+def _leave_exclusive_operation(state: _OperationBarrierState) -> None:
+    held_lock: _HeldOperationFileLock | None = None
+    with state.condition:
+        if (
+            state.exclusive_owner != threading.get_ident()
+            or state.exclusive_depth <= 0
+        ):
+            raise TaskDatabaseError("Task database exclusive lock state is invalid")
+        state.exclusive_depth -= 1
+        if state.exclusive_depth == 0:
+            held_lock = state.exclusive_file_lock
+            state.exclusive_file_lock = None
+            state.exclusive_owner = None
+    if held_lock is not None:
+        try:
+            _release_operation_file_lock(held_lock, exclusive=True)
+        finally:
+            with state.condition:
+                state.condition.notify_all()
+
+
+def _open_operation_lock_file(lock_path: Path) -> int:
     _assert_safe_file(lock_path, required=True)
     flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOINHERIT", 0)
@@ -926,66 +1113,97 @@ def _database_operation_lock(
             descriptor_stat.st_ino,
         ) != (path_stat.st_dev, path_stat.st_ino):
             raise TaskDatabaseError("Task database operation lock path changed")
-        if descriptor_stat.st_size == 0:
-            os.write(descriptor, b"\0")
-            os.fsync(descriptor)
-        _acquire_operation_lock(
-            descriptor,
-            timeout_seconds=timeout_seconds,
-            busy_message=busy_message,
-        )
-        try:
-            yield
-        finally:
-            _release_operation_lock(descriptor)
-    except TaskDatabaseError:
-        raise
-    except OSError as error:
-        raise TaskDatabaseError("Task database operation lock failed") from error
-    finally:
+        return descriptor
+    except BaseException:
         os.close(descriptor)
+        raise
 
 
-def _acquire_operation_lock(
-    descriptor: int,
+def _acquire_operation_file_lock(
+    lock_path: Path,
     *,
+    exclusive: bool,
     timeout_seconds: float,
     busy_message: str,
-) -> None:
+) -> _HeldOperationFileLock:
+    descriptor = _open_operation_lock_file(lock_path)
     deadline = time.monotonic() + timeout_seconds
-    while True:
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except OSError as error:
-            if time.monotonic() >= deadline:
-                raise TaskDatabaseError(busy_message) from error
-            time.sleep(_OPERATION_LOCK_RETRY_SECONDS)
-
-
-def _release_operation_lock(descriptor: int) -> None:
     try:
         if os.name == "nt":
             import msvcrt
 
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            while True:
+                last_error: OSError | None = None
+                if exclusive:
+                    try:
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(
+                            descriptor,
+                            msvcrt.LK_NBLCK,
+                            _WINDOWS_OPERATION_LOCK_BYTES,
+                        )
+                        return _HeldOperationFileLock(descriptor, None)
+                    except OSError as error:
+                        last_error = error
+                else:
+                    first_slot = os.getpid() % _WINDOWS_OPERATION_LOCK_BYTES
+                    for offset in range(_WINDOWS_OPERATION_LOCK_BYTES):
+                        slot = (
+                            first_slot + offset
+                        ) % _WINDOWS_OPERATION_LOCK_BYTES
+                        try:
+                            os.lseek(descriptor, slot, os.SEEK_SET)
+                            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                            return _HeldOperationFileLock(descriptor, slot)
+                        except OSError as error:
+                            last_error = error
+                if time.monotonic() >= deadline:
+                    raise TaskDatabaseError(busy_message) from last_error
+                time.sleep(_OPERATION_LOCK_RETRY_SECONDS)
+
+        import fcntl
+
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        while True:
+            try:
+                fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+                return _HeldOperationFileLock(descriptor, None)
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    raise TaskDatabaseError(busy_message) from error
+                time.sleep(_OPERATION_LOCK_RETRY_SECONDS)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _release_operation_file_lock(
+    held_lock: _HeldOperationFileLock,
+    *,
+    exclusive: bool,
+) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            offset = 0 if exclusive else held_lock.reader_slot
+            if offset is None:
+                raise TaskDatabaseError(
+                    "Task database shared lock slot is missing"
+                )
+            length = _WINDOWS_OPERATION_LOCK_BYTES if exclusive else 1
+            os.lseek(held_lock.descriptor, offset, os.SEEK_SET)
+            msvcrt.locking(held_lock.descriptor, msvcrt.LK_UNLCK, length)
         else:
             import fcntl
 
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            fcntl.flock(held_lock.descriptor, fcntl.LOCK_UN)
     except OSError as error:
         raise TaskDatabaseError(
             "Task database operation lock could not be released"
         ) from error
+    finally:
+        os.close(held_lock.descriptor)
 
 
 def _prepare_output_path(path: str | Path) -> Path:
@@ -1092,31 +1310,29 @@ def _connect_database_file(path: Path, *, mode: str) -> sqlite3.Connection:
 
 @contextmanager
 def _offline_database_gate(path: Path) -> Iterator[sqlite3.Connection]:
-    connection = _connect_database_file(path, mode="rw")
+    write_gate = _connect_database_file(path, mode="rw")
+    source: sqlite3.Connection | None = None
     try:
-        connection.execute("PRAGMA busy_timeout = 0")
+        write_gate.execute("PRAGMA busy_timeout = 0")
         try:
-            connection.execute("BEGIN EXCLUSIVE")
+            write_gate.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as error:
-            raise TaskDatabaseError(
-                "Task database restore requires offline access"
-            ) from error
-        yield connection
+            raise TaskDatabaseError(_RESTORE_OFFLINE_MESSAGE) from error
+        source = _connect_database_file(path, mode="rw")
+        source.execute("PRAGMA busy_timeout = 0")
+        source.execute("BEGIN")
+        source.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
+        yield source
     finally:
         try:
-            connection.rollback()
+            if source is not None:
+                source.rollback()
+                source.close()
         finally:
-            connection.close()
-
-
-def _database_file_paths(database_path: Path) -> dict[str, Path]:
-    paths = {"": database_path}
-    for suffix in _SQLITE_SIDECAR_SUFFIXES:
-        sidecar = Path(f"{database_path}{suffix}")
-        if sidecar.exists():
-            _assert_safe_file(sidecar, required=True)
-            paths[suffix] = sidecar
-    return paths
+            try:
+                write_gate.rollback()
+            finally:
+                write_gate.close()
 
 
 def _file_sha256(path: Path) -> str:
@@ -1130,48 +1346,120 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _database_file_digests(database_path: Path) -> dict[str, str]:
-    return {
-        suffix: _file_sha256(path)
-        for suffix, path in _database_file_paths(database_path).items()
-    }
+def _database_content_hash(connection: sqlite3.Connection) -> str:
+    table_names = set(TASK_DATABASE_TABLES)
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+    ).fetchone():
+        table_names.add("sqlite_sequence")
 
-
-def _capture_restore_preimage(database_path: Path) -> _RestorePreimage:
-    source_paths = _database_file_paths(database_path)
-    source_digests = {
-        suffix: _file_sha256(path) for suffix, path in source_paths.items()
-    }
-    captured: dict[str, Path] = {}
-    try:
-        for suffix, source in source_paths.items():
-            artifact = _new_secure_temporary_file(
-                database_path.parent,
-                "rollback-preimage",
+    digest = hashlib.sha256()
+    for table_name in sorted(table_names):
+        quoted_table = _quote_sqlite_identifier(table_name)
+        columns = tuple(
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({quoted_table})")
+        )
+        if not columns:
+            raise TaskDatabaseError(
+                f"Task database table {table_name} has no readable columns"
             )
-            captured[suffix] = artifact
-            shutil.copyfile(source, artifact)
-            _apply_owner_only_permissions(artifact)
-            _sync_file(artifact)
-            if not _verify_owner_only_permissions(artifact):
-                raise TaskDatabaseError("rollback artifact permissions are unsafe")
-            if _file_sha256(artifact) != source_digests[suffix]:
-                raise TaskDatabaseError("rollback artifact does not match live data")
-        preimage = _RestorePreimage(files=captured, digests=source_digests)
-        _assert_live_matches_preimage(database_path, preimage)
-        return preimage
-    except BaseException:
-        for artifact in captured.values():
-            _remove_temporary_file(artifact)
-        raise
+        encoded_rows = sorted(
+            json.dumps(
+                [_encode_sqlite_value(value) for value in row],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            for row in connection.execute(f"SELECT * FROM {quoted_table}")
+        )
+        payload = json.dumps(
+            [table_name, columns, encoded_rows],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
 
 
-def _assert_live_matches_preimage(
+def _quote_sqlite_identifier(value: str) -> str:
+    escaped = value.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _encode_sqlite_value(value: object) -> tuple[str, str]:
+    if value is None:
+        return ("null", "")
+    if isinstance(value, bytes):
+        return ("blob", value.hex())
+    if isinstance(value, int):
+        return ("integer", str(value))
+    if isinstance(value, float):
+        return ("real", value.hex())
+    if isinstance(value, str):
+        return ("text", value)
+    raise TaskDatabaseError("Task database contains an unsupported SQLite value")
+
+
+def _capture_restore_preimage(
+    source: sqlite3.Connection,
     database_path: Path,
-    preimage: _RestorePreimage,
-) -> None:
-    if _database_file_digests(database_path) != preimage.digests:
-        raise TaskDatabaseError("live Task database changed during offline restore")
+) -> _RestorePreimage:
+    artifact = _new_secure_temporary_file(
+        database_path.parent,
+        "rollback-preimage",
+    )
+    try:
+        source_content_hash = _database_content_hash(source)
+        with closing(_connect_database_file(artifact, mode="rw")) as target:
+            source.backup(target)
+            target.commit()
+            journal_mode = target.execute("PRAGMA journal_mode = DELETE").fetchone()
+            if journal_mode is None or str(journal_mode[0]).casefold() != "delete":
+                raise TaskDatabaseError(
+                    "rollback artifact is not a standalone SQLite database"
+                )
+            _quick_check(target)
+            _validate_exact_schema(
+                target,
+                _EXPECTED_SCHEMA,
+                TASK_DATABASE_SCHEMA_VERSION,
+            )
+            if connection_errors := target.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall():
+                raise TaskDatabaseError(
+                    "rollback artifact foreign key check failed: "
+                    f"{len(connection_errors)} error(s)"
+                )
+            if _database_content_hash(target) != source_content_hash:
+                raise TaskDatabaseError(
+                    "rollback artifact does not match live database data"
+                )
+        _apply_owner_only_permissions(artifact)
+        _sync_file(artifact)
+        if not _verify_owner_only_permissions(artifact):
+            raise TaskDatabaseError("rollback artifact permissions are unsafe")
+        file_hash = _file_sha256(artifact)
+        with closing(_connect_database_file(artifact, mode="ro")) as readback:
+            _quick_check(readback)
+            _validate_exact_schema(
+                readback,
+                _EXPECTED_SCHEMA,
+                TASK_DATABASE_SCHEMA_VERSION,
+            )
+            if _database_content_hash(readback) != source_content_hash:
+                raise TaskDatabaseError("rollback artifact readback does not match")
+        if _file_sha256(artifact) != file_hash:
+            raise TaskDatabaseError("rollback artifact changed during readback")
+        return _RestorePreimage(
+            artifact=artifact,
+            file_hash=file_hash,
+            content_hash=source_content_hash,
+        )
+    except BaseException:
+        _remove_restore_artifact(artifact)
+        raise
 
 
 def _publish_preimage_file(source: Path, destination: Path) -> None:
@@ -1192,22 +1480,29 @@ def _restore_preimage(
     preimage: _RestorePreimage,
 ) -> None:
     _remove_sqlite_sidecars(database_path)
-    _publish_preimage_file(preimage.files[""], database_path)
-    for suffix in _SQLITE_SIDECAR_SUFFIXES:
-        artifact = preimage.files.get(suffix)
-        if artifact is not None:
-            _publish_preimage_file(artifact, Path(f"{database_path}{suffix}"))
-    _assert_live_matches_preimage(database_path, preimage)
+    _publish_preimage_file(preimage.artifact, database_path)
+    if _file_sha256(database_path) != preimage.file_hash:
+        raise TaskDatabaseError("rolled back Task database file is not exact")
     if not _verify_owner_only_permissions(database_path):
         raise TaskDatabaseError("rolled back Task database permissions are unsafe")
     with closing(_connect_database_file(database_path, mode="rw")) as connection:
         _quick_check(connection)
-        _validate_supported_schema(connection)
+        _validate_exact_schema(
+            connection,
+            _EXPECTED_SCHEMA,
+            TASK_DATABASE_SCHEMA_VERSION,
+        )
+        if _database_content_hash(connection) != preimage.content_hash:
+            raise TaskDatabaseError("rolled back Task database data does not match")
 
 
 def _remove_restore_preimage(preimage: _RestorePreimage) -> None:
-    for artifact in preimage.files.values():
-        _remove_temporary_file(artifact)
+    _remove_restore_artifact(preimage.artifact)
+
+
+def _remove_restore_artifact(artifact: Path) -> None:
+    _remove_sqlite_sidecars(artifact)
+    _remove_temporary_file(artifact)
 
 
 def _new_secure_temporary_file(directory: Path, purpose: str) -> Path:
