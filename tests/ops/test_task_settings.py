@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import pytest
 
-import forge.ops.task_settings as task_settings_module
+import forge.ops.task_database as task_database_module
 from forge.ops.task_options import MergeMode, TaskFlow
 from forge.ops.task_settings import (
     TASK_SETTINGS_FORMAT,
@@ -743,7 +743,7 @@ def test_new_database_has_exact_schema_version_and_terminal_index(
             ("task_settings_one_terminal_event",),
         ).fetchone()
 
-    assert version == 1
+    assert version == 2
     assert index_sql is not None
     normalized_index_sql = " ".join(index_sql[0].split()).lower()
     assert "unique index" in normalized_index_sql
@@ -836,13 +836,7 @@ def test_store_normalizes_commit_error(
     real_connect = sqlite3.connect
 
     class CommitFailingConnection(sqlite3.Connection):
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            traceback: object,
-        ) -> bool:
-            del exc_type, exc_value, traceback
+        def commit(self) -> None:
             raise sqlite3.OperationalError("forced commit failure")
 
     def connect_with_commit_failure(
@@ -852,7 +846,7 @@ def test_store_normalizes_commit_error(
         return real_connect(*args, **kwargs)
 
     monkeypatch.setattr(
-        task_settings_module.sqlite3,
+        task_database_module.sqlite3,
         "connect",
         connect_with_commit_failure,
     )
@@ -872,15 +866,8 @@ def test_store_normalizes_rollback_error(
     real_connect = sqlite3.connect
 
     class RollbackFailingConnection(sqlite3.Connection):
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            traceback: object,
-        ) -> bool:
-            if exc_type is not None:
-                raise sqlite3.OperationalError("forced rollback failure")
-            return super().__exit__(exc_type, exc_value, traceback)
+        def rollback(self) -> None:
+            raise sqlite3.OperationalError("forced rollback failure")
 
     def connect_with_rollback_failure(
         *args: object, **kwargs: object
@@ -889,7 +876,7 @@ def test_store_normalizes_rollback_error(
         return real_connect(*args, **kwargs)
 
     monkeypatch.setattr(
-        task_settings_module.sqlite3,
+        task_database_module.sqlite3,
         "connect",
         connect_with_rollback_failure,
     )
