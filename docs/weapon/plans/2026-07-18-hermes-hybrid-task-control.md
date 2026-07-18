@@ -73,27 +73,27 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 - Produces: `choice_prompt_id`, `choice_mode`, bounds, `expires_at`, stable choices
 - Preserves: current exact-ID text fallback and `TurnResult.choices`
 
-- [ ] **Step 1: single·multiple·stale·expiry 계약 test 작성**
+- [x] **Step 1: single·multiple·stale·expiry 계약 test 작성**
 
   single은 정확히 1개, multiple은 최소 1개를 요구하고 unknown·duplicate ID, stale prompt,
   만료된 submission이 외부 state를 바꾸지 않는 test를 먼저 작성한다.
 
-- [ ] **Step 2: RED 확인**
+- [x] **Step 2: RED 확인**
 
   Run: `python -m pytest tests/ops/test_choice_prompt.py tests/ops/test_task_setup.py -q`
 
   Expected: `ChoicePrompt`와 structured submission API가 없어 FAIL
 
-- [ ] **Step 3: immutable chooser value와 setup pending prompt 구현**
+- [x] **Step 3: immutable chooser value와 setup pending prompt 구현**
 
   setup draft의 실제 30분 만료와 `expires_at`을 같게 만들고, Cancel·Esc 의미는 선택 적용 0회로
   고정한다. 선택을 처리한 `TurnResult`는 항상 `handled`다.
 
-- [ ] **Step 4: plugin이 전체 chooser metadata를 fail-closed하게 전달**
+- [x] **Step 4: plugin이 전체 chooser metadata를 fail-closed하게 전달**
 
   malformed metadata나 ID·label 중복은 choice를 버리고 모델을 호출하지 않는 오류를 반환한다.
 
-- [ ] **Step 5: 관련 test 통과 후 commit**
+- [x] **Step 5: 관련 test 통과 후 commit**
 
   Run: `python -m pytest tests/ops/test_choice_prompt.py tests/ops/test_task_setup.py tests/hermes_plugin/test_infinity_forge_plugin.py -q`
 
