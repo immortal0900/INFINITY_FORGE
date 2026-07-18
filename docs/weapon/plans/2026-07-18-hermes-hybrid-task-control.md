@@ -114,29 +114,29 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 - Single keys: `Up`, `Down`, `Enter`, numeric shortcut, `Esc`
 - Multiple keys: `Up`, `Down`, `Space`, `Enter/Done`, `Esc`
 
-- [ ] **Step 1: 현재 text 목록만 붙이는 regression test를 방향키 modal 계약으로 확장**
+- [x] **Step 1: 현재 text 목록만 붙이는 regression test를 방향키 modal 계약으로 확장**
 
   기존 `_prompt_text_input_modal`의 app-loop handoff와 draft restore를 재사용하며 curses/stdin reader를
   호출하지 않는 source transform test를 작성한다.
 
-- [ ] **Step 2: RED 확인**
+- [x] **Step 2: RED 확인**
 
   Run: `python -m pytest tests/hermes/test_installer.py tests/hermes/test_pre_user_turn_contract.py -q`
 
   Expected: installer가 `_choice_display_lines`만 생성해 FAIL
 
-- [ ] **Step 3: generic modal carried patch 구현**
+- [x] **Step 3: generic modal carried patch 구현**
 
   `RISK(breaking)` 주석과 함께 기존 slash-confirm wrapper는 유지한다. 빈 multiple의 Enter,
   non-TTY, modal 자체 timeout, Esc는 어떠한 stable ID도 제출하지 않게 한다. UI timeout은 server
   setup expiry를 변경하지 않는다.
 
-- [ ] **Step 4: stable structured submission을 동일 user-turn 경로로 재진입**
+- [x] **Step 4: stable structured submission을 동일 user-turn 경로로 재진입**
 
   선택은 label text가 아니라 `choice_prompt_id + selected_choice_ids`로 전달하며 handled result의
   API calls가 0인지 검증한다.
 
-- [ ] **Step 5: Forge와 Hermes fixture test 통과 후 commit**
+- [x] **Step 5: Forge와 Hermes fixture test 통과 후 commit**
 
   Run: `python -m pytest tests/hermes/ tests/ops/test_workflow_contract.py -q`
 
