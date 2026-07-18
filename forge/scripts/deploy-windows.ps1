@@ -9,18 +9,32 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-$HermesChangeTargets = @(
-  "hermes_cli\plugins.py",
-  "agent\conversation_loop.py",
-  "run_agent.py",
-  "cli.py",
-  "tui_gateway\server.py",
-  "gateway\run.py"
-)
 
 function Assert-ExternalCommand {
   param([Parameter(Mandatory = $true)][string]$Message)
   if ($LASTEXITCODE -ne 0) { throw $Message }
+}
+
+function Get-HermesChangeTargets {
+  $manifestObject = "$Commit`:forge/hermes_change/targets.json"
+  $manifestJson = (& git -C $Repo show $manifestObject | Out-String)
+  Assert-ExternalCommand "Hermes change target manifest is unavailable at the requested commit."
+  try {
+    $targets = @($manifestJson | ConvertFrom-Json)
+  } catch {
+    throw "Hermes change target manifest is invalid."
+  }
+  if ($targets.Count -eq 0 -or @($targets | Select-Object -Unique).Count -ne $targets.Count) {
+    throw "Hermes change target manifest must contain unique paths."
+  }
+  foreach ($target in $targets) {
+    if ($target -isnot [string] -or [string]::IsNullOrWhiteSpace($target) -or
+        [IO.Path]::IsPathRooted($target) -or $target.Contains("\") -or
+        $target.Split("/").Contains("..")) {
+      throw "Hermes change target manifest contains an unsafe path."
+    }
+  }
+  return $targets
 }
 
 function Get-HermesRuntimeFingerprint {
@@ -40,7 +54,7 @@ print(digest.hexdigest()[:40])
 '@
   $fingerprint = (
     & $Paths.HermesPython -c $fingerprintScript `
-      $Paths.HermesRoot @HermesChangeTargets
+      $Paths.HermesRoot @($Paths.HermesChangeTargets)
   ).Trim()
   Assert-ExternalCommand "Hermes runtime fingerprint cannot be computed."
   if ($fingerprint -notmatch '^[0-9a-f]{40}$') {
@@ -126,6 +140,7 @@ function Test-ForgeWindowsPreflight {
     TaskOutboxDB = (Join-Path $taskData "task-settings.db.task-outbox.db")
     KanbanDB = (Join-Path $hermesHome "kanban.db")
     PackageRoot = (Join-Path $taskData "hermes-user-turn-changes")
+    HermesChangeTargets = @()
   }
 
   foreach ($path in @(
@@ -146,7 +161,8 @@ function Test-ForgeWindowsPreflight {
   if ($repoCommit -ne $Commit) {
     throw "Requested Forge commit did not resolve exactly."
   }
-  foreach ($target in $HermesChangeTargets) {
+  $paths.HermesChangeTargets = @(Get-HermesChangeTargets)
+  foreach ($target in $paths.HermesChangeTargets) {
     if (-not (Test-Path -PathType Leaf -LiteralPath (
       Join-Path $paths.HermesRoot $target
     ))) {
@@ -303,6 +319,10 @@ function New-HermesChangePackage {
     if ($manifest.source_version -ne $packageVersion) {
       throw "Existing Hermes change package has a different version."
     }
+    $manifestTargets = @($manifest.files | ForEach-Object { $_.path })
+    if (@(Compare-Object $Paths.HermesChangeTargets $manifestTargets).Count -ne 0) {
+      throw "Existing Hermes change package has unexpected target paths."
+    }
     return [pscustomobject]@{
       Path = $packagePath
       Version = $packageVersion
@@ -317,8 +337,8 @@ function New-HermesChangePackage {
   $packageTemp = Join-Path $Paths.PackageRoot "._b-$suffix"
   try {
     New-Item -ItemType Directory -Path $sourceTemp | Out-Null
-    # Gateway가 중지된 동안 실제 Desktop runtime의 여섯 source만 snapshot한다.
-    foreach ($target in $HermesChangeTargets) {
+    # Gateway가 중지된 동안 exact manifest의 모든 production/test target을 snapshot한다.
+    foreach ($target in $Paths.HermesChangeTargets) {
       $destination = Join-Path $sourceTemp $target
       New-Item -ItemType Directory -Force -Path (
         Split-Path -Parent $destination
@@ -617,6 +637,10 @@ for database in databases:
         connection.close()
 '@
   Invoke-WithReleasePythonPath -ReleasePath $ReleasePath -Action {
+    & $Paths.HermesPython (
+      Join-Path $ReleasePath "forge\scripts\install-hermes-change.py"
+    ) "verify" --hermes-root $Paths.HermesRoot --package $PackagePath | Out-Host
+    Assert-ExternalCommand "Windows Hermes change verification failed."
     & $Paths.HermesPython -c $verifyPython $ReleasePath $PackagePath `
       $Paths.HermesRoot $Paths.EnvFile $Paths.TaskSettingsDB `
       $Paths.TaskOutboxDB $Paths.KanbanDB

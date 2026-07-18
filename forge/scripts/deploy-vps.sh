@@ -362,6 +362,9 @@ EXPECTED_PACKAGE_VERSION="$CHANGE_PACKAGE_VERSION" CHANGE_PACKAGE="$CHANGE_PACKA
 "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" install \
   --hermes-root "$HERMES_ROOT" \
   --package "$CHANGE_PACKAGE"
+"$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" verify \
+  --hermes-root "$HERMES_ROOT" \
+  --package "$CHANGE_PACKAGE"
 
 # 플러그인 세 파일을 버전 디렉터리에 먼저 완성한 뒤 stable link만
 # 교체한다. 기존 일반 디렉터리는 plugins 밖으로 옮겨 롤백용으로 보존한다.

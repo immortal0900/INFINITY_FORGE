@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -83,7 +84,16 @@ def test_windows_release_is_archive_based_and_atomically_promoted() -> None:
 def test_windows_hermes_package_uses_live_runtime_snapshot() -> None:
     script = _script()
 
-    assert "$HermesChangeTargets = @(" in script
+    target_manifest = (
+        ROOT / "forge" / "hermes_change" / "targets.json"
+    )
+    targets = json.loads(target_manifest.read_text(encoding="utf-8"))
+
+    assert len(targets) == 19
+    assert len(targets) == len(set(targets))
+    assert "$HermesChangeTargets = @(" not in script
+    assert '"$Commit`:forge/hermes_change/targets.json"' in script
+    assert "$Paths.HermesChangeTargets" in script
     assert "function Get-HermesRuntimeFingerprint" in script
     assert (
         "Copy-Item -LiteralPath (Join-Path $Paths.HermesRoot $target)"

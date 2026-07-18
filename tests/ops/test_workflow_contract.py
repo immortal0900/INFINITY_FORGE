@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -12,6 +13,7 @@ DEPLOY = ROOT / "forge" / "scripts" / "deploy-vps.sh"
 LOCAL_DEPLOY = ROOT / "forge" / "scripts" / "deploy.ps1"
 WINDOWS_DEPLOY = ROOT / "forge" / "scripts" / "deploy-windows.ps1"
 HERMES_INSTALLER = ROOT / "forge" / "hermes_change" / "installer.py"
+HERMES_TARGETS = ROOT / "forge" / "hermes_change" / "targets.json"
 
 
 def test_eval_is_the_single_stable_ruleset_context() -> None:
@@ -318,6 +320,21 @@ def test_deployable_hermes_change_carries_the_classic_cli_chooser() -> None:
     assert 'install-hermes-change.py" build' in server_deploy
     assert '--hermes-root "$HERMES_SOURCE_TEMP"' in server_deploy
     assert '"cli.py"' in windows_deploy
+
+
+def test_all_deployments_use_the_exact_hermes_change_target_manifest() -> None:
+    targets = json.loads(HERMES_TARGETS.read_text(encoding="utf-8"))
+    installer = HERMES_INSTALLER.read_text(encoding="utf-8")
+    server_deploy = DEPLOY.read_text(encoding="utf-8")
+    windows_deploy = WINDOWS_DEPLOY.read_text(encoding="utf-8")
+
+    assert len(targets) == 19
+    assert len(targets) == len(set(targets))
+    assert all("\\" not in target and not Path(target).is_absolute() for target in targets)
+    assert "_load_change_targets" in installer
+    assert 'forge/hermes_change/targets.json' in windows_deploy
+    assert '"$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" install' in server_deploy
+    assert '"$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" verify' in server_deploy
 
 
 def test_hermes_change_package_is_version_bound_and_committed_atomically() -> None:

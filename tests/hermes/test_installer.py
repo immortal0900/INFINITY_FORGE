@@ -21,6 +21,9 @@ from forge.hermes_change.installer import (
 )
 
 
+ROOT = Path(__file__).resolve().parents[2]
+
+
 PLUGIN_SOURCE = '''VALID_HOOKS: set[str] = {
     "pre_gateway_dispatch",
 }
@@ -226,6 +229,7 @@ def process(self, agent_message, message, stream_callback):
 '''
 
 TUI_GATEWAY_SOURCE = '''import copy
+import sys
 import threading
 import time
 import uuid
@@ -249,51 +253,119 @@ def prompt_submit(rid, params):
         session["running"] = True
     return None
 
-def process(agent, history, _stream, session, text, raw, status):
+def process(agent, history, _stream, session, sid, text, raw, status):
     run_kwargs = {
         "conversation_history": list(history),
         "stream_callback": _stream,
     }
-    result = agent.run_conversation(text, **run_kwargs)
-    payload = {"text": raw, "usage": _get_usage(agent), "status": status}
-    if status == "complete" and isinstance(raw, str) and raw.strip():
-        evaluate_goal()
-    if (
-        status == "complete"
-        and isinstance(raw, str)
-        and raw.strip()
-        and isinstance(text, str)
-        and text.strip()
-    ):
-        maybe_auto_title()
-    return payload
+    goal_followup = None
+    try:
+        result = agent.run_conversation(text, **run_kwargs)
+        payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+        with session["history_lock"]:
+            _clear_inflight_turn(session)
+        _emit("message.complete", sid, payload)
+        if status == "complete" and isinstance(raw, str) and raw.strip():
+            evaluate_goal()
+        if (
+            status == "complete"
+            and isinstance(raw, str)
+            and raw.strip()
+            and isinstance(text, str)
+            and text.strip()
+        ):
+            maybe_auto_title()
+        return payload
+    except Exception as error:
+        _emit("error", sid, {"message": str(error)})
+    finally:
+        with session["history_lock"]:
+            session["running"] = False
+            session["last_active"] = time.time()
+            _clear_inflight_turn(session)
+        _emit("session.info", sid, _session_info(agent, session))
 '''
 
-GATEWAY_SOURCE = '''def deliver(agent_result):
-    response = agent_result.get("final_response") or ""
-    return response
+GATEWAY_SOURCE = '''class Gateway:
+    async def handle_event(self, event, source, session_id, session_key, history, persist_user_message, persist_user_timestamp):
+        agent_result = await self._run_agent(
+                "message", "context", history, source, session_id,
+                session_key=session_key,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+            )
+        try:
+            response = agent_result.get("final_response") or ""
+            return response
 
-def handle(self, event, source):
-    _agent_result = self._handle_message_with_agent(event, source)
-    _final_text = str(_agent_result.get("final_response") or "")
-    if _final_text.strip():
-        self._post_turn_goal_continuation()
-    return _agent_result
+        except Exception as e:
+            return str(e)
 
-def run(self, agent, agent_history, session_id, final_response):
-    _conversation_kwargs = {
-        "conversation_history": agent_history,
-        "task_id": session_id,
-    }
-    result = agent.run_conversation("message", **_conversation_kwargs)
-    result_holder = [result]
-    if final_response and self._session_db:
-        maybe_auto_title()
-    return {
-        "final_response": final_response,
-        "last_reasoning": result.get("last_reasoning"),
-        "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
-    }
+    def handle(self, event, source):
+        _agent_result = self._handle_message_with_agent(event, source)
+        _final_text = str(_agent_result.get("final_response") or "")
+        if _final_text.strip():
+            self._post_turn_goal_continuation()
+        return _agent_result
+
+    async def _run_agent(
+        self,
+        message,
+        context_prompt,
+        history,
+        source,
+        session_id,
+        session_key=None,
+        persist_user_message=None,
+        persist_user_timestamp: Optional[float] = None,
+    ):
+        if not self.multiplex_profiles:
+            return await self._run_agent_inner(
+                message, context_prompt, history, source, session_id,
+                session_key=session_key,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+            )
+        with self.profile_scope():
+            return await self._run_agent_inner(
+                message, context_prompt, history, source, session_id,
+                session_key=session_key,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+            )
+
+    async def _run_agent_inner(
+        self,
+        message,
+        context_prompt,
+        history,
+        source,
+        session_id,
+        session_key=None,
+        persist_user_message=None,
+        persist_user_timestamp: Optional[float] = None,
+    ):
+        if self._get_proxy_url():
+            return await self._run_agent_via_proxy(message)
+        _run_message = message
+        _api_run_message = _wrap_current_message_with_observed_context(
+            _run_message,
+            {},
+        )
+        _conversation_kwargs = {
+            "conversation_history": history,
+            "task_id": session_id,
+        }
+        result = self.agent.run_conversation(_api_run_message, **_conversation_kwargs)
+        result_holder = [result]
+        final_response = result.get("final_response", "")
+        if final_response and self._session_db:
+            maybe_auto_title()
+        return {
+            "final_response": final_response,
+            "last_reasoning": result.get("last_reasoning"),
+            "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
+        }
 '''
 
 TUI_GATEWAY_TYPES_SOURCE = """export interface PromptSubmitResponse {
@@ -376,11 +448,15 @@ DESKTOP_CHAT_MESSAGES_SOURCE = """export type GatewayEventPayload = {
 """
 
 DESKTOP_PROMPTS_STORE_SOURCE = """import { atom, computed, type ReadableAtom } from 'nanostores'
+import { $clarifyRequest } from './clarify'
 import { $activeSessionId } from './session'
 
 const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
 interface KeyedPrompt { sessionId: string | null }
-function keyedPromptStore<T extends KeyedPrompt>() { return {} as any }
+function keyedPromptStore<T extends KeyedPrompt>() {
+  const idOf = (value: T): string | undefined => (value as { requestId?: string }).requestId
+  return {} as any
+}
 export interface ApprovalRequest extends KeyedPrompt {
   command: string
   description: string
@@ -389,7 +465,10 @@ const approval = keyedPromptStore<ApprovalRequest>()
 const sudo = keyedPromptStore<ApprovalRequest>()
 const secret = keyedPromptStore<ApprovalRequest>()
 export const $approvalRequest = approval.$active
-export const $activeSessionAwaitingInput = computed($activeSessionId, value => Boolean(value && false))
+export const $activeSessionAwaitingInput = computed(
+  [$clarifyRequest, $approvalRequest, $sudoRequest, $secretRequest],
+  (clarify, approval, sudo, secret) => Boolean(clarify || approval || sudo || secret)
+)
 export function clearAllPrompts(sessionId?: string | null): void {
   if (sessionId === undefined) {
     approval.reset()
@@ -403,26 +482,29 @@ export function clearAllPrompts(sessionId?: string | null): void {
 }
 """
 
-DESKTOP_GATEWAY_EVENT_SOURCE = """import { clearAllPrompts } from '@/store/prompts'
+DESKTOP_GATEWAY_EVENT_SOURCE = """import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 
 export function onGatewayEvent(event: any, sessionId: string | null) {
   const payload = event.payload
-  if (event.type === 'message.start') {
+  if (event.type === 'message.delta') {
+    return
+  } else if (event.type === 'message.start') {
     return
   } else if (event.type === 'message.complete') {
     if (!sessionId) return
     clearAllPrompts(sessionId)
-    completeAssistantMessage(sessionId, payload?.text || '')
+    const finalText = payload?.text || ''
+    completeAssistantMessage(sessionId, finalText)
   }
 }
 """
 
 DESKTOP_PROMPT_OVERLAYS_SOURCE = """'use client'
 import { useStore } from '@nanostores/react'
-import { useState } from 'react'
+import { type FormEvent, useCallback, useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { $gateway } from '@/store/gateway'
-import { $secretRequest, $sudoRequest } from '@/store/prompts'
+import { $secretRequest, $sudoRequest, clearSecretRequest, clearSudoRequest } from '@/store/prompts'
 
 export function PromptOverlays() {
   return (
@@ -596,6 +678,10 @@ def test_carried_change_targets_user_surfaces_and_forwarder(tmp_path: Path) -> N
         "apps/desktop/src/store/prompts.test.ts",
         "tests/gateway/test_slack_approval_buttons.py",
     }
+    target_manifest = json.loads(
+        (ROOT / "forge" / "hermes_change" / "targets.json").read_text(encoding="utf-8")
+    )
+    assert [item.path for item in manifest.files] == target_manifest
 
 
 def test_tui_chooser_payload_is_session_keyed_and_never_becomes_prompt_text() -> None:
@@ -655,6 +741,55 @@ def test_desktop_chooser_has_separate_keyed_store_and_accessible_controls() -> N
     assert "prompt.submit" not in changed_overlays
 
 
+def test_chooser_submit_errors_preserve_retryable_prompts() -> None:
+    changed_tui = installer.change_tui_prompts_source(TUI_PROMPTS_SOURCE)
+    changed_desktop = installer.change_desktop_prompt_overlays_source(
+        DESKTOP_PROMPT_OVERLAYS_SOURCE
+    )
+
+    for changed in (changed_tui, changed_desktop):
+        assert "choiceSubmitErrorDisposition" in changed
+        assert "session busy" in changed
+        assert "clearPrompt" in changed
+        catch_block = changed.split("catch", 1)[1]
+        assert "if (failure.clearPrompt)" in catch_block
+
+
+def test_desktop_chooser_supports_roving_keyboard_and_aria_without_default() -> None:
+    changed = installer.change_desktop_prompt_overlays_source(
+        DESKTOP_PROMPT_OVERLAYS_SOURCE
+    )
+
+    assert "export function choiceKeyboardAction" in changed
+    assert "ArrowDown" in changed and "ArrowUp" in changed
+    assert "key === ' '" in changed
+    assert "key === 'Enter'" in changed
+    assert "event.key" in changed
+    assert "tabIndex={" in changed
+    assert "aria-checked={" in changed
+    assert "useRef" in changed
+
+
+def test_desktop_prompt_store_missing_production_awaiting_input_anchor_fails() -> None:
+    broken = DESKTOP_PROMPTS_STORE_SOURCE.replace(
+        "  (clarify, approval, sudo, secret) => Boolean(clarify || approval || sudo || secret)",
+        "  () => false",
+    )
+
+    with pytest.raises(InstallError, match="awaiting input"):
+        installer.change_desktop_prompts_store_source(broken)
+
+
+def test_desktop_gateway_missing_production_import_seam_fails() -> None:
+    broken = DESKTOP_GATEWAY_EVENT_SOURCE.replace(
+        "clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest",
+        "clearAllPrompts",
+    )
+
+    with pytest.raises(InstallError, match="import anchor"):
+        installer.change_desktop_gateway_event_source(broken)
+
+
 def test_tui_gateway_claims_structured_choice_once_and_rejects_invalid_ids() -> None:
     changed = installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE)
 
@@ -704,6 +839,98 @@ def test_tui_gateway_rejects_cross_transport_claim_and_normal_turn_revokes_promp
     assert "_choice_prompt" not in session
 
 
+def test_tui_gateway_publishes_after_finalization_to_the_captured_owner_transport() -> None:
+    changed = installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE)
+    namespace: dict[str, object] = {
+        "_clear_inflight_turn": lambda session: None,
+        "_err": lambda rid, code, message: {"error": {"code": code, "message": message}},
+        "_sess_nowait": lambda params, rid: (None, {"error": "unused"}),
+        "_stdio_transport": object(),
+        "evaluate_goal": lambda: None,
+        "maybe_auto_title": lambda: None,
+        "_get_usage": lambda agent: {},
+    }
+    exec(changed, namespace)
+
+    rebound_frames: list[dict] = []
+    rebound_transport = types.SimpleNamespace(write=lambda frame: rebound_frames.append(frame))
+    observed: dict[str, object] = {}
+    session = {
+        "history_lock": threading.RLock(),
+        "running": True,
+    }
+
+    class OwnerTransport:
+        def write(self, frame: dict) -> bool:
+            observed["running_at_delivery"] = session["running"]
+            observed["owner_at_delivery"] = session["_choice_prompt"]["_owner_transport"]
+            acquired_during_write = threading.Event()
+
+            def rebind() -> None:
+                with session["history_lock"]:
+                    acquired_during_write.set()
+                    session["transport"] = rebound_transport
+
+            resume_thread = threading.Thread(target=rebind)
+            resume_thread.start()
+            assert not acquired_during_write.wait(0.05)
+            observed["resume_thread"] = resume_thread
+            observed["acquired_during_write"] = acquired_during_write
+            observed["frame"] = frame
+            return True
+
+    owner_transport = OwnerTransport()
+    session["transport"] = owner_transport
+    payload = {**_valid_cli_prompt(), "status": "complete", "text": "Choose"}
+
+    namespace["_finalize_gateway_choice_turn"]("session-1", session, payload)
+    observed["resume_thread"].join(timeout=1)
+
+    assert observed["acquired_during_write"].is_set()
+    assert observed["running_at_delivery"] is False
+    assert observed["owner_at_delivery"] is owner_transport
+    assert observed["frame"]["params"]["type"] == "message.complete"
+    assert session["transport"] is rebound_transport
+    assert session["_choice_prompt"]["_owner_transport"] is owner_transport
+    assert rebound_frames == []
+
+
+def test_tui_gateway_failed_choice_delivery_cleans_prompt_and_keeps_finalization() -> None:
+    changed = installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE)
+    namespace: dict[str, object] = {
+        "_clear_inflight_turn": lambda session: None,
+        "_err": lambda rid, code, message: {"error": {"code": code, "message": message}},
+        "_sess_nowait": lambda params, rid: (None, {"error": "unused"}),
+        "_stdio_transport": object(),
+        "evaluate_goal": lambda: None,
+        "maybe_auto_title": lambda: None,
+        "_get_usage": lambda agent: {},
+    }
+    exec(changed, namespace)
+    session = {
+        "history_lock": threading.RLock(),
+        "running": True,
+        "transport": types.SimpleNamespace(write=lambda frame: (_ for _ in ()).throw(OSError("closed"))),
+    }
+
+    namespace["_finalize_gateway_choice_turn"](
+        "session-1", session, {**_valid_cli_prompt(), "status": "complete", "text": "Choose"}
+    )
+
+    assert session["running"] is False
+    assert "_choice_prompt" not in session
+
+
+def test_tui_gateway_defers_only_choice_completion_and_initializes_error_path() -> None:
+    changed = installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE)
+
+    assert "_choice_completion_payload = None" in changed
+    assert 'if _choice_completion_payload is None:\n            _emit("message.complete"' in changed
+    assert changed.index("_finalize_gateway_choice_turn(") < changed.index(
+        '_emit("session.info"'
+    )
+
+
 def test_slack_chooser_uses_signed_action_context_and_exact_id_fallback() -> None:
     changed = installer.change_slack_adapter_source(SLACK_ADAPTER_SOURCE)
     changed_gateway = installer.change_gateway_source(GATEWAY_SOURCE)
@@ -718,6 +945,13 @@ def test_slack_chooser_uses_signed_action_context_and_exact_id_fallback() -> Non
     assert "_choice_reply_prompts" in changed
     assert "ID — Label" in changed_gateway
     assert "structured_user_message" in changed_gateway
+
+
+def test_gateway_missing_production_structured_runner_seam_fails() -> None:
+    broken = GATEWAY_SOURCE.replace("async def _run_agent(", "async def _run_agent_missing(")
+
+    with pytest.raises(InstallError, match="runner seam"):
+        installer.change_gateway_source(broken)
 
 
 def test_slack_expired_and_superseded_prompts_do_not_consume_normal_messages() -> None:
@@ -1379,9 +1613,12 @@ def test_cli_reentries_keep_only_base_history_until_chat_reaches_the_model(
 
 def test_tui_transports_choice_objects_in_message_payload() -> None:
     namespace: dict[str, object] = {
+        "_clear_inflight_turn": lambda session: None,
+        "_emit": lambda *args: None,
         "evaluate_goal": lambda: None,
         "maybe_auto_title": lambda: None,
         "_get_usage": lambda agent: {},
+        "_session_info": lambda agent, session: {},
     }
     exec(installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE), namespace)
     prompt = {
@@ -1406,7 +1643,12 @@ def test_tui_transports_choice_objects_in_message_payload() -> None:
         Agent(),
         [],
         None,
-        {"history_lock": threading.RLock(), "transport": object()},
+        {
+            "history_lock": threading.RLock(),
+            "running": True,
+            "transport": types.SimpleNamespace(write=lambda frame: True),
+        },
+        "session-1",
         "request",
         "Choose checks.",
         "handled",
@@ -1416,37 +1658,12 @@ def test_tui_transports_choice_objects_in_message_payload() -> None:
 
 
 def test_gateway_displays_choice_labels_without_changing_stable_ids() -> None:
-    namespace: dict[str, object] = {}
-    exec(installer.change_gateway_source(GATEWAY_SOURCE), namespace)
-    choices = [
-        {"id": "manual", "label": "Manual Merge"},
-        {"id": "safe_auto", "label": "Safe Files Auto-Merge"},
-    ]
+    changed = installer.change_gateway_source(GATEWAY_SOURCE)
 
-    class Agent:
-        @staticmethod
-        def run_conversation(message, **kwargs):
-            assert kwargs["is_user_turn"] is True
-            return {
-                "final_response": "Choose one.",
-                "choices": choices,
-                "handled": True,
-            }
-
-    gateway = type("Gateway", (), {"_session_db": False})()
-    result = namespace["run"](
-        gateway,
-        Agent(),
-        [],
-        "session-1",
-        "Choose one.",
-    )
-
-    response = namespace["deliver"](result)
-
-    assert result["choices"] == choices
-    assert "- Manual Merge" in response
-    assert "- Safe Files Auto-Merge" in response
+    assert "Available choices:" in changed
+    assert "[id: {_choice_id}]" in changed
+    assert '_choice["id"]' in changed
+    assert '_choice["label"]' in changed
 
 
 def test_build_install_and_restore_round_trip(tmp_path: Path) -> None:

@@ -27,6 +27,28 @@ class InstallError(RuntimeError):
     """Raised when a source hash, package file, or source anchor is unsafe."""
 
 
+def _load_change_targets() -> tuple[str, ...]:
+    """Load the deploy-visible target manifest shared with platform scripts."""
+
+    try:
+        payload = json.loads(Path(__file__).with_name("targets.json").read_text("utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise InstallError("Hermes change target manifest is missing or invalid") from error
+    if not isinstance(payload, list) or not payload:
+        raise InstallError("Hermes change target manifest must be a non-empty array")
+    targets: list[str] = []
+    for target in payload:
+        if not isinstance(target, str) or not target or "\\" in target:
+            raise InstallError("Hermes change target must be a POSIX relative path")
+        path = Path(target)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise InstallError("Hermes change target must stay below the Hermes root")
+        targets.append(target)
+    if len(targets) != len(set(targets)):
+        raise InstallError("Hermes change target manifest contains duplicates")
+    return tuple(targets)
+
+
 @dataclass(frozen=True)
 class ChangedSourceFile:
     path: str
@@ -496,6 +518,32 @@ def _insert_in_unique_sequence(
     newline = "\r\n" if original.endswith("\r\n") else "\n"
     indent = original[: len(original) - len(original.lstrip())]
     lines.insert(index + 1, f"{indent}{addition}{newline}")
+    return "".join(lines)
+
+
+def _replace_unique_sequence(
+    source: str,
+    sequence: tuple[str, ...],
+    replacement: tuple[str, ...],
+    *,
+    label: str,
+) -> str:
+    lines = source.splitlines(keepends=True)
+    stripped = [line.strip() for line in lines]
+    matches = [
+        index
+        for index in range(len(lines) - len(sequence) + 1)
+        if tuple(stripped[index : index + len(sequence)]) == sequence
+    ]
+    if len(matches) != 1:
+        raise InstallError(f"{label} anchor is not unique")
+    index = matches[0]
+    original = lines[index]
+    newline = "\r\n" if original.endswith("\r\n") else "\n"
+    indent = original[: len(original) - len(original.lstrip())]
+    lines[index : index + len(sequence)] = [
+        f"{indent}{item}{newline}" for item in replacement
+    ]
     return "".join(lines)
 
 
@@ -1076,6 +1124,14 @@ def change_tui_gateway_source(source: str) -> str:
     )
     source = _insert_after_unique_line(
         source,
+        "goal_followup = None  # set by the post-turn goal hook below"
+        if "goal_followup = None  # set by the post-turn goal hook below" in source
+        else "goal_followup = None",
+        ("_choice_completion_payload = None",),
+        label="tui gateway deferred chooser payload",
+    )
+    source = _insert_after_unique_line(
+        source,
         'payload = {"text": raw, "usage": _get_usage(agent), "status": status}',
         (
             "# RISK(breaking): chooser clients require the complete prompt contract, not labels alone.",
@@ -1086,16 +1142,39 @@ def change_tui_gateway_source(source: str) -> str:
             "if isinstance(result, dict) and _is_valid_gateway_choice_prompt(result):",
             "    for _choice_field in _choice_prompt_fields:",
             "        payload[_choice_field] = copy.deepcopy(result[_choice_field])",
-            "    with session[\"history_lock\"]:",
-            "        # RISK(race): publish and later claim one session prompt under the same lock.",
-            "        session[\"_choice_prompt\"] = {",
-            "            _choice_field: copy.deepcopy(result[_choice_field])",
-            "            for _choice_field in _choice_prompt_fields",
-            "        }",
-            "        # RISK(security): only the live transport that received this prompt may claim it.",
-            "        session[\"_choice_prompt\"][\"_owner_transport\"] = session.get(\"transport\")",
         ),
         label="tui gateway chooser payload",
+    )
+    source = _insert_before_unique_line(
+        source,
+        '_emit("message.complete", sid, payload)',
+        (
+            "if _is_valid_gateway_choice_prompt(payload):",
+            "    _choice_completion_payload = copy.deepcopy(payload)",
+            "if _choice_completion_payload is None:",
+        ),
+        label="tui gateway normal completion guard",
+    )
+    source = _replace_unique_line(
+        source,
+        '_emit("message.complete", sid, payload)',
+        '    _emit("message.complete", sid, payload)',
+        label="tui gateway deferred chooser completion",
+    )
+    source = _replace_unique_sequence(
+        source,
+        (
+            'with session["history_lock"]:',
+            'session["running"] = False',
+            'session["last_active"] = time.time()',
+            "_clear_inflight_turn(session)",
+            '_emit("session.info", sid, _session_info(agent, session))',
+        ),
+        (
+            "_finalize_gateway_choice_turn(sid, session, _choice_completion_payload)",
+            '_emit("session.info", sid, _session_info(agent, session))',
+        ),
+        label="tui gateway atomic chooser publication",
     )
     source = _insert_after_line_in_unique_block(
         source,
@@ -1195,6 +1274,39 @@ def _claim_gateway_choice_submission(session: dict, params: dict) -> tuple[dict 
         "choice_prompt_id": prompt_id,
         "selected_choice_ids": selected_ids,
     }, None
+
+
+def _finalize_gateway_choice_turn(sid: str, session: dict, payload: dict | None) -> None:
+    with session["history_lock"]:
+        session["running"] = False
+        session["last_active"] = time.time()
+        _clear_inflight_turn(session)
+        if payload is None:
+            return
+        fields = (
+            "choice_prompt_id", "choice_mode", "min_choices", "max_choices",
+            "submit_label", "expires_at", "choices",
+        )
+        delivery_transport = session.get("transport") or _stdio_transport
+        prompt = {field: copy.deepcopy(payload[field]) for field in fields}
+        # RISK(race): owner, prompt generation, and synchronous delivery are one
+        # lock-protected publication; prompt.submit cannot invalidate between them.
+        prompt["_owner_transport"] = delivery_transport
+        session["_choice_prompt"] = prompt
+        frame = {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {"type": "message.complete", "session_id": sid, "payload": payload},
+        }
+        try:
+            delivered = delivery_transport.write(frame)
+        except Exception as error:
+            delivered = False
+            print(f"[tui_gateway] chooser publication failed: {error}", file=sys.stderr)
+        if delivered is False:
+            current = session.get("_choice_prompt")
+            if current is prompt:
+                session.pop("_choice_prompt", None)
 
 
 @method("choice.submit")
@@ -1439,6 +1551,15 @@ export type ChoiceAction =
   | { error?: string; ids?: string[]; kind: 'submit' }
   | { kind: 'noop' }
 
+export function choiceSubmitErrorDisposition(reason: unknown): { clearPrompt: boolean; message: string } {
+  const error = reason as { code?: unknown; message?: unknown } | null
+  const code = typeof error?.code === 'number' ? error.code : null
+  const message = typeof error?.message === 'string' ? error.message : String(reason)
+  if (code === 4009 || message === 'session busy') return { clearPrompt: false, message }
+  const terminal = ['belongs to another connection', 'no pending choice prompt', 'choice prompt is stale', 'choice prompt expired']
+  return { clearPrompt: terminal.some(fragment => message.includes(fragment)), message }
+}
+
 export function choiceAction(
   prompt: GatewayChoicePrompt,
   cursor: null | number,
@@ -1503,8 +1624,9 @@ export function ChoicePrompt({ prompt, sessionId, t }: { prompt: GatewayChoicePr
         selected_choice_ids: action.ids,
         session_id: sessionId
       }).then(() => clearChoicePrompt(sessionId, prompt.choice_prompt_id)).catch(reason => {
-        setError(reason instanceof Error ? reason.message : String(reason))
-        clearChoicePrompt(sessionId, prompt.choice_prompt_id)
+        const failure = choiceSubmitErrorDisposition(reason)
+        setError(failure.message)
+        if (failure.clearPrompt) clearChoicePrompt(sessionId, prompt.choice_prompt_id)
         setSubmitting(false)
       })
     }
@@ -1705,36 +1827,32 @@ export function choiceRequestFromPayload(payload: GatewayEventPayload | undefine
             ("choice.clear(sessionId)",),
             label="Desktop chooser session clear",
         )
-    actual = '''export const $activeSessionAwaitingInput = computed(
-  [$clarifyRequest, $approvalRequest, $sudoRequest, $secretRequest],
-  (clarify, approval, sudo, secret) => Boolean(clarify || approval || sudo || secret)
-)'''
-    replacement = '''export const $activeSessionAwaitingInput = computed(
-  [$clarifyRequest, $approvalRequest, $sudoRequest, $secretRequest, $choiceRequest],
-  (clarify, approval, sudo, secret, pendingChoice) => Boolean(clarify || approval || sudo || secret || pendingChoice)
-)'''
-    if source.count(actual) == 1:
-        source = source.replace(actual, replacement)
-    elif "$activeSessionAwaitingInput" in source:
-        # Minimal transform fixture: retain its stub while production uses the exact block above.
-        source += "\n// chooser participates in $activeSessionAwaitingInput through $choiceRequest\n"
-    return source
+    return _replace_unique_sequence(
+        source,
+        (
+            "export const $activeSessionAwaitingInput = computed(",
+            "[$clarifyRequest, $approvalRequest, $sudoRequest, $secretRequest],",
+            "(clarify, approval, sudo, secret) => Boolean(clarify || approval || sudo || secret)",
+            ")",
+        ),
+        (
+            "export const $activeSessionAwaitingInput = computed(",
+            "  [$clarifyRequest, $approvalRequest, $sudoRequest, $secretRequest, $choiceRequest],",
+            "  (clarify, approval, sudo, secret, pendingChoice) => Boolean(clarify || approval || sudo || secret || pendingChoice)",
+            ")",
+        ),
+        label="Desktop chooser awaiting input",
+    )
 
 
 def change_desktop_gateway_event_source(source: str) -> str:
-    old_import = "import { clearAllPrompts } from '@/store/prompts'"
     actual_import = "import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'"
     new_import = "import { choiceRequestFromPayload, clearAllPrompts, clearChoiceRequest, setApprovalRequest, setChoiceRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'"
-    if source.count(actual_import) == 1:
-        source = source.replace(actual_import, new_import)
-    elif source.count(old_import) == 1:
-        source = source.replace(old_import, "import { choiceRequestFromPayload, clearAllPrompts, clearChoiceRequest, setChoiceRequest } from '@/store/prompts'")
-    else:
+    if source.count(actual_import) != 1:
         raise InstallError("Desktop gateway chooser import anchor is not unique")
+    source = source.replace(actual_import, new_import)
 
     message_start = "} else if (event.type === 'message.start') {"
-    if source.count(message_start) == 0:
-        message_start = "if (event.type === 'message.start') {"
     source = _insert_after_unique_line(
         source,
         message_start,
@@ -1743,10 +1861,9 @@ def change_desktop_gateway_event_source(source: str) -> str:
         ),
         label="Desktop chooser clear on new turn",
     )
-    completion_anchor = "completeAssistantMessage(sessionId, finalText)" if "finalText" in source else "completeAssistantMessage(sessionId, payload?.text || '')"
     return _insert_after_unique_line(
         source,
-        completion_anchor,
+        "completeAssistantMessage(sessionId, finalText)",
         (
             "",
             "const choiceRequest = choiceRequestFromPayload(payload, sessionId)",
@@ -1758,31 +1875,70 @@ def change_desktop_gateway_event_source(source: str) -> str:
 
 def change_desktop_prompt_overlays_source(source: str) -> str:
     import_line = "import { type FormEvent, useCallback, useEffect, useState } from 'react'"
-    if source.count(import_line) == 1:
-        pass
-    elif source.count("import { useState } from 'react'") == 1:
-        source = source.replace("import { useState } from 'react'", "import { type FormEvent, useCallback, useEffect, useState } from 'react'")
-    else:
+    if source.count(import_line) != 1:
         raise InstallError("Desktop chooser React import anchor is not unique")
+    source = source.replace(
+        import_line,
+        "import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react'",
+    )
     old = "import { $secretRequest, $sudoRequest, clearSecretRequest, clearSudoRequest } from '@/store/prompts'"
-    fixture = "import { $secretRequest, $sudoRequest } from '@/store/prompts'"
-    new = "import { $choiceRequest, $secretRequest, $sudoRequest, clearChoiceRequest, clearSecretRequest, clearSudoRequest } from '@/store/prompts'"
-    if source.count(old) == 1:
-        source = source.replace(old, new)
-    elif source.count(fixture) == 1:
-        source = source.replace(fixture, new)
-    else:
+    new = "import { $choiceRequest, $secretRequest, $sudoRequest, clearChoiceRequest, clearSecretRequest, clearSudoRequest, type ChoiceRequest } from '@/store/prompts'"
+    if source.count(old) != 1:
         raise InstallError("Desktop chooser prompt store import anchor is not unique")
+    source = source.replace(old, new)
 
-    component = '''export function ChoiceDialog() {
+    component = '''export function choiceSubmitErrorDisposition(reason: unknown): { clearPrompt: boolean; message: string } {
+  const error = reason as { code?: unknown; message?: unknown } | null
+  const code = typeof error?.code === 'number' ? error.code : null
+  const message = typeof error?.message === 'string' ? error.message : String(reason)
+  if (code === 4009 || message === 'session busy') return { clearPrompt: false, message }
+  const terminal = ['belongs to another connection', 'no pending choice prompt', 'choice prompt is stale', 'choice prompt expired']
+  return { clearPrompt: terminal.some(fragment => message.includes(fragment)), message }
+}
+
+export type ChoiceKeyboardAction =
+  | { focusedIndex: number; kind: 'state'; selected: string[] }
+  | { ids: string[]; kind: 'submit' }
+  | { kind: 'noop' }
+
+export function choiceKeyboardAction(
+  request: ChoiceRequest,
+  focusedIndex: null | number,
+  selected: readonly string[],
+  key: string
+): ChoiceKeyboardAction {
+  if (key === 'ArrowDown' || key === 'ArrowUp') {
+    const delta = key === 'ArrowDown' ? 1 : -1
+    const nextIndex = focusedIndex === null
+      ? (delta > 0 ? 0 : request.choices.length - 1)
+      : (focusedIndex + delta + request.choices.length) % request.choices.length
+    const nextSelected = request.choiceMode === 'single' ? [request.choices[nextIndex]!.id] : [...selected]
+    return { focusedIndex: nextIndex, kind: 'state', selected: nextSelected }
+  }
+  if (key === ' ' && focusedIndex !== null) {
+    const id = request.choices[focusedIndex]?.id
+    if (!id) return { kind: 'noop' }
+    const nextSelected = request.choiceMode === 'single'
+      ? [id]
+      : selected.includes(id) ? selected.filter(value => value !== id) : [...selected, id]
+    return { focusedIndex, kind: 'state', selected: nextSelected }
+  }
+  if (key === 'Enter') return { ids: [...selected], kind: 'submit' }
+  return { kind: 'noop' }
+}
+
+export function ChoiceDialog() {
   const request = useStore($choiceRequest)
   const gateway = useStore($gateway)
   const [selected, setSelected] = useState<string[]>([])
+  const [focusedIndex, setFocusedIndex] = useState<null | number>(null)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const choiceRefs = useRef<Array<HTMLButtonElement | HTMLInputElement | null>>([])
 
   useEffect(() => {
     setSelected([])
+    setFocusedIndex(null)
     setError('')
     setSubmitting(false)
   }, [request?.choicePromptId])
@@ -1815,9 +1971,24 @@ def change_desktop_prompt_overlays_source(source: str) -> str:
       })
       clearChoiceRequest(request.sessionId, request.choicePromptId)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
-      clearChoiceRequest(request.sessionId, request.choicePromptId)
+      const failure = choiceSubmitErrorDisposition(reason)
+      setError(failure.message)
+      if (failure.clearPrompt) clearChoiceRequest(request.sessionId, request.choicePromptId)
       setSubmitting(false)
+    }
+  }
+
+  const handleChoiceKeyDown = (event: KeyboardEvent) => {
+    const action = choiceKeyboardAction(request, focusedIndex, selected, event.key)
+    if (action.kind === 'noop') return
+    event.preventDefault()
+    if (action.kind === 'state') {
+      setFocusedIndex(action.focusedIndex)
+      setSelected(action.selected)
+      setError('')
+      choiceRefs.current[action.focusedIndex]?.focus()
+    } else {
+      void submit(action.ids)
     }
   }
 
@@ -1827,14 +1998,14 @@ def change_desktop_prompt_overlays_source(source: str) -> str:
         <DialogTitle>Choose an option</DialogTitle>
         <DialogDescription id="forge-choice-description">Selections are submitted by stable ID.</DialogDescription>
       </DialogHeader>
-      {request.choiceMode === 'single' ? <div aria-label="Available choices" role="radiogroup">
-        {request.choices.map(choice => <Button aria-checked="false" disabled={submitting} key={choice.id} onClick={() => void submit([choice.id])} role="radio" variant="outline">
+      {request.choiceMode === 'single' ? <div aria-label="Available choices" onKeyDown={handleChoiceKeyDown} role="radiogroup">
+        {request.choices.map((choice, index) => <Button aria-checked={selected.includes(choice.id)} disabled={submitting} key={choice.id} onClick={() => void submit([choice.id])} onFocus={() => setFocusedIndex(index)} ref={element => { choiceRefs.current[index] = element }} role="radio" tabIndex={focusedIndex === index || (focusedIndex === null && index === 0) ? 0 : -1} variant="outline">
           <span>{choice.label}</span><span>{choice.description}</span>
         </Button>)}
-      </div> : <fieldset disabled={submitting}>
+      </div> : <fieldset disabled={submitting} onKeyDown={handleChoiceKeyDown}>
         <legend>Available choices</legend>
-        {request.choices.map(choice => <label key={choice.id}>
-          <input checked={selected.includes(choice.id)} onChange={() => setSelected(values => values.includes(choice.id) ? values.filter(id => id !== choice.id) : [...values, choice.id])} type="checkbox" />
+        {request.choices.map((choice, index) => <label key={choice.id}>
+          <input checked={selected.includes(choice.id)} onChange={() => setSelected(values => values.includes(choice.id) ? values.filter(id => id !== choice.id) : [...values, choice.id])} onFocus={() => setFocusedIndex(index)} ref={element => { choiceRefs.current[index] = element }} tabIndex={focusedIndex === index || (focusedIndex === null && index === 0) ? 0 : -1} type="checkbox" />
           <span>{choice.label}</span><span>{choice.description}</span>
         </label>)}
       </fieldset>}
@@ -2155,7 +2326,10 @@ def change_gateway_source(source: str) -> str:
 
     # The full Hermes gateway has an inner runner seam that can accept the
     # trusted adapter metadata without serializing it into user-visible text.
-    if source.count("async def _run_agent(") == 1:
+    runner_seams = source.count("async def _run_agent(")
+    if runner_seams != 1:
+        raise InstallError("gateway structured runner seam is not unique")
+    if runner_seams == 1:
         source = _insert_after_line_in_unique_block(
             source,
             block_start="async def _run_agent(",
@@ -2172,24 +2346,27 @@ def change_gateway_source(source: str) -> str:
             max_lines=30,
             label="gateway structured chooser inner parameter",
         )
-        high_call = '''                persist_user_timestamp=persist_user_timestamp,
-            )'''
-        high_replacement = '''                persist_user_timestamp=persist_user_timestamp,
-                structured_user_message=(event.metadata or {}).get("structured_user_message") if isinstance(getattr(event, "metadata", None), dict) else None,
-            )'''
-        if source.count(high_call) < 1:
-            raise InstallError("gateway structured chooser call anchor is missing")
-        # The first occurrence is the high-level event call; wrapper calls are
-        # patched separately below with their local parameter.
-        source = source.replace(high_call, high_replacement, 1)
-        wrapper_call = '''                persist_user_timestamp=persist_user_timestamp,
-            )'''
-        wrapper_replacement = '''                persist_user_timestamp=persist_user_timestamp,
-                structured_user_message=structured_user_message,
-            )'''
-        if source.count(wrapper_call) != 2:
-            raise InstallError("gateway structured chooser wrapper calls are not unique")
-        source = source.replace(wrapper_call, wrapper_replacement)
+        lines = source.splitlines(keepends=True)
+        call_indexes = [
+            index
+            for index, line in enumerate(lines)
+            if line.strip() == "persist_user_timestamp=persist_user_timestamp,"
+        ]
+        if len(call_indexes) != 3:
+            raise InstallError("gateway structured chooser calls are not unique")
+        for ordinal, index in reversed(list(enumerate(call_indexes))):
+            original = lines[index]
+            newline = "\r\n" if original.endswith("\r\n") else "\n"
+            indent = original[: len(original) - len(original.lstrip())]
+            value = (
+                '(event.metadata or {}).get("structured_user_message") if isinstance(getattr(event, "metadata", None), dict) else None'
+                if ordinal == 0
+                else "structured_user_message"
+            )
+            lines[index + 1 : index + 1] = [
+                f"{indent}structured_user_message={value},{newline}"
+            ]
+        source = "".join(lines)
         source = _insert_after_unique_line(
             source,
             "if self._get_proxy_url():",
@@ -2210,10 +2387,8 @@ def change_gateway_source(source: str) -> str:
             label="gateway trusted chooser envelope",
         )
 
-        final_return = (
-            "            return response\n"
-            + "            \n"
-            + "        except Exception as e:"
+        final_return = re.compile(
+            r"            return response\r?\n[ \t]*\r?\n        except Exception as e:"
         )
         choice_delivery = '''            _choice_fields = ("choice_prompt_id", "choice_mode", "min_choices", "max_choices", "submit_label", "expires_at", "choices")
             _choice_prompt = {field: agent_result.get(field) for field in _choice_fields}
@@ -2239,11 +2414,9 @@ def change_gateway_source(source: str) -> str:
             return response
 
         except Exception as e:'''
-        if source.count(final_return) != 1:
+        if len(final_return.findall(source)) != 1:
             raise InstallError("gateway chooser delivery return anchor is not unique")
-        source = source.replace(final_return, choice_delivery)
-    else:
-        source += "\n# Slack exact fallback format: ID — Label; structured_user_message carries selected_choice_ids.\n"
+        source = final_return.sub(lambda _: choice_delivery, source, count=1)
     return source
 
 
@@ -2252,7 +2425,7 @@ def change_tui_prompt_test_source(source: str) -> str:
         source,
         "import { composerPromptText } from '../lib/prompt.js'",
         (
-            "import { choiceAction } from '../components/prompts.js'",
+            "import { choiceAction, choiceSubmitErrorDisposition } from '../components/prompts.js'",
             "import type { GatewayChoicePrompt } from '../gatewayTypes.js'",
         ),
         label="TUI chooser reducer test imports",
@@ -2294,6 +2467,11 @@ describe('choiceAction', () => {
     expect(choiceAction(multiple, 0, ['chat'], '', { return: true })).toEqual({ ids: ['chat'], kind: 'submit' })
     expect(choiceAction(multiple, 0, ['chat'], '', { escape: true })).toEqual({ kind: 'cancel' })
   })
+
+  it('keeps retryable busy failures and clears terminal prompt failures', () => {
+    expect(choiceSubmitErrorDisposition(new Error('session busy')).clearPrompt).toBe(false)
+    expect(choiceSubmitErrorDisposition(new Error('choice prompt is stale')).clearPrompt).toBe(true)
+  })
 })
 '''
 
@@ -2304,6 +2482,7 @@ def change_desktop_prompts_test_source(source: str) -> str:
         "import { clearClarifyRequest, setClarifyRequest } from './clarify'",
         (
             "import { $choiceRequest, choiceRequestFromPayload, clearChoiceRequest, setChoiceRequest } from './prompts'",
+            "import { choiceKeyboardAction, choiceSubmitErrorDisposition } from '../components/prompt-overlays'",
         ),
         label="Desktop chooser store test imports",
     )
@@ -2347,6 +2526,20 @@ describe('choice prompt store', () => {
     setChoiceRequest(choiceRequestFromPayload(chooserPayload, 's1')!)
     clearAllPrompts('s1')
     expect($choiceRequest.get()).toBeNull()
+  })
+
+  it('moves from no default, toggles with Space, and submits with Enter', () => {
+    const request = choiceRequestFromPayload(chooserPayload, 's1')!
+    const moved = choiceKeyboardAction(request, null, [], 'ArrowDown')
+    expect(moved).toEqual({ focusedIndex: 0, kind: 'state', selected: ['chat'] })
+    expect(choiceKeyboardAction(request, 0, [], ' ')).toEqual({ focusedIndex: 0, kind: 'state', selected: ['chat'] })
+    expect(choiceKeyboardAction(request, 0, ['chat'], 'Enter')).toEqual({ ids: ['chat'], kind: 'submit' })
+  })
+
+  it('keeps retryable failures and clears only terminal prompt failures', () => {
+    expect(choiceSubmitErrorDisposition(new Error('session busy')).clearPrompt).toBe(false)
+    expect(choiceSubmitErrorDisposition(new Error('choice prompt expired')).clearPrompt).toBe(true)
+    expect(choiceSubmitErrorDisposition(new Error('gateway closed')).clearPrompt).toBe(false)
   })
 })
 '''
@@ -2488,6 +2681,9 @@ _CHANGES: dict[str, Callable[[str], str]] = {
     "apps/desktop/src/store/prompts.test.ts": change_desktop_prompts_test_source,
     "tests/gateway/test_slack_approval_buttons.py": change_slack_approval_test_source,
 }
+_CHANGE_TARGETS = _load_change_targets()
+if tuple(_CHANGES) != _CHANGE_TARGETS:
+    raise InstallError("Hermes change target manifest does not match installer transforms")
 
 
 def _write_atomic(path: Path, content: bytes, *, mode: int | None = None) -> None:
@@ -2568,7 +2764,7 @@ def _read_manifest(package: Path) -> ChangeManifest:
         ):
             raise InstallError(f"installed file entry has an invalid package path: {item.path}")
         files.append(item)
-    if len(files) != len(_CHANGES) or {item.path for item in files} != set(_CHANGES):
+    if tuple(item.path for item in files) != _CHANGE_TARGETS:
         raise InstallError("installed files list has unexpected target paths")
     return ChangeManifest(source_version=source_version, files=tuple(files))
 
@@ -2910,3 +3106,17 @@ def restore_change(hermes_root: Path, package: Path) -> ChangeManifest:
     resolved_root = hermes_root.resolve()
     with _change_lock(resolved_root):
         return _restore_change_unlocked(resolved_root, package)
+
+
+def verify_change(hermes_root: Path, package: Path) -> ChangeManifest:
+    """Verify every installed target and both package copies without writing."""
+
+    resolved_root = hermes_root.resolve()
+    resolved_package = package.resolve()
+    with _change_lock(resolved_root):
+        manifest = _read_manifest(resolved_package)
+        if _read_change_state(resolved_root, manifest) is not None:
+            raise InstallError("Hermes source change has an unfinished operation")
+        _validate_all_package_files(resolved_package, manifest)
+        _verify_target_hashes(resolved_root, manifest, "after_file_hash")
+        return manifest
