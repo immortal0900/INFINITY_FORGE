@@ -117,6 +117,54 @@ role: builder | reviewer | deep_checker | fix
 넘어가지 않는다. 여러 Project의 `full_auto`에서는 `merge_order`도 반드시 직접 선택한다.
 이전 Task의 값을 불러오거나 기본값을 자동 선택하지 않는다.
 
+### 키보드 선택 UX
+
+CLI와 TUI에서 선택 항목을 직접 타이핑하게 하지 않는다. Hermes가 이미 사용하는
+`prompt_toolkit` 모달을 범용 chooser로 확장하며, Forge 전용 curses 입력이나 별도 stdin
+reader를 만들지 않는다. 현재 Hermes의 Forge carried change는 `choices`를 응답 문장에
+붙여 보여 주기만 하므로 다음 사용자 입력부터 실제 chooser를 열도록 바꾼다.
+
+- 하나 선택: `↑`·`↓`로 이동하고 `Enter`로 확정한다. 숫자 빠른 선택도 유지한다.
+- 여러 Projects 선택: `↑`·`↓`로 이동하고 `Space`로 체크하며 `Enter` 또는 `Done`으로
+  확정한다. 하나도 고르지 않은 상태의 확정은 거부한다.
+- `Esc` 또는 chooser 안의 `Cancel`은 현재 선택을 적용하지 않고 모달만 닫는다. 첫 항목을
+  자동 선택하거나 `chat`을 기본 확정하지 않는다.
+- 비대화형 CLI처럼 모달을 열 수 없는 surface는 `stable ID — label`을 표시하고 ID 입력을
+  받는다. label이나 Project 경로를 권한 있는 입력값으로 사용하지 않는다.
+- Desktop은 버튼 또는 checkbox 목록을 사용하고 키보드 `Arrow`·`Space`·`Enter`와 접근성
+  label을 제공한다. Slack처럼 방향키를 가로챌 수 없는 surface는 Block Kit button 또는
+  multi-select를 사용하며 지원하지 않는 client에서는 stable ID 답장을 fallback으로 둔다.
+
+모든 surface는 같은 transport-neutral chooser 계약을 사용한다.
+
+```json
+{
+  "choice_prompt_id": "UUID",
+  "choice_mode": "single",
+  "min_choices": 1,
+  "max_choices": 1,
+  "submit_label": "Done",
+  "expires_at": "2026-07-18T03:00:00Z",
+  "choices": [
+    {
+      "id": "task",
+      "label": "Task",
+      "description": "Start the implementation pipeline"
+    }
+  ]
+}
+```
+
+복수 선택은 `choice_mode=multiple`, `max_choices=null`을 사용한다. UI는 label 문자열을 새
+채팅으로 만들지 않고 `choice_prompt_id`와 `selected_choice_ids`를 구조화된 user-turn
+입력으로 돌려준다. 시스템은 현재 session의 대기 중 prompt ID, 허용된 choice ID, 최소·최대
+개수를 모두 확인하고 하나라도 맞지 않으면 외부 write와 모델 호출 없이 같은 chooser를
+다시 표시한다. plain-text fallback도 server가 보관한 현재 prompt ID에 결합하므로 오래된
+화면의 답을 새 단계에 적용하지 않는다. chooser 표시와 선택 turn은 모두 `handled`이며 모델
+API 호출은 0회다. `expires_at`은 Task setup draft의 실제 만료시각과 같아야 한다. Hermes의
+기존 120초 modal timeout을 별도 상태 만료로 사용하지 않으며 UI가 먼저 닫혀도 선택을
+자동 적용하지 않는다.
+
 ## 범용 Project 발견과 선택
 
 ### 발견 순서
@@ -731,6 +779,12 @@ settings는 더 이상 active로 남기지 않고 `partially_merged` terminal ev
 4. 모든 chooser 입력과 Confirm은 `handled`이며 모델 호출이 0회다.
 5. Confirm 뒤 일반 문장은 다시 Hermes 메인 에이전트가 받는다.
 6. 기존 `mode`, `task_flow`, `merge_mode` 값과 화면 문구가 바뀌지 않는다.
+- **AC 6-A:** 대화형 CLI와 TUI의 단일 선택은 `↑`·`↓`와 `Enter`, 복수 Project 선택은 `Space`와
+   `Enter`로 완료되며 ID를 직접 타이핑할 필요가 없다.
+- **AC 6-B:** `Esc`, 빈 복수 선택, stale prompt ID, 알 수 없는 choice ID는 설정·외부 상태를 바꾸지
+   않고 chooser를 유지한다.
+- **AC 6-C:** 비대화형 CLI와 구조화 UI를 지원하지 않는 client에서는 stable ID fallback이 동작하고,
+   모든 chooser 처리에서 모델 API 호출은 0회다.
 
 ### Project 실행
 
@@ -830,6 +884,12 @@ Task 메시지와 중단 요청이 durable하게 남으므로 응답 중단, 프
 
 ## 변경이력
 
+- 2026-07-18 | 방향키 chooser 사용자 확정 | 변경: CLI·TUI 단일 선택은 방향키와 Enter,
+  복수 Projects는 Space 체크와 Enter, Desktop·Slack은 구조화된 control과 stable ID
+  fallback을 사용하도록 선택 계약 추가 | 검증: Hermes v0.18.2의
+  `_prompt_text_input_modal`의 120초 timeout, Task setup의 30분 timeout, clarify key binding,
+  TUI/Desktop message.complete 처리 경로와
+  현재 Forge `_choice_display_lines`를 대조
 - 2026-07-18 | 혼합형 구조 사용자 확정 | 변경: Hermes 메인 대화, deterministic control,
   durable Task inbox, 범용 Project 선택, 중앙 Management/실제 PR 분리, 멱등 Stop Task를
   하나의 설계로 고정 | 검증: 현재 Task setup, Task settings, worker, merge, Linux CLI
