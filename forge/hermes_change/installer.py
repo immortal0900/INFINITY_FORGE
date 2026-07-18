@@ -67,10 +67,109 @@ def change_plugins_source(source: str) -> str:
     return source.replace(anchor, addition, 1)
 
 
-_CONVERSATION_HOOK = f'''
+_CONVERSATION_HOOK = fr'''
     if is_user_turn:
         # {_HOOK_MARKER}: only a caller that received a real user turn opts in.
         # Internal build, review, delegate, and batch calls keep the safe default.
+        def _valid_pre_user_turn_choice_prompt(_prompt):
+            _required_prompt_fields = (
+                "choice_prompt_id",
+                "choice_mode",
+                "min_choices",
+                "max_choices",
+                "submit_label",
+                "expires_at",
+                "choices",
+            )
+            if not isinstance(_prompt, dict) or any(
+                _field not in _prompt for _field in _required_prompt_fields
+            ):
+                return False
+            _prompt_id = _prompt.get("choice_prompt_id")
+            _expires_text = _prompt.get("expires_at")
+            if not isinstance(_prompt_id, str) or not isinstance(_expires_text, str):
+                return False
+            try:
+                import re as _choice_re
+                from datetime import datetime as _choice_datetime
+                from datetime import timezone as _choice_timezone
+                from uuid import UUID as _choice_uuid
+
+                if str(_choice_uuid(_prompt_id)) != _prompt_id:
+                    return False
+                if not _choice_re.fullmatch(
+                    r"\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}"
+                    r"(?:\.\d+)?(?:Z|[+-]\d{{2}}:\d{{2}})",
+                    _expires_text,
+                ):
+                    return False
+                _expires_at = _choice_datetime.fromisoformat(
+                    _expires_text[:-1] + "+00:00"
+                    if _expires_text.endswith("Z")
+                    else _expires_text
+                )
+            except (TypeError, ValueError):
+                return False
+            if (
+                _expires_at.tzinfo is None
+                or _expires_at.utcoffset() is None
+                or _expires_at <= _choice_datetime.now(_choice_timezone.utc)
+            ):
+                return False
+            _choices = _prompt.get("choices")
+            if not isinstance(_choices, list) or not _choices:
+                return False
+            if not all(
+                isinstance(_choice, dict)
+                and isinstance(_choice.get("id"), str)
+                and bool(_choice["id"].strip())
+                and isinstance(_choice.get("label"), str)
+                and bool(_choice["label"].strip())
+                and isinstance(_choice.get("description"), str)
+                and bool(_choice["description"].strip())
+                for _choice in _choices
+            ):
+                return False
+            _choice_ids = [_choice["id"] for _choice in _choices]
+            _choice_labels = [_choice["label"] for _choice in _choices]
+            if (
+                len(set(_choice_ids)) != len(_choice_ids)
+                or len(set(_choice_labels)) != len(_choice_labels)
+            ):
+                return False
+            _choice_mode = _prompt.get("choice_mode")
+            _min_choices = _prompt.get("min_choices")
+            _max_choices = _prompt.get("max_choices")
+            if (
+                not isinstance(_min_choices, int)
+                or isinstance(_min_choices, bool)
+                or _min_choices < 1
+                or _min_choices > len(_choices)
+            ):
+                return False
+            if _choice_mode == "single":
+                if _min_choices != 1 or _max_choices != 1:
+                    return False
+            elif _choice_mode == "multiple":
+                if _max_choices is not None and (
+                    not isinstance(_max_choices, int)
+                    or isinstance(_max_choices, bool)
+                    or _max_choices < _min_choices
+                    or _max_choices > len(_choices)
+                ):
+                    return False
+            else:
+                return False
+            return (
+                isinstance(_prompt.get("submit_label"), str)
+                and bool(_prompt["submit_label"].strip())
+            )
+
+        _is_structured_choice_submission = isinstance(user_message, dict) and (
+            "choice_prompt_id" in user_message
+            or "selected_choice_ids" in user_message
+        )
+
         def _finish_pre_user_turn(_response, _prompt=None):
             _handled_messages = list(conversation_history or [])
             _handled_user_message = (
@@ -82,9 +181,13 @@ _CONVERSATION_HOOK = f'''
                     else user_message
                 )
             )
-            _handled_messages.append(
-                {{"role": "user", "content": _handled_user_message}}
-            )
+            if (
+                isinstance(_handled_user_message, str)
+                and _handled_user_message.strip()
+            ):
+                _handled_messages.append(
+                    {{"role": "user", "content": _handled_user_message}}
+                )
             _handled_messages.append({{"role": "assistant", "content": _response}})
             _handled_payload = {{
                 "final_response": _response,
@@ -202,6 +305,14 @@ _CONVERSATION_HOOK = f'''
                 _handled_pre_user_turn_results
                 and _replace_pre_user_turn_results
             )
+            or (
+                _is_structured_choice_submission
+                and not _handled_pre_user_turn_results
+                and (
+                    len(_replace_pre_user_turn_results) != 1
+                    or user_message.get("selected_choice_ids") != ["chat"]
+                )
+            )
         ):
             return _finish_pre_user_turn(
                 "Hermes user-turn plugin results conflict. No model request was made."
@@ -252,44 +363,9 @@ _CONVERSATION_HOOK = f'''
                 if _valid_choices
                 else []
             )
-            _choice_mode = _handled_result.get("choice_mode")
-            _min_choices = _handled_result.get("min_choices")
-            _max_choices = _handled_result.get("max_choices")
             _valid_choice_prompt = (
                 not _has_choice_prompt
-                or (
-                    all(
-                        _field in _handled_result
-                        for _field in _choice_prompt_fields
-                    )
-                    and isinstance(_handled_result.get("choice_prompt_id"), str)
-                    and bool(_handled_result["choice_prompt_id"].strip())
-                    and _choice_mode in ("single", "multiple")
-                    and isinstance(_min_choices, int)
-                    and not isinstance(_min_choices, bool)
-                    and _min_choices >= 1
-                    and (
-                        _max_choices is None
-                        or (
-                            isinstance(_max_choices, int)
-                            and not isinstance(_max_choices, bool)
-                            and _max_choices >= _min_choices
-                        )
-                    )
-                    and (
-                        _choice_mode != "single"
-                        or (_min_choices == 1 and _max_choices == 1)
-                    )
-                    and isinstance(_handled_result.get("submit_label"), str)
-                    and bool(_handled_result["submit_label"].strip())
-                    and isinstance(_handled_result.get("expires_at"), str)
-                    and bool(_handled_result["expires_at"].strip())
-                    and _min_choices <= len(_choices)
-                    and (
-                        _max_choices is None
-                        or _max_choices <= len(_choices)
-                    )
-                )
+                or _valid_pre_user_turn_choice_prompt(_handled_result)
             )
             if (
                 not isinstance(_response, str)
@@ -473,10 +549,10 @@ def change_run_agent_source(source: str) -> str:
     )
 
 
-_CLI_CHOICE_METHODS = '''
+_CLI_CHOICE_METHODS = r'''
 # RISK(breaking): classic CLI submissions carry stable IDs, never display labels.
-def _prompt_choice_modal(self, prompt: dict, timeout: float = 120) -> dict | None:
-    """Return one structured chooser submission, or ``None`` on cancel/timeout."""
+def _is_valid_choice_prompt(self, prompt: dict) -> bool:
+    """Reject malformed, ambiguous, or expired chooser metadata."""
     required = (
         "choice_prompt_id",
         "choice_mode",
@@ -487,11 +563,91 @@ def _prompt_choice_modal(self, prompt: dict, timeout: float = 120) -> dict | Non
         "choices",
     )
     if not isinstance(prompt, dict) or any(field not in prompt for field in required):
+        return False
+    prompt_id = prompt.get("choice_prompt_id")
+    expires_text = prompt.get("expires_at")
+    if not isinstance(prompt_id, str) or not isinstance(expires_text, str):
+        return False
+    try:
+        import re as _choice_re
+        from datetime import datetime as _choice_datetime
+        from datetime import timezone as _choice_timezone
+        from uuid import UUID as _choice_uuid
+
+        if str(_choice_uuid(prompt_id)) != prompt_id:
+            return False
+        if not _choice_re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+            r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+            expires_text,
+        ):
+            return False
+        expires_at = _choice_datetime.fromisoformat(
+            expires_text[:-1] + "+00:00"
+            if expires_text.endswith("Z")
+            else expires_text
+        )
+    except (TypeError, ValueError):
+        return False
+    if (
+        expires_at.tzinfo is None
+        or expires_at.utcoffset() is None
+        or expires_at <= _choice_datetime.now(_choice_timezone.utc)
+    ):
+        return False
+    choices = prompt.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    if not all(
+        isinstance(choice, dict)
+        and isinstance(choice.get("id"), str)
+        and bool(choice["id"].strip())
+        and isinstance(choice.get("label"), str)
+        and bool(choice["label"].strip())
+        and isinstance(choice.get("description"), str)
+        and bool(choice["description"].strip())
+        for choice in choices
+    ):
+        return False
+    choice_ids = [choice["id"] for choice in choices]
+    choice_labels = [choice["label"] for choice in choices]
+    if len(set(choice_ids)) != len(choice_ids) or len(set(choice_labels)) != len(
+        choice_labels
+    ):
+        return False
+    choice_mode = prompt.get("choice_mode")
+    min_choices = prompt.get("min_choices")
+    max_choices = prompt.get("max_choices")
+    if (
+        not isinstance(min_choices, int)
+        or isinstance(min_choices, bool)
+        or min_choices < 1
+        or min_choices > len(choices)
+    ):
+        return False
+    if choice_mode == "single":
+        if min_choices != 1 or max_choices != 1:
+            return False
+    elif choice_mode == "multiple":
+        if max_choices is not None and (
+            not isinstance(max_choices, int)
+            or isinstance(max_choices, bool)
+            or max_choices < min_choices
+            or max_choices > len(choices)
+        ):
+            return False
+    else:
+        return False
+    return isinstance(prompt.get("submit_label"), str) and bool(
+        prompt["submit_label"].strip()
+    )
+
+def _prompt_choice_modal(self, prompt: dict, timeout: float = 120) -> dict | None:
+    """Return one structured chooser submission, or ``None`` on cancel/timeout."""
+    if not self._is_valid_choice_prompt(prompt):
         return None
     choice_mode = prompt.get("choice_mode")
     choices = prompt.get("choices")
-    if choice_mode not in ("single", "multiple") or not isinstance(choices, list):
-        return None
     if not getattr(self, "_app", None):
         return None
     if not getattr(sys.stdin, "isatty", lambda: False)():
@@ -499,31 +655,11 @@ def _prompt_choice_modal(self, prompt: dict, timeout: float = 120) -> dict | Non
     if not getattr(sys.stdout, "isatty", lambda: False)():
         return None
     modal_choices = [
-        (choice["id"], choice["label"], choice.get("description", ""))
+        (choice["id"], choice["label"], choice["description"])
         for choice in choices
-        if isinstance(choice, dict)
-        and isinstance(choice.get("id"), str)
-        and isinstance(choice.get("label"), str)
-        and isinstance(choice.get("description", ""), str)
     ]
-    if len(modal_choices) != len(choices) or not modal_choices:
-        return None
     min_choices = prompt.get("min_choices")
     max_choices = prompt.get("max_choices")
-    if (
-        not isinstance(min_choices, int)
-        or isinstance(min_choices, bool)
-        or min_choices < 1
-        or (
-            max_choices is not None
-            and (
-                not isinstance(max_choices, int)
-                or isinstance(max_choices, bool)
-                or max_choices < min_choices
-            )
-        )
-    ):
-        return None
     initial_selected = -1 if choice_mode == "single" else 0
     # RISK(race): the existing app-loop handoff remains the sole writer of the
     # shared modal state while the process_loop thread waits on its queue.
@@ -625,20 +761,11 @@ def _continue_choice_modal_result(
     moa_config,
 ):
     """Resolve bounded handled choosers through the same user-turn hook path."""
-    prompt_fields = (
-        "choice_prompt_id",
-        "choice_mode",
-        "min_choices",
-        "max_choices",
-        "submit_label",
-        "expires_at",
-        "choices",
-    )
     for _choice_turn in range(16):
         if (
             not isinstance(result, dict)
             or not result.get("handled")
-            or any(field not in result for field in prompt_fields)
+            or not self._is_valid_choice_prompt(result)
         ):
             return result
         submission = self._prompt_choice_modal(result)
@@ -646,13 +773,19 @@ def _continue_choice_modal_result(
             return result
         result = self.agent.run_conversation(
             user_message=submission,
-            conversation_history=result.get("messages", conversation_history),
+            conversation_history=conversation_history,
             stream_callback=stream_callback,
             task_id=task_id,
             is_user_turn=True,
             persist_user_message=None,
             moa_config=moa_config,
         )
+    if (
+        not isinstance(result, dict)
+        or not result.get("handled")
+        or not self._is_valid_choice_prompt(result)
+    ):
+        return result
     return {
         "final_response": "Hermes chooser stopped after too many consecutive prompts.",
         "messages": result.get("messages", conversation_history),
@@ -837,7 +970,11 @@ def change_cli_source(source: str) -> str:
         addition=(
             'choice_mode = state.get("choice_mode", "single")',
             'selected_ids = state.get("selected_ids") or set()',
-            "instructions = self._choice_modal_instructions(state)",
+            "instructions = (",
+            "    self._choice_modal_instructions(state)",
+            '    if state.get("structured_choice_modal")',
+            '    else "Type 1/2/3 or use ↑/↓ then Enter. ESC/Ctrl+C cancels."',
+            ")",
         ),
         max_lines=18,
         label="cli.py chooser display state",

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import queue
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -352,6 +354,29 @@ def test_cli_carries_a_generic_keyboard_choice_modal_without_raw_readers() -> No
     compile(changed, "<changed Hermes CLI>", "exec")
 
 
+def test_legacy_slash_display_does_not_require_the_structured_modal_helper() -> None:
+    namespace: dict[str, object] = {
+        "queue": queue,
+        "_append_panel_line": lambda *args: None,
+        "box_width": 80,
+    }
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    legacy_shell = types.SimpleNamespace(
+        _slash_confirm_state={
+            "title": "Confirm",
+            "detail": "Legacy slash confirmation.",
+            "choices": [("once", "Approve Once", "Proceed once.")],
+            "selected": 0,
+        }
+    )
+
+    fragments = namespace["ModalShell"]._get_slash_confirm_display_fragments(
+        legacy_shell
+    )
+
+    assert fragments == []
+
+
 def test_multiple_choice_requires_space_toggle_before_done() -> None:
     namespace: dict[str, object] = {"queue": queue}
     exec(installer.change_cli_source(CLI_SOURCE), namespace)
@@ -384,6 +409,26 @@ def test_multiple_choice_requires_space_toggle_before_done() -> None:
     assert cli._slash_confirm_state is None
 
 
+@pytest.mark.parametrize(
+    ("path", "sentinel"),
+    [
+        pytest.param("ctrl-c", "cancel", id="ctrl-c"),
+        pytest.param("timeout", None, id="timeout"),
+        pytest.param("cancel", None, id="cancel"),
+    ],
+)
+def test_choice_modal_cancel_sentinels_never_submit_a_stable_id(path, sentinel) -> None:
+    tty = type("TTY", (), {"isatty": lambda self: True})()
+    fake_sys = type("Sys", (), {"stdin": tty, "stdout": tty})()
+    namespace: dict[str, object] = {"queue": queue, "sys": fake_sys}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    cli = namespace["ModalShell"]()
+    cli._app = object()
+    cli._prompt_text_input_modal = lambda **kwargs: sentinel
+
+    assert cli._prompt_choice_modal(_valid_cli_prompt()) is None, path
+
+
 def test_cli_reenters_the_same_user_turn_path_with_stable_ids() -> None:
     namespace: dict[str, object] = {"queue": queue, "maybe_auto_title": lambda: None}
     exec(installer.change_cli_source(CLI_SOURCE), namespace)
@@ -405,7 +450,7 @@ def test_cli_reenters_the_same_user_turn_path_with_stable_ids() -> None:
                     "min_choices": 1,
                     "max_choices": 1,
                     "submit_label": "Choose mode",
-                    "expires_at": "2026-07-18T03:00:00Z",
+                    "expires_at": "2099-07-18T03:00:00Z",
                     "choices": [
                         {"id": "chat", "label": "Chat", "description": "Chat."},
                         {"id": "task", "label": "Task", "description": "Task."},
@@ -461,7 +506,7 @@ def test_cli_modal_cancel_does_not_reenter_or_auto_select_first_choice() -> None
                 "min_choices": 1,
                 "max_choices": 1,
                 "submit_label": "Choose mode",
-                "expires_at": "2026-07-18T03:00:00Z",
+                "expires_at": "2099-07-18T03:00:00Z",
                 "choices": [
                     {"id": "chat", "label": "Chat", "description": "Chat."},
                     {"id": "task", "label": "Task", "description": "Task."},
@@ -480,6 +525,182 @@ def test_cli_modal_cancel_does_not_reenter_or_auto_select_first_choice() -> None
     assert result["api_calls"] == 0
     assert result["choices"][0]["id"] == "chat"
     assert "- Chat [id: chat]" in result["final_response"]
+
+
+def _valid_cli_prompt() -> dict[str, object]:
+    return {
+        "final_response": "Choose mode.",
+        "messages": [{"role": "assistant", "content": "intermediate chooser"}],
+        "api_calls": 0,
+        "handled": True,
+        "choice_prompt_id": "79df97c7-ff3d-4415-8b2e-dbe93bd10590",
+        "choice_mode": "single",
+        "min_choices": 1,
+        "max_choices": 1,
+        "submit_label": "Choose mode",
+        "expires_at": "2099-07-18T03:00:00Z",
+        "choices": [
+            {"id": "chat", "label": "Chat", "description": "Chat."},
+            {"id": "task", "label": "Task", "description": "Task."},
+        ],
+    }
+
+
+def test_sixteenth_reentry_returns_a_nonchooser_result_unchanged() -> None:
+    namespace: dict[str, object] = {"queue": queue}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    prompt = _valid_cli_prompt()
+    final_result = {
+        "final_response": "Model answer",
+        "messages": [{"role": "assistant", "content": "Model answer"}],
+        "api_calls": 1,
+        "completed": True,
+    }
+    calls = 0
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**kwargs):
+            nonlocal calls
+            calls += 1
+            return final_result if calls == 16 else dict(prompt)
+
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli._prompt_choice_modal = lambda _prompt: {
+        "choice_prompt_id": prompt["choice_prompt_id"],
+        "selected_choice_ids": ["chat"],
+    }
+
+    result = cli._continue_choice_modal_result(
+        dict(prompt),
+        conversation_history=[{"role": "assistant", "content": "base"}],
+        stream_callback=None,
+        task_id="session-1",
+        moa_config=None,
+    )
+
+    assert calls == 16
+    assert result is final_result
+    assert result["api_calls"] == 1
+    assert result["final_response"] == "Model answer"
+
+
+def test_sixteenth_reentry_stops_only_when_it_is_still_a_chooser() -> None:
+    namespace: dict[str, object] = {"queue": queue}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    prompt = _valid_cli_prompt()
+    calls = 0
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**kwargs):
+            nonlocal calls
+            calls += 1
+            return dict(prompt)
+
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli._prompt_choice_modal = lambda _prompt: {
+        "choice_prompt_id": prompt["choice_prompt_id"],
+        "selected_choice_ids": ["chat"],
+    }
+
+    result = cli._continue_choice_modal_result(
+        dict(prompt),
+        conversation_history=[{"role": "assistant", "content": "base"}],
+        stream_callback=None,
+        task_id="session-1",
+        moa_config=None,
+    )
+
+    assert calls == 16
+    assert result["handled"] is True
+    assert result["api_calls"] == 0
+    assert "too many consecutive prompts" in result["final_response"]
+
+
+def test_cli_reentries_keep_only_base_history_until_chat_reaches_the_model(
+    monkeypatch,
+) -> None:
+    prompt_one = _valid_cli_prompt()
+    prompt_two = {
+        **_valid_cli_prompt(),
+        "choice_prompt_id": "483ad83b-2972-46fc-a839-b348b1487710",
+        "final_response": "Choose again.",
+    }
+    hook_calls = 0
+    plugins = types.ModuleType("hermes_cli.plugins")
+
+    def invoke_hook(name, **values):
+        nonlocal hook_calls
+        hook_calls += 1
+        if hook_calls == 1:
+            return [{"action": "handled", "text": "Choose mode.", **prompt_one}]
+        if hook_calls == 2:
+            return [{"action": "handled", "text": "Choose again.", **prompt_two}]
+        return [{"action": "replace", "text": "first input"}]
+
+    plugins.has_hook = lambda name: True
+    plugins.invoke_hook = invoke_hook
+    package = types.ModuleType("hermes_cli")
+    package.plugins = plugins
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+    conversation_source = CONVERSATION_SOURCE.replace(
+        'return {"seen": user_message}',
+        "model_context = list(conversation_history or [])\n"
+        '        model_context.append({"role": "user", "content": user_message})\n'
+        "        model_calls.append(model_context)\n"
+        '        return {"final_response": "Model answer", "messages": model_context, "api_calls": 1}',
+    )
+    model_calls: list[list[dict[str, object]]] = []
+    conversation_namespace: dict[str, object] = {"model_calls": model_calls}
+    exec(installer.change_conversation_source(conversation_source), conversation_namespace)
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**kwargs):
+            return conversation_namespace["run_conversation"](
+                types.SimpleNamespace(platform="cli", _gateway_session_key="session-1"),
+                **kwargs,
+            )
+
+    cli_namespace: dict[str, object] = {
+        "queue": queue,
+        "maybe_auto_title": lambda: None,
+    }
+    exec(installer.change_cli_source(CLI_SOURCE), cli_namespace)
+    cli = cli_namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli.conversation_history = [
+        {"role": "assistant", "content": "base"},
+        {"role": "user", "content": "first input"},
+    ]
+    cli.session_id = "session-1"
+    selections = iter(
+        [
+            {
+                "choice_prompt_id": prompt_one["choice_prompt_id"],
+                "selected_choice_ids": ["task"],
+            },
+            {
+                "choice_prompt_id": prompt_two["choice_prompt_id"],
+                "selected_choice_ids": ["chat"],
+            },
+        ]
+    )
+    cli._prompt_choice_modal = lambda _prompt: next(selections)
+
+    result = cli_namespace["process"](cli, "first input", "first input", None)
+
+    assert result["api_calls"] == 1
+    assert len(model_calls) == 1
+    assert model_calls[0] == [
+        {"role": "assistant", "content": "base"},
+        {"role": "user", "content": "first input"},
+    ]
+    assert all(message["content"] for message in result["messages"])
 
 
 def test_tui_transports_choice_objects_in_message_payload() -> None:
