@@ -1748,12 +1748,21 @@ def change_desktop_prompts_store_source(source: str) -> str:
         ("import type { ChoicePromptPayload, GatewayEventPayload } from '@/lib/chat-messages'",),
         label="Desktop chooser store type import",
     )
+    identity_anchor = (
+        "const idOf = (value: T): string | undefined => "
+        "(value as { requestId?: string }).requestId"
+    )
+    identity_postcondition = (
+        "const idOf = (value: T): string | undefined => "
+        "(value as { choicePromptId?: string; requestId?: string }).requestId ?? "
+        "(value as { choicePromptId?: string }).choicePromptId"
+    )
     source = _replace_unique_line(
         source,
-        "const idOf = (value: T): string | undefined => (value as { requestId?: string }).requestId",
-        "const idOf = (value: T): string | undefined => (value as { choicePromptId?: string; requestId?: string }).requestId ?? (value as { choicePromptId?: string }).choicePromptId",
+        identity_anchor,
+        identity_postcondition,
         label="Desktop chooser stale clear identity",
-    ) if "const idOf =" in source else source
+    )
     anchor = "export interface ApprovalRequest extends KeyedPrompt {"
     addition = '''export interface ChoiceRequest extends KeyedPrompt {
   choiceMode: 'multiple' | 'single'
@@ -1814,20 +1823,19 @@ export function choiceRequestFromPayload(payload: GatewayEventPayload | undefine
         ),
         label="Desktop chooser store exports",
     )
-    if "secret.reset()" in source:
-        source = _insert_after_unique_line(
-            source,
-            "secret.reset()",
-            ("choice.reset()",),
-            label="Desktop chooser global clear",
-        )
-        source = _insert_after_unique_line(
-            source,
-            "secret.clear(sessionId)",
-            ("choice.clear(sessionId)",),
-            label="Desktop chooser session clear",
-        )
-    return _replace_unique_sequence(
+    source = _insert_after_unique_line(
+        source,
+        "secret.reset()",
+        ("choice.reset()",),
+        label="Desktop chooser global clear",
+    )
+    source = _insert_after_unique_line(
+        source,
+        "secret.clear(sessionId)",
+        ("choice.clear(sessionId)",),
+        label="Desktop chooser session clear",
+    )
+    source = _replace_unique_sequence(
         source,
         (
             "export const $activeSessionAwaitingInput = computed(",
@@ -1843,6 +1851,14 @@ export function choiceRequestFromPayload(payload: GatewayEventPayload | undefine
         ),
         label="Desktop chooser awaiting input",
     )
+    for expected, label in (
+        (identity_postcondition, "Desktop chooser stale clear identity"),
+        ("choice.reset()", "Desktop chooser global clear"),
+        ("choice.clear(sessionId)", "Desktop chooser session clear"),
+    ):
+        if source.count(expected) != 1:
+            raise InstallError(f"{label} postcondition failed")
+    return source
 
 
 def change_desktop_gateway_event_source(source: str) -> str:

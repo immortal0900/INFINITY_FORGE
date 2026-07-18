@@ -108,6 +108,24 @@ def test_windows_hermes_package_uses_live_runtime_snapshot() -> None:
     assert '$packageVersion = "$Commit-$hermesRuntimeVersion"' in script
 
 
+def test_windows_reused_package_rejects_reordered_target_manifest() -> None:
+    script = _script()
+    package_function = script[
+        script.index("function New-HermesChangePackage") : script.index(
+            "function Get-PreviousHermesPackage"
+        )
+    ]
+
+    assert "Compare-Object" not in package_function
+    assert (
+        "$manifestTargets.Count -ne $Paths.HermesChangeTargets.Count"
+        in package_function
+    )
+    assert "[StringComparison]::Ordinal" in package_function
+    assert "$manifestTargets[$index]" in package_function
+    assert "$Paths.HermesChangeTargets[$index]" in package_function
+
+
 def test_previous_package_is_restored_before_new_runtime_snapshot() -> None:
     script = _script()
     start = script.index("function Invoke-ForgeWindowsApply")

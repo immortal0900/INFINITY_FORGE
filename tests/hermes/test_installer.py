@@ -729,6 +729,11 @@ def test_desktop_chooser_has_separate_keyed_store_and_accessible_controls() -> N
     assert "ChoicePromptPayload" in changed_payload
     assert "keyedPromptStore<ChoiceRequest>" in changed_store
     assert "choicePromptId" in changed_store
+    assert (
+        "const idOf = (value: T): string | undefined => "
+        "(value as { choicePromptId?: string; requestId?: string }).requestId ?? "
+        "(value as { choicePromptId?: string }).choicePromptId"
+    ) in changed_store
     assert "setChoiceRequest" in changed_handler
     assert "clearAllPrompts(sessionId)" in changed_handler
     assert changed_handler.index("clearAllPrompts(sessionId)") < changed_handler.index(
@@ -777,6 +782,50 @@ def test_desktop_prompt_store_missing_production_awaiting_input_anchor_fails() -
     )
 
     with pytest.raises(InstallError, match="awaiting input"):
+        installer.change_desktop_prompts_store_source(broken)
+
+
+@pytest.mark.parametrize(
+    "identity_line",
+    (
+        "",
+        "const promptIdentityOf = (value: T): string | undefined => "
+        "(value as { requestId?: string }).requestId",
+        "const idOf = (value: T): string | undefined => "
+        "(value as { requestId?: string }).requestId || undefined",
+    ),
+    ids=("missing", "renamed", "request-id-only-variant"),
+)
+def test_desktop_prompt_store_requires_exact_choice_identity_seam(
+    identity_line: str,
+) -> None:
+    broken = DESKTOP_PROMPTS_STORE_SOURCE.replace(
+        "const idOf = (value: T): string | undefined => "
+        "(value as { requestId?: string }).requestId",
+        identity_line,
+    )
+
+    with pytest.raises(InstallError, match="stale clear identity"):
+        installer.change_desktop_prompts_store_source(broken)
+
+
+def test_desktop_prompt_store_requires_exact_global_clear_seam() -> None:
+    broken = DESKTOP_PROMPTS_STORE_SOURCE.replace(
+        "    secret.reset()",
+        "    for (const store of [approval, sudo, secret]) store.reset()",
+    )
+
+    with pytest.raises(InstallError, match="global clear"):
+        installer.change_desktop_prompts_store_source(broken)
+
+
+def test_desktop_prompt_store_requires_exact_session_clear_seam() -> None:
+    broken = DESKTOP_PROMPTS_STORE_SOURCE.replace(
+        "  secret.clear(sessionId)",
+        "  for (const store of [approval, sudo, secret]) store.clear(sessionId)",
+    )
+
+    with pytest.raises(InstallError, match="session clear"):
         installer.change_desktop_prompts_store_source(broken)
 
 

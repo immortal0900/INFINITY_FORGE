@@ -320,8 +320,17 @@ function New-HermesChangePackage {
       throw "Existing Hermes change package has a different version."
     }
     $manifestTargets = @($manifest.files | ForEach-Object { $_.path })
-    if (@(Compare-Object $Paths.HermesChangeTargets $manifestTargets).Count -ne 0) {
+    if ($manifestTargets.Count -ne $Paths.HermesChangeTargets.Count) {
       throw "Existing Hermes change package has unexpected target paths."
+    }
+    for ($index = 0; $index -lt $manifestTargets.Count; $index++) {
+      if (-not [string]::Equals(
+        [string]$manifestTargets[$index],
+        [string]$Paths.HermesChangeTargets[$index],
+        [StringComparison]::Ordinal
+      )) {
+        throw "Existing Hermes change package has unexpected target paths."
+      }
     }
     return [pscustomobject]@{
       Path = $packagePath
