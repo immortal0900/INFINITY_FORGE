@@ -29,9 +29,9 @@ def test_chooser_shows_plain_human_readable_english_options() -> None:
     setup = TaskSetup()
 
     mode = setup.handle("s1", "u1", "첫 입력", NOW)
-    flow = setup.handle("s1", "u1", "Task", NOW + timedelta(seconds=1))
+    flow = setup.handle("s1", "u1", "task", NOW + timedelta(seconds=1))
     merge = setup.handle(
-        "s1", "u1", "Build + Review", NOW + timedelta(seconds=2)
+        "s1", "u1", "build_review", NOW + timedelta(seconds=2)
     )
 
     assert [choice["label"] for choice in _hook_result(mode)["choices"]] == [
@@ -261,6 +261,44 @@ def test_structured_submission_does_not_refresh_or_apply_an_expired_prompt() -> 
 
     assert expired.action == "handled"
     assert expired.choice_prompt == mode.choice_prompt
+
+
+def test_new_session_discards_stale_structured_submission_before_it_can_apply() -> None:
+    setup = TaskSetup()
+    mode = setup.handle("s1", "u1", "first request", NOW)
+
+    assert mode.choice_prompt is not None
+    stale = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("task",)),
+        NOW + timedelta(seconds=1),
+        is_new_session=True,
+    )
+    fresh = setup.handle("s1", "u1", "new request", NOW + timedelta(seconds=2))
+
+    assert stale.action == "handled"
+    assert stale.choice_prompt is None
+    assert fresh.next_step is SetupStep.MODE
+
+
+def test_text_only_choice_accepts_stable_ids_not_visible_labels() -> None:
+    setup = TaskSetup()
+    setup.handle("s1", "u1", "first request", NOW)
+
+    rejected_mode = setup.handle("s1", "u1", "Task", NOW + timedelta(seconds=1))
+    flow = setup.handle("s1", "u1", "task", NOW + timedelta(seconds=2))
+    rejected_flow = setup.handle(
+        "s1", "u1", "Build + Review", NOW + timedelta(seconds=3)
+    )
+    merge = setup.handle(
+        "s1", "u1", "build_review", NOW + timedelta(seconds=4)
+    )
+
+    assert rejected_mode.next_step is SetupStep.MODE
+    assert flow.next_step is SetupStep.TASK_FLOW
+    assert rejected_flow.next_step is SetupStep.TASK_FLOW
+    assert merge.next_step is SetupStep.MERGE_MODE
 
 
 def test_inactive_task_draft_expires_after_thirty_minutes() -> None:

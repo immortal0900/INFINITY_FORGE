@@ -342,6 +342,17 @@ def _handle_pending_task(
     return None, pending.request
 
 
+def _is_confirmation_input(
+    submission: ChoiceSubmission | None,
+    text: str,
+) -> bool:
+    """Use structured selection as authority whenever its envelope is present."""
+
+    if submission is not None:
+        return submission.selected_choice_ids == ("confirm",)
+    return text.strip() == "confirm"
+
+
 def _deliver_confirmed_task(
     result: TurnResult,
     key: StateKey,
@@ -361,8 +372,6 @@ def _deliver_confirmed_task(
             ),
             None,
         )
-    if len(_pending_tasks) >= _MAX_PENDING_TASKS and key not in _pending_tasks:
-        raise RuntimeError("Pending Task capacity was exceeded")
     _pending_tasks[key] = _PendingTask(result.task_request, in_flight=True)
     return None, result.task_request
 
@@ -399,21 +408,27 @@ def before_user_turn(
     cleanup_time = _cleanup_time(combined)
     key = _fallback_key(combined)
     raw_text = combined.get("text")
-    choice = raw_text.strip().lower() if isinstance(raw_text, str) else ""
+    choice = raw_text.strip() if isinstance(raw_text, str) else ""
     preserved_text = raw_text if isinstance(raw_text, str) else ""
     service_request: TaskCreationRequest | None = None
 
-    with _state_lock:
-        pending_result, service_request = _handle_pending_task(key, choice)
-        if pending_result is not None:
-            return pending_result
-        if service_request is None:
+    # RISK(breaking): an envelope is authoritative over text controls. Parse it
+    # before retry, cancel, or confirmation can reach any external Task state.
+    try:
+        submission = _read_choice_submission(combined)
+    except ChoicePromptError as error:
+        return _error_result(error)
+
+    try:
+        session_id, user_id, surface, text, is_new_session, now = _read_event(
+            combined
+        )
+    except Exception as error:
+        with _state_lock:
             _sweep_failed_inputs(cleanup_time)
-            if combined.get("is_new_session") is True:
-                _failed_inputs.pop(key, None)
-            failed = _failed_inputs.get(key)
-            if failed is not None:
-                if choice == "continue_chat":
+            if submission is None:
+                failed = _failed_inputs.get(key)
+                if failed is not None and choice == "continue_chat":
                     _failed_inputs.pop(key, None)
                     surface, session_id, user_id = key
                     try:
@@ -423,40 +438,76 @@ def before_user_turn(
                             surface=surface,
                             now=cleanup_time,
                         )
-                    except Exception as error:
+                    except Exception as setup_error:
                         _failed_inputs[key] = failed
-                        return _error_result(error)
+                        return _error_result(setup_error)
                     return _hook_result(TurnResult.replace(failed.text))
-                if choice == "retry":
-                    _failed_inputs.pop(key, None)
-                    preserved_text = failed.text
-                    combined = dict(failed.event)
-                    combined.pop("now", None)
-                    key = _fallback_key(combined)
-                else:
-                    return _error_result(
-                        ValueError(
-                            "Choose Retry or Continue in Chat after this error."
-                        )
+                if failed is not None and choice == "retry":
+                    _store_failed_input(
+                        key, failed.text, failed.event, cleanup_time
                     )
+                    return _error_result(error)
+            _store_failed_input(key, preserved_text, combined, cleanup_time)
+        return _error_result(error)
 
-            try:
-                session_id, user_id, surface, text, is_new_session, now = _read_event(
-                    combined
-                )
-            except Exception as error:
-                _store_failed_input(key, preserved_text, combined, cleanup_time)
-                return _error_result(error)
+    key = (surface, session_id, user_id)
 
-            try:
-                submission = _read_choice_submission(combined)
-            except ChoicePromptError as error:
-                return _error_result(error)
+    with _state_lock:
+        _sweep_failed_inputs(cleanup_time)
+        if is_new_session:
+            _failed_inputs.pop(key, None)
 
-            parsed_choice = text.strip().lower()
+        # Structured controls never enter the text retry path. A new session
+        # likewise cannot resume a predecessor's pending Task from its text.
+        if submission is None and not is_new_session:
+            pending_result, service_request = _handle_pending_task(key, choice)
+            if pending_result is not None:
+                return pending_result
+        if service_request is None:
+            if submission is None and not is_new_session:
+                failed = _failed_inputs.get(key)
+                if failed is not None:
+                    if choice == "continue_chat":
+                        _failed_inputs.pop(key, None)
+                        surface, session_id, user_id = key
+                        try:
+                            _task_setup.enter_chat(
+                                session_id,
+                                user_id,
+                                surface=surface,
+                                now=cleanup_time,
+                            )
+                        except Exception as error:
+                            _failed_inputs[key] = failed
+                            return _error_result(error)
+                        return _hook_result(TurnResult.replace(failed.text))
+                    if choice == "retry":
+                        _failed_inputs.pop(key, None)
+                        preserved_text = failed.text
+                        combined = dict(failed.event)
+                        combined.pop("now", None)
+                        key = _fallback_key(combined)
+                        try:
+                            session_id, user_id, surface, text, is_new_session, now = (
+                                _read_event(combined)
+                            )
+                        except Exception as error:
+                            _store_failed_input(
+                                key, preserved_text, combined, cleanup_time
+                            )
+                            return _error_result(error)
+                        key = (surface, session_id, user_id)
+                    else:
+                        return _error_result(
+                            ValueError(
+                                "Choose Retry or Continue in Chat after this error."
+                            )
+                        )
+
             if (
-                parsed_choice == "confirm"
+                _is_confirmation_input(submission, text)
                 and len(_pending_tasks) >= _MAX_PENDING_TASKS
+                and key not in _pending_tasks
             ):
                 return _hook_result(
                     TurnResult.handled(
@@ -484,6 +535,7 @@ def before_user_turn(
                         submission,
                         now,
                         surface=surface,
+                        is_new_session=is_new_session,
                         repository=os.environ.get(_REPOSITORY_ENV),
                     )
             except Exception as error:

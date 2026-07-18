@@ -233,13 +233,23 @@ class TaskSetup:
         now: datetime | None = None,
         *,
         surface: str = DEFAULT_SURFACE,
+        is_new_session: bool = False,
         repository: str | None = None,
     ) -> TurnResult:
-        """Apply a structured chooser submission only to its pending prompt."""
+        """Apply a structured submission to its pending prompt.
+
+        A new session invalidates every prompt from its predecessor before the
+        submission is inspected, so a stale confirmation cannot create a Task.
+        """
 
         current_time = now or self._clock()
         key = (surface, session_id, user_id)
         with self._lock:
+            if is_new_session:
+                # RISK(breaking): structured callers must send the current
+                # session flag or a stale confirmation is deliberately rejected.
+                self._discard(key)
+                return TurnResult.handled("No pending chooser is available.")
             draft = self._drafts.get(key)
             if draft is None or draft.choice_prompt is None:
                 return TurnResult.handled("No pending chooser is available.")
@@ -258,7 +268,7 @@ class TaskSetup:
         current_time: datetime,
         repository: str | None,
     ) -> TurnResult:
-        choice = text.strip().lower()
+        choice = text.strip()
 
         if choice == "/task":
             return self._start_task(key, current_time)
@@ -605,12 +615,12 @@ class TaskSetup:
         return request_id
 
     @staticmethod
-    def _selected_value(choice: str, labels: dict[Enum, str]) -> Enum | None:
-        """Match a visible label while retaining stable internal storage values."""
+    def _selected_value(choice: str, values: dict[Enum, str]) -> Enum | None:
+        """Match only the stable ID; labels remain presentation-only text."""
 
-        normalized = choice.strip().casefold()
-        for value, label in labels.items():
-            if normalized in {label.casefold(), str(value.value).casefold()}:
+        normalized = choice.strip()
+        for value in values:
+            if normalized == str(value.value):
                 return value
         return None
 

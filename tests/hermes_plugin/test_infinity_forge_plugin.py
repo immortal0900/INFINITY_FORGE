@@ -320,6 +320,117 @@ def test_task_service_error_retries_the_same_frozen_request(monkeypatch) -> None
     assert requests[0] is requests[1]
 
 
+def test_pending_retry_rejects_malformed_structured_envelope_before_service_call(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+
+    def failing_task_service(request) -> str:
+        calls.append(request)
+        raise RuntimeError("service offline")
+
+    plugin.set_task_service(failing_task_service)
+    _complete_task_until_confirmation(monkeypatch)
+    plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        text="confirm",
+    )
+
+    rejected = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        text="retry",
+        choice_prompt_id="not-a-uuid",
+        selected_choice_ids=["retry"],
+    )
+
+    assert rejected["action"] == "handled"
+    assert "choice_prompt_id" in str(rejected["text"])
+    assert len(calls) == 1
+
+
+def test_new_session_rejects_stale_structured_confirm_without_task_service_call(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+    plugin.set_task_service(lambda request: calls.append(request) or "created")
+    preview = _complete_task_until_confirmation(monkeypatch)
+
+    rejected = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=True,
+        text="ignored",
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["confirm"],
+    )
+
+    assert rejected["action"] == "handled"
+    assert calls == []
+
+
+def test_structured_confirmation_capacity_uses_selected_id_and_preserves_draft(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+    plugin.set_task_service(lambda request: calls.append(request) or "created")
+    preview = _complete_task_until_confirmation(monkeypatch)
+    monkeypatch.setattr(plugin, "_MAX_PENDING_TASKS", 1)
+    plugin._pending_tasks[("tui", "other", "user")] = object()
+
+    blocked = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        text="not-confirm",
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["confirm"],
+    )
+    plugin._pending_tasks.clear()
+    confirmed = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        text="not-confirm",
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["confirm"],
+    )
+
+    assert blocked["action"] == "handled"
+    assert "temporarily full" in str(blocked["text"])
+    assert confirmed == {"action": "handled", "text": "created"}
+    assert len(calls) == 1
+
+
+def test_structured_cancel_is_not_blocked_by_confirm_text_when_pending_is_full(
+    monkeypatch,
+) -> None:
+    preview = _complete_task_until_confirmation(monkeypatch)
+    monkeypatch.setattr(plugin, "_MAX_PENDING_TASKS", 1)
+    plugin._pending_tasks[("tui", "other", "user")] = object()
+
+    cancelled = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        text="confirm",
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["cancel"],
+    )
+
+    assert cancelled["action"] == "handled"
+    assert "cancelled" in str(cancelled["text"]).lower()
+
+
 def test_pending_task_can_only_be_cancelled_without_another_service_call(monkeypatch) -> None:
     requests: list[object] = []
 
