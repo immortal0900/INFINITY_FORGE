@@ -216,6 +216,7 @@ class SetupDraft:
     task_owner_host: str | None
     task_text: str | None
     task_request: TaskCreationRequest | None
+    v2_request_id: str | None
     task_request_v2: TaskRequestV2 | None
     expires_at: datetime
     choice_prompt: ChoicePrompt | None
@@ -339,7 +340,12 @@ class TaskSetup:
         repository: str | None = None,
         context: TaskSetupContext | None = None,
     ) -> TurnResult:
-        """Consume one user input and return continue, replace, or handled."""
+        """Consume one trusted/internal text input.
+
+        Production surfaces must bind chooser replies to a prompt through
+        :meth:`handle_submission`; raw stable IDs remain a compatibility seam
+        for direct callers and tests only.
+        """
 
         current_time = now or self._clock()
         key = (surface, session_id, user_id)
@@ -484,6 +490,7 @@ class TaskSetup:
                         merge_order=None,
                         task_text=None,
                         task_request=None,
+                        v2_request_id=None,
                         task_request_v2=None,
                         operation_token=None,
                     )
@@ -501,6 +508,7 @@ class TaskSetup:
                     task_owner_host=outcome.context.task_owner_host,
                     task_text=None,
                     task_request=None,
+                    v2_request_id=None,
                     task_request_v2=None,
                     operation_token=None,
                 )
@@ -532,6 +540,7 @@ class TaskSetup:
                         merge_order=None,
                         task_text=None,
                         task_request=None,
+                        v2_request_id=None,
                         task_request_v2=None,
                         operation_token=None,
                     )
@@ -720,6 +729,7 @@ class TaskSetup:
             task_owner_host=None,
             task_text=None,
             task_request=None,
+            v2_request_id=None,
             task_request_v2=None,
             expires_at=expires_at,
             choice_prompt=None,
@@ -742,6 +752,7 @@ class TaskSetup:
             task_owner_host=None,
             task_text=None,
             task_request=None,
+            v2_request_id=None,
             task_request_v2=None,
             expires_at=expires_at,
             choice_prompt=None,
@@ -839,6 +850,7 @@ class TaskSetup:
                 task_owner_host=None,
                 task_text=None,
                 task_request=None,
+                v2_request_id=None,
                 task_request_v2=None,
             )
             self._store_draft(key, task_draft, now)
@@ -870,6 +882,7 @@ class TaskSetup:
             task_owner_host=None,
             task_text=None,
             task_request=None,
+            v2_request_id=None,
             task_request_v2=None,
             operation_token=token,
         )
@@ -943,6 +956,7 @@ class TaskSetup:
             merge_order=None,
             task_text=None,
             task_request=None,
+            v2_request_id=None,
             task_request_v2=None,
             operation_token=None,
         )
@@ -971,6 +985,7 @@ class TaskSetup:
             merge_order=None,
             task_text=None,
             task_request=None,
+            v2_request_id=None,
             task_request_v2=None,
         )
         self._store_draft(key, selected, now)
@@ -996,6 +1011,7 @@ class TaskSetup:
             merge_mode=merge_mode,
             merge_order=None,
             task_request=None,
+            v2_request_id=None,
             task_request_v2=None,
         )
         if merge_mode is MergeMode.FULL_AUTO and len(selected.projects) > 1:
@@ -1083,29 +1099,17 @@ class TaskSetup:
     ) -> TurnResult:
         if draft.task_flow is None or draft.merge_mode is None:
             raise RuntimeError("Task choices are incomplete")
-        confirmed_at = self._normalized_utc(now)
         if draft.projects:
             if draft.management_repository is None or draft.task_owner_host is None:
                 raise RuntimeError("Trusted v2 Task configuration is missing")
-            request_v2 = TaskRequestV2.create(
-                request_id=self._new_request_id(),
-                management_repository=draft.management_repository,
-                task_content=self._task_content(task_text),
-                task_flow=draft.task_flow,
-                merge_mode=draft.merge_mode,
-                merge_order=draft.merge_order,
-                projects=draft.projects,
-                task_owner_host=draft.task_owner_host,
-                confirmed_by=key[2],
-                confirmed_at=confirmed_at,
-            )
             preview = self._refresh(
                 draft,
                 now,
                 step=SetupStep.CONFIRM,
                 task_text=task_text,
                 task_request=None,
-                task_request_v2=request_v2,
+                v2_request_id=self._new_request_id(),
+                task_request_v2=None,
             )
             self._store_draft(key, preview, now)
             return self._preview_prompt(preview)
@@ -1119,7 +1123,7 @@ class TaskSetup:
             task_flow=draft.task_flow,
             merge_mode=draft.merge_mode,
             confirmed_by=key[2],
-            confirmed_at=confirmed_at,
+            confirmed_at=self._normalized_utc(now),
         )
         # Validate the exact immutable request and derive its automatic-merge
         # expiry before it is shown to the user.
@@ -1138,6 +1142,7 @@ class TaskSetup:
             step=SetupStep.CONFIRM,
             task_text=task_text,
             task_request=request,
+            v2_request_id=None,
             task_request_v2=None,
         )
         self._store_draft(key, preview, now)
@@ -1153,7 +1158,7 @@ class TaskSetup:
     ) -> TurnResult | _ValidationWork:
         if choice == "cancel":
             return self._enter_chat(key, now)
-        if choice == "confirm" and draft.operation_token is not None:
+        if draft.operation_token is not None:
             return self._preview_prompt(
                 draft,
                 "Project validation is already in progress.",
@@ -1167,7 +1172,7 @@ class TaskSetup:
             )
         if draft.task_text is None:
             raise RuntimeError("Task content is missing")
-        if draft.task_request_v2 is not None:
+        if draft.v2_request_id is not None:
             if (
                 context is None
                 or context.management_repository != draft.management_repository
@@ -1184,6 +1189,7 @@ class TaskSetup:
                     merge_order=None,
                     task_text=None,
                     task_request=None,
+                    v2_request_id=None,
                     task_request_v2=None,
                     operation_token=None,
                 )
@@ -1193,7 +1199,25 @@ class TaskSetup:
                     "Trusted Task configuration changed. Discover Projects again.",
                 )
             token = str(uuid4())
-            pending = update(draft, operation_token=token)
+            if draft.task_flow is None or draft.merge_mode is None:
+                raise RuntimeError("Task choices are incomplete")
+            request_v2 = TaskRequestV2.create(
+                request_id=draft.v2_request_id,
+                management_repository=draft.management_repository,
+                task_content=self._task_content(draft.task_text),
+                task_flow=draft.task_flow,
+                merge_mode=draft.merge_mode,
+                merge_order=draft.merge_order,
+                projects=draft.projects,
+                task_owner_host=draft.task_owner_host,
+                confirmed_by=key[2],
+                confirmed_at=self._normalized_utc(now),
+            )
+            pending = update(
+                draft,
+                task_request_v2=request_v2,
+                operation_token=token,
+            )
             self._store_draft(key, pending, now)
             prompt_id = (
                 None
@@ -1575,19 +1599,51 @@ class TaskSetup:
         draft: SetupDraft,
         prefix: str | None = None,
     ) -> TurnResult:
-        if draft.task_request_v2 is not None:
+        if draft.v2_request_id is not None:
             request_v2 = draft.task_request_v2
+            task_content = (
+                request_v2.task_content
+                if request_v2 is not None
+                else TaskSetup._task_content(draft.task_text or "")
+            )
+            projects = (
+                request_v2.projects
+                if request_v2 is not None
+                else draft.projects
+            )
+            merge_order = (
+                request_v2.merge_order
+                if request_v2 is not None
+                else draft.merge_order
+            )
+            task_flow = (
+                request_v2.task_flow
+                if request_v2 is not None
+                else draft.task_flow
+            )
+            merge_mode = (
+                request_v2.merge_mode
+                if request_v2 is not None
+                else draft.merge_mode
+            )
+            if (
+                draft.management_repository is None
+                or draft.task_owner_host is None
+                or task_flow is None
+                or merge_mode is None
+            ):
+                raise RuntimeError("Task preview is incomplete")
             criteria = "\n".join(
                 f"{number}. {criterion}"
                 for number, criterion in enumerate(
-                    request_v2.task_content.acceptance_criteria,
+                    task_content.acceptance_criteria,
                     start=1,
                 )
             )
             order_ranks = {
                 project_id: rank
                 for rank, project_id in enumerate(
-                    request_v2.merge_order or (),
+                    merge_order or (),
                     start=1,
                 )
             }
@@ -1606,31 +1662,43 @@ class TaskSetup:
                     )
                     + f"Project ID: {project.project_id}"
                 )
-                for number, project in enumerate(request_v2.projects, start=1)
+                for number, project in enumerate(projects, start=1)
             )
-            expiry = (
-                "not granted"
-                if request_v2.auto_merge_expires_at is None
-                else TaskSetup._format_timestamp(
-                    request_v2.auto_merge_expires_at
+            if request_v2 is None:
+                expiry = (
+                    "not granted"
+                    if merge_mode is MergeMode.MANUAL
+                    else "set from Confirm Task selection time"
                 )
-            )
+                confirmed_by = "set when Confirm Task is selected"
+                confirmed_at = "set when Confirm Task is selected"
+            else:
+                expiry = (
+                    "not granted"
+                    if request_v2.auto_merge_expires_at is None
+                    else TaskSetup._format_timestamp(
+                        request_v2.auto_merge_expires_at
+                    )
+                )
+                confirmed_by = request_v2.confirmed_by
+                confirmed_at = TaskSetup._format_timestamp(
+                    request_v2.confirmed_at
+                )
             details = (
-                f"Management: {request_v2.management_repository}\n"
-                f"Task ID: {request_v2.request_id}\n"
-                f"Title: {request_v2.task_content.title}\n"
-                f"Description:\n{request_v2.task_content.description}\n"
+                f"Management: {draft.management_repository}\n"
+                f"Task ID: {draft.v2_request_id}\n"
+                f"Title: {task_content.title}\n"
+                f"Description:\n{task_content.description}\n"
                 f"Acceptance criteria:\n{criteria}\n"
                 f"{project_details}\n"
-                f"Checks selected: {_FLOW_LABELS[request_v2.task_flow]}\n"
-                f"Checks: {_FLOW_PATHS[request_v2.task_flow]}\n"
-                f"Merge choice: {_MERGE_LABELS[request_v2.merge_mode]}\n"
-                f"Merge result: {_MERGE_RESULTS[request_v2.merge_mode]}\n"
+                f"Checks selected: {_FLOW_LABELS[task_flow]}\n"
+                f"Checks: {_FLOW_PATHS[task_flow]}\n"
+                f"Merge choice: {_MERGE_LABELS[merge_mode]}\n"
+                f"Merge result: {_MERGE_RESULTS[merge_mode]}\n"
                 f"Automatic merge permission until: {expiry}\n"
-                f"Task owner host: {request_v2.task_owner_host}\n"
-                f"Confirmed by: {request_v2.confirmed_by}\n"
-                "Confirmed at: "
-                f"{TaskSetup._format_timestamp(request_v2.confirmed_at)}"
+                f"Task owner host: {draft.task_owner_host}\n"
+                f"Confirmed by: {confirmed_by}\n"
+                f"Confirmed at: {confirmed_at}"
             )
             text = f"{prefix}\n\n{details}" if prefix else details
             return TurnResult.handled(

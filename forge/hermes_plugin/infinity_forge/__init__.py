@@ -22,6 +22,10 @@ from uuid import UUID
 
 
 _RELEASE_SHA = re.compile(r"[0-9a-f]{40}")
+_PLAIN_CHOICE = re.compile(
+    r"^choose (?P<prompt_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}) (?P<choice_ids>\S(?:.*\S)?)$"
+)
 
 
 def _managed_release_root(plugin_file: Path) -> Path:
@@ -500,6 +504,18 @@ def _read_choice_submission(
     return ChoiceSubmission(prompt_id, tuple(selected_ids))
 
 
+def _read_plain_choice_submission(text: str) -> ChoiceSubmission | None:
+    """Parse the prompt-bound fallback emitted by production surfaces."""
+
+    matched = _PLAIN_CHOICE.fullmatch(text)
+    if matched is None:
+        return None
+    selected_ids = tuple(
+        part.strip() for part in matched.group("choice_ids").split(",")
+    )
+    return ChoiceSubmission(matched.group("prompt_id"), selected_ids)
+
+
 def _error_result(error: Exception) -> dict[str, object]:
     return {
         "action": "handled",
@@ -911,6 +927,23 @@ def before_user_turn(
             surface=surface,
         )
     )
+    if submission is None and pending_prompt is not None and text.startswith("choose "):
+        try:
+            submission = _read_plain_choice_submission(text)
+        except ChoicePromptError as error:
+            return _hook_result(
+                TurnResult.handled(
+                    f"That chooser reply is invalid: {error}",
+                    choice_prompt=pending_prompt,
+                )
+            )
+        if submission is None:
+            return _hook_result(
+                TurnResult.handled(
+                    "Use: choose <choice_prompt_id> <choice_id[,choice_id...]>",
+                    choice_prompt=pending_prompt,
+                )
+            )
     invalid_submission_reader = getattr(
         _task_setup,
         "invalid_submission_result",

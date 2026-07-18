@@ -129,11 +129,13 @@ reader를 만들지 않는다. 현재 Hermes의 Forge carried change는 `choices
   확정한다. 하나도 고르지 않은 상태의 확정은 거부한다.
 - `Esc` 또는 chooser 안의 `Cancel`은 현재 선택을 적용하지 않고 모달만 닫는다. 첫 항목을
   자동 선택하거나 `chat`을 기본 확정하지 않는다.
-- 비대화형 CLI처럼 모달을 열 수 없는 surface는 `stable ID — label`을 표시하고 ID 입력을
-  받는다. label이나 Project 경로를 권한 있는 입력값으로 사용하지 않는다.
+- 비대화형 CLI처럼 모달을 열 수 없는 surface는 `stable ID — label`을 표시하고
+  `choose <choice_prompt_id> <choice_id[,choice_id...]>` 입력을 받는다. label이나 Project
+  경로를 권한 있는 입력값으로 사용하지 않는다.
 - Desktop은 버튼 또는 checkbox 목록을 사용하고 키보드 `Arrow`·`Space`·`Enter`와 접근성
   label을 제공한다. Slack처럼 방향키를 가로챌 수 없는 surface는 Block Kit button 또는
-  multi-select를 사용하며 지원하지 않는 client에서는 stable ID 답장을 fallback으로 둔다.
+  multi-select를 사용하며 지원하지 않는 client에서는 prompt ID에 결합된 stable ID 답장을
+  fallback으로 둔다.
 
 모든 surface는 같은 transport-neutral chooser 계약을 사용한다.
 

@@ -890,6 +890,10 @@ def _choice_display_lines(result_name: str, response_name: str) -> tuple[str, ..
             f'_pre_user_turn_choices = {result_name}.get("choices", []) '
             f"if isinstance({result_name}, dict) else []"
         ),
+        (
+            f'_choice_prompt_id = {result_name}.get("choice_prompt_id") '
+            f"if isinstance({result_name}, dict) else None"
+        ),
         "if _pre_user_turn_choices:",
         "    _pre_user_turn_entries = [",
         "        (",
@@ -924,6 +928,13 @@ def _choice_display_lines(result_name: str, response_name: str) -> tuple[str, ..
             "for _choice_id, _label, _description in _pre_user_turn_entries"
             ")"
         ),
+        "        if isinstance(_choice_prompt_id, str):",
+        (
+            f'            {response_name} = f"{{{response_name}}}\\nReply with: '
+            'choose {_choice_prompt_id} <choice_id[,choice_id...]>"'
+        ),
+        "        else:",
+        f'            {response_name} = f"{{{response_name}}}\\nReply with exact ID."',
         f'        {result_name}["final_response"] = {response_name}',
     )
 
@@ -2195,7 +2206,12 @@ def change_slack_adapter_source(source: str) -> str:
             self._choice_prompts.pop(message_ts, None)
             self._choice_reply_prompts.pop(key, None)
             return False, None
-        selected_ids = [part.strip() for part in str(text or "").split(",") if part.strip()]
+        reply_parts = str(text or "").split(" ", 2)
+        if len(reply_parts) != 3 or reply_parts[0] != "choose":
+            return False, None
+        if reply_parts[1] != state["prompt"]["choice_prompt_id"]:
+            return True, None
+        selected_ids = [part.strip() for part in reply_parts[2].split(",") if part.strip()]
         state = self._claim_choice_state(message_ts, selected_ids)
         if not state:
             return True, None
@@ -2245,7 +2261,7 @@ def change_slack_adapter_source(source: str) -> str:
                 if prompt["choice_mode"] == "multiple":
                     elements.append({"type": "button", "action_id": "forge_choice_submit", "text": {"type": "plain_text", "text": prompt["submit_label"][:75]}, "value": prompt["choice_prompt_id"]})
                 blocks.append({"type": "actions", "block_id": f"forge_choice:{prompt['choice_prompt_id']}", "elements": elements})
-            fallback = str(content or "Choose an option") + "\\n\\n" + "\\n".join(f"{choice['id']} — {choice['label']}" for choice in prompt["choices"]) + "\\nReply with exact ID" + ("s separated by commas." if prompt["choice_mode"] == "multiple" else ".")
+            fallback = str(content or "Choose an option") + "\\n\\n" + "\\n".join(f"{choice['id']} — {choice['label']}" for choice in prompt["choices"]) + f"\\nReply with: choose {prompt['choice_prompt_id']} <choice_id[,choice_id...]>"
             kwargs: Dict[str, Any] = {"channel": chat_id, "text": fallback, "blocks": blocks}
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
@@ -2454,8 +2470,8 @@ def change_gateway_source(source: str) -> str:
         choice_delivery = '''            _choice_fields = ("choice_prompt_id", "choice_mode", "min_choices", "max_choices", "submit_label", "expires_at", "choices")
             _choice_prompt = {field: agent_result.get(field) for field in _choice_fields}
             if all(_choice_prompt.get(field) is not None for field in _choice_fields if field != "max_choices") and isinstance(_choice_prompt.get("choices"), list):
-                # Exact stable IDs remain the only text fallback authority (ID — Label).
-                _choice_fallback = response + "\\n\\n" + "\\n".join(f"{choice['id']} — {choice['label']}" for choice in _choice_prompt["choices"])
+                # Stable IDs are authoritative only when bound to this prompt.
+                _choice_fallback = response + "\\n\\n" + "\\n".join(f"{choice['id']} — {choice['label']}" for choice in _choice_prompt["choices"]) + f"\\nReply with: choose {_choice_prompt['choice_prompt_id']} <choice_id[,choice_id...]>"
                 _choice_adapter = self._adapter_for_source(source)
                 if _choice_adapter and hasattr(_choice_adapter, "send_choice_prompt"):
                     _choice_result = await _choice_adapter.send_choice_prompt(

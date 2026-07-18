@@ -993,7 +993,8 @@ def test_slack_chooser_uses_signed_action_context_and_exact_id_fallback() -> Non
     assert "structured_user_message" in changed
     assert "selected_choice_ids" in changed
     assert "_choice_reply_prompts" in changed
-    assert "ID — Label" in changed_gateway
+    assert "Reply with: choose" in changed_gateway
+    assert "Reply with exact ID." in changed_gateway
     assert "structured_user_message" in changed_gateway
 
 
@@ -1855,8 +1856,25 @@ def test_gateway_displays_choice_labels_without_changing_stable_ids() -> None:
 
     assert "Available choices:" in changed
     assert "[id: {_choice_id}]" in changed
+    assert "choose {_choice_prompt_id}" in changed
     assert '_choice["id"]' in changed
     assert '_choice["label"]' in changed
+
+
+def test_choice_display_keeps_legacy_exact_id_fallback_without_none_prompt() -> None:
+    namespace = {
+        "result": {
+            "choices": [
+                {"id": "retry", "label": "Retry", "description": "Try again."}
+            ]
+        },
+        "response": "Choose what to do.",
+    }
+
+    exec("\n".join(installer._choice_display_lines("result", "response")), namespace)
+
+    assert "Reply with exact ID." in namespace["response"]
+    assert "choose None" not in namespace["response"]
 
 
 def test_build_install_and_restore_round_trip(tmp_path: Path) -> None:

@@ -20,7 +20,8 @@ from forge.ops.task_setup import (
     TurnResult,
     begin_task_setup,
 )
-from forge.ops.task_settings_v2 import TaskRequestV2
+from forge.ops.task_settings import MAX_AUTO_MERGE_DURATION
+from forge.ops.task_settings_v2 import TaskRequestV2, task_request_v2_hash
 
 
 NOW = datetime(2026, 7, 16, 9, 0, tzinfo=timezone.utc)
@@ -708,14 +709,8 @@ def test_v2_task_selects_projects_and_builds_exact_repeated_merge_order(
         context=context,
     )
     assert preview.next_step is SetupStep.CONFIRM
-    assert isinstance(preview.task_request_v2, TaskRequestV2)
+    assert preview.task_request_v2 is None
     assert preview.task_request is None
-    assert preview.task_request_v2.management_repository == MANAGEMENT_REPOSITORY
-    assert preview.task_request_v2.projects == (alpha, beta)
-    assert preview.task_request_v2.merge_order == (
-        beta.project_id,
-        alpha.project_id,
-    )
     assert "Management: management/forge" in (preview.text or "")
     assert "Project 1: owner/alpha" in (preview.text or "")
     assert f"Workspace: {alpha.workspace}" in (preview.text or "")
@@ -728,7 +723,13 @@ def test_v2_task_selects_projects_and_builds_exact_repeated_merge_order(
     )
     assert prepared.action == "handled"
     assert prepared.next_step is SetupStep.CONFIRM
-    assert prepared.task_request_v2 is preview.task_request_v2
+    assert isinstance(prepared.task_request_v2, TaskRequestV2)
+    assert prepared.task_request_v2.management_repository == MANAGEMENT_REPOSITORY
+    assert prepared.task_request_v2.projects == (alpha, beta)
+    assert prepared.task_request_v2.merge_order == (
+        beta.project_id,
+        alpha.project_id,
+    )
     assert prepared.task_request is None
     assert validated == [alpha, beta]
     assert setup.pending_choice_prompt("s1", "alice") == preview.choice_prompt
@@ -1156,7 +1157,8 @@ def test_duplicate_confirm_during_live_validation_runs_one_callback(
     assert duplicate.next_step is SetupStep.CONFIRM
     assert duplicate.choice_prompt == preview.choice_prompt
     assert "in progress" in (duplicate.text or "").lower()
-    assert completed.task_request_v2 is preview.task_request_v2
+    assert preview.task_request_v2 is None
+    assert completed.task_request_v2 is not None
 
 
 def test_stale_merge_rank_submission_cannot_skip_a_rank(tmp_path: Path) -> None:
@@ -1276,8 +1278,7 @@ def test_maximum_256_project_flow_reaches_confirm_on_submission_261(
     assert len(rank_prompt_ids) == 256
     assert rank.next_step is SetupStep.CONFIRM
     assert rank.choice_prompt is not None
-    assert rank.task_request_v2 is not None
-    assert rank.task_request_v2.merge_order == ordered_ids
+    assert rank.task_request_v2 is None
     prepared = setup.handle_submission(
         "max",
         "u1",
@@ -1286,4 +1287,100 @@ def test_maximum_256_project_flow_reaches_confirm_on_submission_261(
         context=context,
     )
     assert prepared.next_step is SetupStep.CONFIRM
-    assert prepared.task_request_v2 is rank.task_request_v2
+    assert prepared.task_request_v2 is not None
+    assert prepared.task_request_v2.merge_order == ordered_ids
+
+
+def test_confirm_click_time_survives_validation_and_other_input_keeps_operation_live(
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / "project", "owner/project")
+    validation_started = Event()
+    release_validation = Event()
+
+    def validate(selected: tuple[TaskProject, ...]) -> tuple[TaskProject, ...]:
+        validation_started.set()
+        assert release_validation.wait(timeout=2)
+        return selected
+
+    context = _task_context((project,), validate=validate)
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+    setup.handle("click-time", "u1", "구현 요청", NOW, context=context)
+    projects = setup.handle(
+        "click-time",
+        "u1",
+        "task",
+        NOW + timedelta(seconds=1),
+        context=context,
+    )
+    assert projects.choice_prompt is not None
+    setup.handle_submission(
+        "click-time",
+        "u1",
+        ChoiceSubmission(projects.choice_prompt.choice_prompt_id, (project.project_id,)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    setup.handle(
+        "click-time",
+        "u1",
+        "build",
+        NOW + timedelta(seconds=3),
+        context=context,
+    )
+    preview = setup.handle(
+        "click-time",
+        "u1",
+        "safe_auto",
+        NOW + timedelta(seconds=4),
+        context=context,
+    )
+    assert preview.task_request_v2 is None
+    assert "set when Confirm Task is selected" in (preview.text or "")
+    assert preview.choice_prompt is not None
+    clicked_at = NOW + timedelta(minutes=5)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        confirmation = pool.submit(
+            setup.handle,
+            "click-time",
+            "u1",
+            "confirm",
+            clicked_at,
+            context=context,
+        )
+        assert validation_started.wait(timeout=1)
+        unrelated_input = setup.handle(
+            "click-time",
+            "u1",
+            "상태가 어떻게 돼?",
+            clicked_at + timedelta(seconds=1),
+            context=context,
+        )
+        assert unrelated_input.choice_prompt == preview.choice_prompt
+        assert "in progress" in (unrelated_input.text or "").lower()
+        release_validation.set()
+        prepared = confirmation.result(timeout=1)
+
+    assert prepared.task_request_v2 is not None
+    assert prepared.task_request_v2.confirmed_at == clicked_at
+    assert prepared.task_request_v2.auto_merge_expires_at == (
+        clicked_at + MAX_AUTO_MERGE_DURATION
+    )
+    preview_time_request = TaskRequestV2.create(
+        request_id=prepared.task_request_v2.request_id,
+        management_repository=prepared.task_request_v2.management_repository,
+        task_content=prepared.task_request_v2.task_content,
+        task_flow=prepared.task_request_v2.task_flow,
+        merge_mode=prepared.task_request_v2.merge_mode,
+        merge_order=prepared.task_request_v2.merge_order,
+        projects=prepared.task_request_v2.projects,
+        task_owner_host=prepared.task_request_v2.task_owner_host,
+        confirmed_by=prepared.task_request_v2.confirmed_by,
+        confirmed_at=NOW + timedelta(seconds=4),
+    )
+    assert prepared.task_request_v2.request_hash == task_request_v2_hash(
+        prepared.task_request_v2
+    )
+    assert prepared.task_request_v2.request_hash != preview_time_request.request_hash
+    assert prepared.choice_prompt == preview.choice_prompt

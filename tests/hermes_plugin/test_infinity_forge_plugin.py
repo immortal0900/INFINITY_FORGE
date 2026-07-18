@@ -1425,6 +1425,95 @@ def test_invalid_task_submission_is_rejected_before_loading_config(
     assert calls == 0
 
 
+def test_plain_text_fallback_requires_current_prompt_id(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path / "project", "owner/project")
+    context = _v2_context(str(tmp_path.resolve()), (project,))
+    monkeypatch.setattr(plugin, "_task_context_factory", lambda _cwd: context)
+    common = {
+        "session_id": "text-fallback",
+        "user_id": "u1",
+        "working_directory": str(tmp_path.resolve()),
+    }
+    mode = plugin.before_user_turn(text="구현 요청", **common)
+    projects = plugin.before_user_turn(
+        text=f"choose {mode['choice_prompt_id']} task",
+        **common,
+    )
+    assert projects["choice_mode"] == "multiple"
+    flow = plugin.before_user_turn(
+        text=(
+            f"choose {projects['choice_prompt_id']} "
+            f"{project.project_id}"
+        ),
+        **common,
+    )
+    assert [choice["id"] for choice in flow["choices"]] == [
+        "build",
+        "build_review",
+        "build_review_deep_check",
+    ]
+
+    stale = plugin.before_user_turn(
+        text=f"choose {mode['choice_prompt_id']} task",
+        **common,
+    )
+
+    assert stale["choice_prompt_id"] == flow["choice_prompt_id"]
+    assert [choice["id"] for choice in stale["choices"]] == [
+        "build",
+        "build_review",
+        "build_review_deep_check",
+    ]
+
+
+def test_delayed_rank_one_project_reply_cannot_apply_to_rank_two(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    alpha = _project(tmp_path / "alpha", "owner/alpha")
+    beta = _project(tmp_path / "beta", "owner/beta")
+    context = _v2_context(str(tmp_path.resolve()), (alpha, beta))
+    monkeypatch.setattr(plugin, "_task_context_factory", lambda _cwd: context)
+    common = {
+        "session_id": "delayed-rank",
+        "user_id": "u1",
+        "working_directory": str(tmp_path.resolve()),
+    }
+
+    mode = plugin.before_user_turn(text="두 프로젝트 구현", **common)
+    projects = plugin.before_user_turn(
+        text=f"choose {mode['choice_prompt_id']} task", **common
+    )
+    flow = plugin.before_user_turn(
+        text=(
+            f"choose {projects['choice_prompt_id']} "
+            f"{alpha.project_id},{beta.project_id}"
+        ),
+        **common,
+    )
+    merge = plugin.before_user_turn(
+        text=f"choose {flow['choice_prompt_id']} build", **common
+    )
+    rank_one = plugin.before_user_turn(
+        text=f"choose {merge['choice_prompt_id']} full_auto", **common
+    )
+    rank_two = plugin.before_user_turn(
+        text=f"choose {rank_one['choice_prompt_id']} {alpha.project_id}",
+        **common,
+    )
+
+    stale = plugin.before_user_turn(
+        text=f"choose {rank_one['choice_prompt_id']} {beta.project_id}",
+        **common,
+    )
+
+    assert stale["choice_prompt_id"] == rank_two["choice_prompt_id"]
+    assert [choice["id"] for choice in stale["choices"]] == [beta.project_id]
+
+
 def test_failed_task_entry_retry_keeps_first_trusted_working_directory(
     monkeypatch,
     tmp_path: Path,
