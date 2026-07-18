@@ -104,3 +104,38 @@ python -m pytest tests/ops/test_task_settings_v2.py tests/ops/test_task_projects
 python -m pytest tests/ops/test_plain_names.py tests/ops/test_task_settings.py tests/ops/test_task_service.py tests/ops/test_task_outbox.py -q
 92 passed, 3 skipped in 10.16s
 ```
+
+## 두 번째 독립 리뷰 수정
+
+- Windows의 durable workspace text도 live `Path.resolve(strict=True)` 결과가 만들 수 있는
+  표기만 허용한다. 로컬 drive letter는 ASCII 대문자만 허용하고, 경로 component의 C0
+  control, `< > : " | ? *`, 끝의 점·공백, Win32 예약 device basename을 거부한다.
+  `CONIN$`·`CONOUT$`, `CON.txt`, `COM1`~`COM9`, `LPT1`~`LPT9`도 포함한다.
+- 위 규칙은 `os.name == "nt"`에서만 적용한다. U+007F와 U+FFFD는 Windows에서도 허용하고,
+  POSIX에서는 실제 생성 가능한 newline component를 live create와 삭제 후 stored parse로
+  보존한다. durable validator는 `resolve(strict=False)`로 사라진 경로를 추측하지 않는다.
+- JSON decoder에 safe `parse_int`를 연결했다. 정상 integer는 그대로 `int`가 되고 Python의
+  digit limit을 넘는 integer는 입력 예외를 parser 밖으로 내보내지 않는 private sentinel이
+  된다. iterative scan이 sentinel을 찾으면 request/settings의 class parser와 compatibility
+  wrapper 모두 sanitized `TaskSettingsV2Error`를 반환한다. monkeypatched `json.loads`의 예상
+  밖 `ValueError`는 계속 원형 전파한다.
+- `TaskSettingsV2.create`는 positive issue number가 현재 Python JSON integer로 표현 가능한지
+  hash 생성 전에 확인한다. `10**5000` 같은 값은 native `ValueError`나 원문 integer를
+  traceback에 남기지 않고 `TaskSettingsV2Error`로 거부한다.
+
+### 두 번째 리뷰 RED
+
+```text
+Windows impossible workspace attack: 38 failed, 1 passed, 1 skipped
+5000-digit JSON/create attack: 5 failed
+```
+
+### 두 번째 리뷰 GREEN
+
+```text
+python -m pytest tests/ops/test_task_settings_v2.py tests/ops/test_task_projects.py tests/ops/test_project_discovery.py -q
+241 passed, 1 skipped in 3.26s
+
+python -m pytest tests/ops/test_plain_names.py tests/ops/test_task_settings.py tests/ops/test_task_service.py tests/ops/test_task_outbox.py -q
+92 passed, 3 skipped in 10.49s
+```

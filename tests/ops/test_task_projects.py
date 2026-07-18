@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import traceback
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
@@ -70,6 +71,19 @@ def _binding(workspace: Path) -> dict[str, str]:
         "base_branch": "release/next",
         "base_commit": "a" * 40,
         "host_id": str(uuid4()),
+    }
+
+
+def _stored_payload(binding: dict[str, str]) -> dict[str, object]:
+    encoded = json.dumps(
+        binding,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "project_id": hashlib.sha256(encoded).hexdigest(),
+        **binding,
     }
 
 
@@ -348,3 +362,107 @@ def test_direct_task_project_constructor_remains_live_strict(
 
     with pytest.raises(TaskProjectError, match="workspace"):
         TaskProject(**payload)  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lexical path contract")
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "lowercase_drive",
+        "newline",
+        "tab",
+        "control_01",
+        "trailing_dot",
+        "trailing_space",
+        "less_than",
+        "greater_than",
+        "colon_ads",
+        "double_quote",
+        "pipe",
+        "question",
+        "asterisk",
+        "CON",
+        "con.txt",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "COM2",
+        "COM3",
+        "COM4",
+        "COM5",
+        "COM6",
+        "COM7",
+        "COM8",
+        "COM9",
+        "LPT1",
+        "LPT2",
+        "LPT3",
+        "LPT4",
+        "LPT5",
+        "LPT6",
+        "LPT7",
+        "LPT8",
+        "LPT9",
+        "CONIN$",
+        "CONOUT$",
+    ],
+)
+def test_stored_task_project_rejects_windows_impossible_workspace_text(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    components = {
+        "newline": "bad\ncomponent",
+        "tab": "bad\tcomponent",
+        "control_01": "bad\x01component",
+        "trailing_dot": "bad.",
+        "trailing_space": "bad ",
+        "less_than": "bad<name",
+        "greater_than": "bad>name",
+        "colon_ads": "repo:stream",
+        "double_quote": 'bad"name',
+        "pipe": "bad|name",
+        "question": "bad?name",
+        "asterisk": "bad*name",
+    }
+    canonical = str(tmp_path / "missing-repository")
+    if attack == "lowercase_drive":
+        workspace = canonical[0].lower() + canonical[1:]
+        assert workspace != canonical
+    else:
+        workspace = str(tmp_path / components.get(attack, attack) / "repo")
+    binding = _binding(tmp_path)
+    binding["workspace"] = workspace
+
+    with pytest.raises(TaskProjectError, match="workspace"):
+        TaskProject.from_mapping(_stored_payload(binding))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lexical path contract")
+def test_stored_windows_workspace_allows_del_and_valid_replacement_scalar(
+    tmp_path: Path,
+) -> None:
+    binding = _binding(tmp_path)
+    binding["workspace"] = str(tmp_path / "valid-\u007f-\ufffd-missing")
+
+    project = TaskProject.from_mapping(_stored_payload(binding))
+
+    assert project.workspace == binding["workspace"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX lexical path contract")
+def test_stored_posix_workspace_allows_live_control_character_names(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "valid-\n-control"
+    workspace.mkdir()
+    project = TaskProject.create(**_binding(workspace))
+    payload = {
+        field.name: getattr(project, field.name) for field in fields(project)
+    }
+    workspace.rmdir()
+
+    stored_project = TaskProject.from_mapping(payload)
+
+    assert stored_project == project

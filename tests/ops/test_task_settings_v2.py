@@ -177,6 +177,22 @@ def _forge_traceback_local_text(error: BaseException) -> tuple[str, ...]:
     return tuple(texts)
 
 
+def _forge_traceback_contains_identity(
+    error: BaseException,
+    target: object,
+) -> bool:
+    for current in _exception_graph(error):
+        trace = current.__traceback__
+        while trace is not None:
+            module_name = trace.tb_frame.f_globals.get("__name__", "")
+            if module_name.startswith("forge.ops") and any(
+                value is target for value in trace.tb_frame.f_locals.values()
+            ):
+                return True
+            trace = trace.tb_next
+    return False
+
+
 def _assert_sanitized_v2_error(
     operation: object,
     secret: str,
@@ -1014,3 +1030,71 @@ def test_unexpected_nested_parser_exception_propagates(
 
     with pytest.raises(TypeError, match="unexpected nested parser programming error"):
         TaskRequestV2.from_json(raw)
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "compatibility"])
+def test_request_parser_sanitizes_python_digit_limit_integer(
+    tmp_path: Path,
+    entrypoint: str,
+) -> None:
+    request = _request(tmp_path)
+    marker = "91827364501234567890"
+    huge_integer = marker * 250
+    raw = request.to_json().replace(
+        f'"task_content_hash":"{request.task_content_hash}"',
+        f'"task_content_hash":{huge_integer}',
+        1,
+    )
+    parser = (
+        TaskRequestV2.from_json
+        if entrypoint == "direct"
+        else parse_task_request_v2
+    )
+
+    _assert_sanitized_v2_error(lambda: parser(raw), marker)
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "compatibility"])
+def test_settings_parser_sanitizes_python_digit_limit_integer(
+    tmp_path: Path,
+    entrypoint: str,
+) -> None:
+    request = _request(tmp_path)
+    settings = TaskSettingsV2.create(request=request, parent_issue_number=21)
+    marker = "56473829105647382910"
+    huge_integer = marker * 250
+    raw = settings.to_json().replace(
+        '"parent_issue_number":21',
+        f'"parent_issue_number":{huge_integer}',
+        1,
+    )
+    parser = (
+        TaskSettingsV2.from_json
+        if entrypoint == "direct"
+        else parse_task_settings_v2
+    )
+
+    _assert_sanitized_v2_error(
+        lambda: parser(raw, request=request),
+        marker,
+    )
+
+
+def test_settings_create_rejects_unrenderable_python_issue_number(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    huge_issue_number = 10**5000
+
+    with pytest.raises(TaskSettingsV2Error, match="parent_issue_number") as caught:
+        TaskSettingsV2.create(
+            request=request,
+            parent_issue_number=huge_issue_number,
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert not _forge_traceback_contains_identity(
+        caught.value,
+        huge_issue_number,
+    )

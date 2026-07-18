@@ -20,6 +20,19 @@ _OWNER_PATTERN = re.compile(
 )
 _REPOSITORY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,100}$", re.ASCII)
 _REMOTE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", re.ASCII)
+_WINDOWS_FORBIDDEN_PATH_CHARACTERS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_DEVICE_BASENAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "conin$",
+        "conout$",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }
+)
 _HTTPS_REMOTE_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<name>[^/]+)$",
     re.ASCII,
@@ -127,6 +140,31 @@ def _validate_utf8_text(value: object, error_message: str) -> str:
     return value
 
 
+def _is_canonical_windows_workspace(path: Path) -> bool:
+    drive = path.drive
+    if (
+        len(drive) == 2
+        and drive[1] == ":"
+        and drive[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    ):
+        return False
+    components = path.parts[1:] if path.anchor else path.parts
+    for component in components:
+        if (
+            any(ord(character) < 32 for character in component)
+            or any(
+                character in _WINDOWS_FORBIDDEN_PATH_CHARACTERS
+                for character in component
+            )
+            or component.endswith((".", " "))
+        ):
+            return False
+        device_basename = component.split(".", 1)[0].rstrip(" ").casefold()
+        if device_basename in _WINDOWS_RESERVED_DEVICE_BASENAMES:
+            return False
+    return True
+
+
 def _validate_workspace_text(workspace: object) -> str:
     workspace = _validate_utf8_text(
         workspace,
@@ -139,6 +177,8 @@ def _validate_workspace_text(workspace: object) -> str:
         if not path.is_absolute():
             raise TaskProjectError("workspace must be a canonical absolute path")
         if os.path.normpath(workspace) != workspace or str(path) != workspace:
+            raise TaskProjectError("workspace must be a canonical absolute path")
+        if os.name == "nt" and not _is_canonical_windows_workspace(path):
             raise TaskProjectError("workspace must be a canonical absolute path")
     except (OSError, RuntimeError, ValueError):
         raise TaskProjectError("workspace must be a canonical absolute path") from None

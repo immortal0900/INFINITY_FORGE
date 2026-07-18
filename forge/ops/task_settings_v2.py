@@ -32,6 +32,7 @@ _REQUEST_STATUS = "prepared"
 _SETTINGS_STATUS = "active"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _AUTO_EXPIRY_UNSET = object()
+_INVALID_JSON_INTEGER = object()
 
 _REQUEST_FIELDS = frozenset(
     {
@@ -140,6 +141,31 @@ def _reject_json_constant(value: str) -> object:
     raise TaskSettingsV2Error("JSON contains a non-standard number")
 
 
+def _parse_json_integer(value: str) -> object:
+    parsed: int | None = None
+    try:
+        parsed = int(value)
+    except ValueError:
+        pass
+    if parsed is None:
+        value = ""
+        return _INVALID_JSON_INTEGER
+    return parsed
+
+
+def _contains_invalid_json_integer(value: object) -> bool:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if item is _INVALID_JSON_INTEGER:
+            return True
+        if type(item) is dict:
+            pending.extend(item.values())
+        elif type(item) is list:
+            pending.extend(item)
+    return False
+
+
 def _load_json_object(raw: object, label: str) -> dict[str, object]:
     if type(raw) is not str:
         raise TaskSettingsV2Error(f"{label} JSON must be text")
@@ -148,11 +174,16 @@ def _load_json_object(raw: object, label: str) -> dict[str, object]:
             raw,
             object_pairs_hook=_unique_object,
             parse_constant=_reject_json_constant,
+            parse_int=_parse_json_integer,
         )
     except TaskSettingsV2Error:
         raise
     except (json.JSONDecodeError, RecursionError):
         raise TaskSettingsV2Error(f"{label} JSON is invalid") from None
+    if _contains_invalid_json_integer(value):
+        raw = None
+        value = None
+        raise TaskSettingsV2Error(f"{label} JSON contains an invalid integer")
     if type(value) is not dict:
         raise TaskSettingsV2Error(f"{label} JSON must be an object")
     return value
@@ -193,6 +224,16 @@ def _validate_hash(value: object, field_name: str) -> str:
             f"{field_name} must be a lowercase SHA-256"
         )
     return value
+
+
+def _is_json_renderable_positive_integer(value: object) -> bool:
+    if type(value) is not int or value <= 0:
+        return False
+    try:
+        str(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _validate_utf8_text(value: object, field_name: str) -> str:
@@ -896,7 +937,7 @@ class TaskSettingsV2:
             self.management_repository,
             "management_repository",
         )
-        if type(self.parent_issue_number) is not int or self.parent_issue_number <= 0:
+        if not _is_json_renderable_positive_integer(self.parent_issue_number):
             raise TaskSettingsV2Error("parent_issue_number must be a positive integer")
         _validate_mode(self.mode)
         _validate_hash(self.task_content_hash, "task_content_hash")
@@ -939,7 +980,8 @@ class TaskSettingsV2:
 
         if not isinstance(request, TaskRequestV2):
             raise TaskSettingsV2Error("request must be TaskRequestV2")
-        if type(parent_issue_number) is not int or parent_issue_number <= 0:
+        if not _is_json_renderable_positive_integer(parent_issue_number):
+            parent_issue_number = None  # type: ignore[assignment]
             raise TaskSettingsV2Error("parent_issue_number must be a positive integer")
         payload: dict[str, object] = {
             "format_version": TASK_SETTINGS_V2_FORMAT,
