@@ -16,10 +16,105 @@ def _script() -> str:
     return WINDOWS_DEPLOY.read_text(encoding="utf-8")
 
 
+def _powershell() -> str | None:
+    return shutil.which("pwsh") or shutil.which("powershell")
+
+
+def _new_hermes_change_package_source() -> str:
+    script = _script()
+    return script[
+        script.index("function New-HermesChangePackage") : script.index(
+            "function Get-PreviousHermesPackage"
+        )
+    ]
+
+
+def _run_reused_package_harness(
+    powershell: str,
+    function_source: str,
+    sandbox: Path,
+) -> subprocess.CompletedProcess[str]:
+    sandbox.mkdir()
+    harness = sandbox / "reused-package-harness.ps1"
+    package_root = sandbox / "packages"
+    harness.write_text(
+        """param([Parameter(Mandatory = $true)][string]$PackageRoot)
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$Commit = "1111111111111111111111111111111111111111"
+
+function Get-HermesRuntimeFingerprint {
+  param([Parameter(Mandatory = $true)][pscustomobject]$Paths)
+  return "runtime"
+}
+
+"""
+        + function_source
+        + """
+$targets = @("alpha.ts", "beta.ts", "gamma.ts")
+$paths = [pscustomobject]@{
+  PackageRoot = $PackageRoot
+  HermesChangeTargets = $targets
+}
+$packageVersion = "$Commit-runtime"
+$packagePath = Join-Path $PackageRoot $packageVersion
+$manifestPath = Join-Path $packagePath "installed-files-list.json"
+New-Item -ItemType Directory -Force -Path $packagePath | Out-Null
+
+function Write-TestManifest {
+  param([Parameter(Mandatory = $true)][string[]]$Targets)
+  $files = @($Targets | ForEach-Object { [pscustomobject]@{ path = $_ } })
+  [pscustomobject]@{
+    source_version = $packageVersion
+    files = $files
+  } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+}
+
+Write-TestManifest -Targets @($targets[2], $targets[1], $targets[0])
+$rejected = $false
+try {
+  $null = New-HermesChangePackage -Paths $paths -ReleasePath $PackageRoot
+} catch {
+  if ($_.Exception.Message -ne "Existing Hermes change package has unexpected target paths.") {
+    throw
+  }
+  $rejected = $true
+}
+if (-not $rejected) { throw "REORDERED_MANIFEST_WAS_ACCEPTED" }
+
+Write-TestManifest -Targets $targets
+$result = New-HermesChangePackage -Paths $paths -ReleasePath $PackageRoot
+if ($result.Version -ne $packageVersion) { throw "ORDERED_VERSION_MISMATCH" }
+if ([IO.Path]::GetFullPath([string]$result.Path) -ne [IO.Path]::GetFullPath($packagePath)) {
+  throw "ORDERED_PATH_MISMATCH"
+}
+"BEHAVIOR_OK"
+""",
+        encoding="utf-8-sig",
+    )
+    return subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(harness),
+            "-PackageRoot",
+            str(package_root),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+    )
+
+
 def test_windows_adapter_parses_as_powershell() -> None:
-    pwsh = shutil.which("pwsh")
+    pwsh = _powershell()
     if pwsh is None:
-        pytest.skip("PowerShell 7 is unavailable")
+        pytest.skip("PowerShell is unavailable")
     quoted_path = str(WINDOWS_DEPLOY).replace("'", "''")
 
     result = subprocess.run(
@@ -109,12 +204,7 @@ def test_windows_hermes_package_uses_live_runtime_snapshot() -> None:
 
 
 def test_windows_reused_package_rejects_reordered_target_manifest() -> None:
-    script = _script()
-    package_function = script[
-        script.index("function New-HermesChangePackage") : script.index(
-            "function Get-PreviousHermesPackage"
-        )
-    ]
+    package_function = _new_hermes_change_package_source()
 
     assert "Compare-Object" not in package_function
     assert (
@@ -124,6 +214,38 @@ def test_windows_reused_package_rejects_reordered_target_manifest() -> None:
     assert "[StringComparison]::Ordinal" in package_function
     assert "$manifestTargets[$index]" in package_function
     assert "$Paths.HermesChangeTargets[$index]" in package_function
+
+
+def test_windows_reused_package_order_check_executes_actual_function(
+    tmp_path: Path,
+) -> None:
+    powershell = _powershell()
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable")
+    function_source = _new_hermes_change_package_source()
+
+    actual = _run_reused_package_harness(
+        powershell,
+        function_source,
+        tmp_path / "actual",
+    )
+    assert actual.returncode == 0, actual.stderr
+    assert "BEHAVIOR_OK" in actual.stdout
+
+    mutation_anchor = "if (-not [string]::Equals("
+    assert function_source.count(mutation_anchor) == 1
+    mutated_source = function_source.replace(
+        mutation_anchor,
+        "if ($false -and -not [string]::Equals(",
+        1,
+    )
+    mutated = _run_reused_package_harness(
+        powershell,
+        mutated_source,
+        tmp_path / "mutated",
+    )
+    assert mutated.returncode != 0
+    assert "REORDERED_MANIFEST_WAS_ACCEPTED" in (mutated.stdout + mutated.stderr)
 
 
 def test_previous_package_is_restored_before_new_runtime_snapshot() -> None:
