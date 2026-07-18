@@ -71,54 +71,100 @@ _CONVERSATION_HOOK = f'''
     if is_user_turn:
         # {_HOOK_MARKER}: only a caller that received a real user turn opts in.
         # Internal build, review, delegate, and batch calls keep the safe default.
-        def _finish_pre_user_turn(_response, _choices=None):
+        def _finish_pre_user_turn(_response, _prompt=None):
             _handled_messages = list(conversation_history or [])
             _handled_user_message = (
                 persist_user_message
                 if isinstance(persist_user_message, str)
-                else user_message
+                else (
+                    user_message.get("text", "")
+                    if isinstance(user_message, dict)
+                    else user_message
+                )
             )
             _handled_messages.append(
                 {{"role": "user", "content": _handled_user_message}}
             )
             _handled_messages.append({{"role": "assistant", "content": _response}})
-            return {{
+            _handled_payload = {{
                 "final_response": _response,
                 "messages": _handled_messages,
                 "api_calls": 0,
                 "completed": True,
                 "handled": True,
-                "choices": list(_choices or []),
+                "choices": list(
+                    _prompt.get("choices", [])
+                    if isinstance(_prompt, dict)
+                    else []
+                ),
             }}
+            if isinstance(_prompt, dict):
+                for _prompt_field in (
+                    "choice_prompt_id",
+                    "choice_mode",
+                    "min_choices",
+                    "max_choices",
+                    "submit_label",
+                    "expires_at",
+                ):
+                    if _prompt_field in _prompt:
+                        _handled_payload[_prompt_field] = _prompt[_prompt_field]
+            return _handled_payload
 
         try:
             from hermes_cli.plugins import has_hook as _has_pre_user_turn
             from hermes_cli.plugins import invoke_hook as _invoke_pre_user_turn
 
             _pre_user_turn_registered = _has_pre_user_turn("pre_user_turn")
+            # RISK(breaking): stable chooser IDs are authoritative input fields;
+            # label text never substitutes for this structured envelope.
+            _pre_user_turn_values = {{
+                "agent": agent,
+                "text": (
+                    user_message.get("text", "")
+                    if isinstance(user_message, dict)
+                    else user_message
+                ),
+                "task_id": task_id,
+                "session_id": str(
+                    getattr(agent, "_gateway_session_key", "")
+                    or task_id
+                    or "local-session"
+                ),
+                "user_id": str(
+                    getattr(agent, "_user_id", "")
+                    or getattr(agent, "_gateway_user_id", "")
+                    or getattr(agent, "user_id", "")
+                    or os.environ.get("HERMES_USER_ID", "")
+                    or "local-user"
+                ),
+                "surface": str(
+                    getattr(agent, "platform", "")
+                    or os.environ.get("HERMES_SESSION_SOURCE", "cli")
+                ),
+                "is_new_session": (
+                    False
+                    if isinstance(user_message, dict)
+                    and (
+                        "choice_prompt_id" in user_message
+                        or "selected_choice_ids" in user_message
+                    )
+                    else not bool(conversation_history)
+                ),
+            }}
+            if isinstance(user_message, dict):
+                for _submission_field in (
+                    "choice_prompt_id",
+                    "selected_choice_ids",
+                ):
+                    if _submission_field in user_message:
+                        _pre_user_turn_values[_submission_field] = user_message[
+                            _submission_field
+                        ]
             _pre_user_turn_results = (
                 _invoke_pre_user_turn(
                     "pre_user_turn",
-                    agent=agent,
-                    text=user_message,
-                    task_id=task_id,
-                    session_id=str(
-                        getattr(agent, "_gateway_session_key", "")
-                        or task_id
-                        or "local-session"
-                    ),
-                    user_id=str(
-                        getattr(agent, "_user_id", "")
-                        or getattr(agent, "_gateway_user_id", "")
-                        or getattr(agent, "user_id", "")
-                        or os.environ.get("HERMES_USER_ID", "")
-                        or "local-user"
-                    ),
-                    surface=str(
-                        getattr(agent, "platform", "")
-                        or os.environ.get("HERMES_SESSION_SOURCE", "cli")
-                    ),
-                    is_new_session=not bool(conversation_history),
+                    **_pre_user_turn_values,
                 )
                 if _pre_user_turn_registered
                 else []
@@ -165,6 +211,17 @@ _CONVERSATION_HOOK = f'''
             _handled_result = _handled_pre_user_turn_results[0]
             _response = _handled_result.get("text")
             _choices = _handled_result.get("choices", [])
+            _choice_prompt_fields = (
+                "choice_prompt_id",
+                "choice_mode",
+                "min_choices",
+                "max_choices",
+                "submit_label",
+                "expires_at",
+            )
+            _has_choice_prompt = any(
+                _field in _handled_result for _field in _choice_prompt_fields
+            )
             # RISK(breaking): every user surface relies on stable text IDs and
             # labels; malformed or ambiguous choice objects must stop closed.
             _valid_choices = (
@@ -175,6 +232,13 @@ _CONVERSATION_HOOK = f'''
                     and bool(_choice["id"].strip())
                     and isinstance(_choice.get("label"), str)
                     and bool(_choice["label"].strip())
+                    and (
+                        not _has_choice_prompt
+                        or (
+                            isinstance(_choice.get("description"), str)
+                            and bool(_choice["description"].strip())
+                        )
+                    )
                     for _choice in _choices
                 )
             )
@@ -188,16 +252,56 @@ _CONVERSATION_HOOK = f'''
                 if _valid_choices
                 else []
             )
+            _choice_mode = _handled_result.get("choice_mode")
+            _min_choices = _handled_result.get("min_choices")
+            _max_choices = _handled_result.get("max_choices")
+            _valid_choice_prompt = (
+                not _has_choice_prompt
+                or (
+                    all(
+                        _field in _handled_result
+                        for _field in _choice_prompt_fields
+                    )
+                    and isinstance(_handled_result.get("choice_prompt_id"), str)
+                    and bool(_handled_result["choice_prompt_id"].strip())
+                    and _choice_mode in ("single", "multiple")
+                    and isinstance(_min_choices, int)
+                    and not isinstance(_min_choices, bool)
+                    and _min_choices >= 1
+                    and (
+                        _max_choices is None
+                        or (
+                            isinstance(_max_choices, int)
+                            and not isinstance(_max_choices, bool)
+                            and _max_choices >= _min_choices
+                        )
+                    )
+                    and (
+                        _choice_mode != "single"
+                        or (_min_choices == 1 and _max_choices == 1)
+                    )
+                    and isinstance(_handled_result.get("submit_label"), str)
+                    and bool(_handled_result["submit_label"].strip())
+                    and isinstance(_handled_result.get("expires_at"), str)
+                    and bool(_handled_result["expires_at"].strip())
+                    and _min_choices <= len(_choices)
+                    and (
+                        _max_choices is None
+                        or _max_choices <= len(_choices)
+                    )
+                )
+            )
             if (
                 not isinstance(_response, str)
                 or not _valid_choices
+                or not _valid_choice_prompt
                 or len(set(_choice_ids)) != len(_choice_ids)
                 or len(set(_choice_labels)) != len(_choice_labels)
             ):
                 return _finish_pre_user_turn(
                     "Hermes user-turn plugin results conflict. No model request was made."
                 )
-            return _finish_pre_user_turn(_response, _choices)
+            return _finish_pre_user_turn(_response, _handled_result)
 
         if _replace_pre_user_turn_results:
             _replacement = _replace_pre_user_turn_results[0].get("text")
@@ -261,6 +365,21 @@ def _insert_after_unique_line(
     return "".join(lines)
 
 
+def _insert_before_unique_line(
+    source: str, expected: str, additions: tuple[str, ...], *, label: str
+) -> str:
+    lines = source.splitlines(keepends=True)
+    matches = [index for index, line in enumerate(lines) if line.strip() == expected]
+    if len(matches) != 1:
+        raise InstallError(f"{label} anchor is not unique")
+    index = matches[0]
+    original = lines[index]
+    newline = "\r\n" if original.endswith("\r\n") else "\n"
+    indent = original[: len(original) - len(original.lstrip())]
+    lines[index:index] = [f"{indent}{addition}{newline}" for addition in additions]
+    return "".join(lines)
+
+
 def _replace_unique_line(source: str, expected: str, replacement: str, *, label: str) -> str:
     lines = source.splitlines(keepends=True)
     matches = [index for index, line in enumerate(lines) if line.strip() == expected]
@@ -304,7 +423,7 @@ def _insert_after_line_in_unique_block(
     *,
     block_start: str,
     expected: str,
-    addition: str,
+    addition: str | tuple[str, ...],
     max_lines: int,
     label: str,
 ) -> str:
@@ -324,7 +443,10 @@ def _insert_after_line_in_unique_block(
     original = lines[index]
     newline = "\r\n" if original.endswith("\r\n") else "\n"
     indent = original[: len(original) - len(original.lstrip())]
-    lines.insert(index + 1, f"{indent}{addition}{newline}")
+    additions = (addition,) if isinstance(addition, str) else addition
+    lines[index + 1 : index + 1] = [
+        f"{indent}{item}{newline}" for item in additions
+    ]
     return "".join(lines)
 
 
@@ -351,6 +473,197 @@ def change_run_agent_source(source: str) -> str:
     )
 
 
+_CLI_CHOICE_METHODS = '''
+# RISK(breaking): classic CLI submissions carry stable IDs, never display labels.
+def _prompt_choice_modal(self, prompt: dict, timeout: float = 120) -> dict | None:
+    """Return one structured chooser submission, or ``None`` on cancel/timeout."""
+    required = (
+        "choice_prompt_id",
+        "choice_mode",
+        "min_choices",
+        "max_choices",
+        "submit_label",
+        "expires_at",
+        "choices",
+    )
+    if not isinstance(prompt, dict) or any(field not in prompt for field in required):
+        return None
+    choice_mode = prompt.get("choice_mode")
+    choices = prompt.get("choices")
+    if choice_mode not in ("single", "multiple") or not isinstance(choices, list):
+        return None
+    if not getattr(self, "_app", None):
+        return None
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        return None
+    if not getattr(sys.stdout, "isatty", lambda: False)():
+        return None
+    modal_choices = [
+        (choice["id"], choice["label"], choice.get("description", ""))
+        for choice in choices
+        if isinstance(choice, dict)
+        and isinstance(choice.get("id"), str)
+        and isinstance(choice.get("label"), str)
+        and isinstance(choice.get("description", ""), str)
+    ]
+    if len(modal_choices) != len(choices) or not modal_choices:
+        return None
+    min_choices = prompt.get("min_choices")
+    max_choices = prompt.get("max_choices")
+    if (
+        not isinstance(min_choices, int)
+        or isinstance(min_choices, bool)
+        or min_choices < 1
+        or (
+            max_choices is not None
+            and (
+                not isinstance(max_choices, int)
+                or isinstance(max_choices, bool)
+                or max_choices < min_choices
+            )
+        )
+    ):
+        return None
+    initial_selected = -1 if choice_mode == "single" else 0
+    # RISK(race): the existing app-loop handoff remains the sole writer of the
+    # shared modal state while the process_loop thread waits on its queue.
+    selected = self._prompt_text_input_modal(
+        title=prompt.get("submit_label") or "Choose",
+        detail=prompt.get("final_response") or "",
+        choices=modal_choices,
+        timeout=timeout,
+        _choice_modal_state={
+            "structured_choice_modal": True,
+            "choice_mode": choice_mode,
+            "min_choices": min_choices,
+            "max_choices": max_choices,
+            "submit_label": prompt.get("submit_label") or "Done",
+            "selected": initial_selected,
+            "selected_ids": set(),
+        },
+    )
+    if selected is None:
+        return None
+    selected_ids = [selected] if isinstance(selected, str) else list(selected)
+    allowed_ids = {choice[0] for choice in modal_choices}
+    if (
+        len(set(selected_ids)) != len(selected_ids)
+        or any(choice_id not in allowed_ids for choice_id in selected_ids)
+        or len(selected_ids) < min_choices
+        or (max_choices is not None and len(selected_ids) > max_choices)
+    ):
+        return None
+    return {
+        "choice_prompt_id": prompt["choice_prompt_id"],
+        "selected_choice_ids": selected_ids,
+    }
+
+def _toggle_choice_modal_selection(self) -> bool:
+    state = self._slash_confirm_state
+    if not state or state.get("choice_mode") != "multiple":
+        return False
+    choices = state.get("choices") or []
+    selected = state.get("selected", 0)
+    if not 0 <= selected < len(choices):
+        return False
+    selected_ids = state.setdefault("selected_ids", set())
+    choice_id = choices[selected][0]
+    if choice_id in selected_ids:
+        selected_ids.remove(choice_id)
+    else:
+        max_choices = state.get("max_choices")
+        if max_choices is not None and len(selected_ids) >= max_choices:
+            state["validation_error"] = f"Choose at most {max_choices}."
+            self._invalidate()
+            return False
+        selected_ids.add(choice_id)
+    state.pop("validation_error", None)
+    self._invalidate()
+    return True
+
+def _submit_choice_modal_selection(self) -> bool:
+    state = self._slash_confirm_state
+    if not state or not state.get("structured_choice_modal"):
+        return False
+    choices = state.get("choices") or []
+    if state.get("choice_mode") == "multiple":
+        selected_ids = state.get("selected_ids") or set()
+        ordered_ids = [choice[0] for choice in choices if choice[0] in selected_ids]
+    else:
+        selected = state.get("selected", -1)
+        ordered_ids = [choices[selected][0]] if 0 <= selected < len(choices) else []
+    min_choices = state.get("min_choices", 1)
+    max_choices = state.get("max_choices")
+    if len(ordered_ids) < min_choices:
+        state["validation_error"] = f"Choose at least {min_choices}."
+        self._invalidate()
+        return False
+    if max_choices is not None and len(ordered_ids) > max_choices:
+        state["validation_error"] = f"Choose at most {max_choices}."
+        self._invalidate()
+        return False
+    value = ordered_ids if state.get("choice_mode") == "multiple" else ordered_ids[0]
+    self._submit_slash_confirm_response(value)
+    return True
+
+def _choice_modal_instructions(self, state: dict | None = None) -> str:
+    state = state or self._slash_confirm_state or {}
+    if not state.get("structured_choice_modal"):
+        return "Type 1/2/3 or use ↑/↓ then Enter. ESC/Ctrl+C cancels."
+    if state.get("choice_mode") == "multiple":
+        label = state.get("submit_label") or "Done"
+        return f"Use ↑/↓, Space to toggle, Enter for {label}. ESC/Ctrl+C cancels."
+    return "Use ↑/↓ then Enter, or press a number. ESC/Ctrl+C cancels."
+
+def _continue_choice_modal_result(
+    self,
+    result: dict | None,
+    *,
+    conversation_history,
+    stream_callback,
+    task_id,
+    moa_config,
+):
+    """Resolve bounded handled choosers through the same user-turn hook path."""
+    prompt_fields = (
+        "choice_prompt_id",
+        "choice_mode",
+        "min_choices",
+        "max_choices",
+        "submit_label",
+        "expires_at",
+        "choices",
+    )
+    for _choice_turn in range(16):
+        if (
+            not isinstance(result, dict)
+            or not result.get("handled")
+            or any(field not in result for field in prompt_fields)
+        ):
+            return result
+        submission = self._prompt_choice_modal(result)
+        if submission is None:
+            return result
+        result = self.agent.run_conversation(
+            user_message=submission,
+            conversation_history=result.get("messages", conversation_history),
+            stream_callback=stream_callback,
+            task_id=task_id,
+            is_user_turn=True,
+            persist_user_message=None,
+            moa_config=moa_config,
+        )
+    return {
+        "final_response": "Hermes chooser stopped after too many consecutive prompts.",
+        "messages": result.get("messages", conversation_history),
+        "api_calls": 0,
+        "completed": True,
+        "handled": True,
+        "choices": [],
+    }
+'''
+
+
 def _choice_display_lines(result_name: str, response_name: str) -> tuple[str, ...]:
     """Return fail-closed source lines that make structured choices visible."""
 
@@ -361,27 +674,38 @@ def _choice_display_lines(result_name: str, response_name: str) -> tuple[str, ..
             f"if isinstance({result_name}, dict) else []"
         ),
         "if _pre_user_turn_choices:",
-        "    _pre_user_turn_labels = [",
-        '        _choice["label"]',
+        "    _pre_user_turn_entries = [",
+        "        (",
+        '            _choice["id"],',
+        '            _choice["label"],',
+        '            _choice.get("description", ""),',
+        "        )",
         "        for _choice in _pre_user_turn_choices",
         (
             "        if isinstance(_choice, dict) "
-            'and isinstance(_choice.get("label"), str)'
+            'and isinstance(_choice.get("id"), str) '
+            'and isinstance(_choice.get("label"), str) '
+            'and isinstance(_choice.get("description", ""), str)'
         ),
         "    ]",
-        "    if len(_pre_user_turn_labels) != len(_pre_user_turn_choices):",
+        "    if len(_pre_user_turn_entries) != len(_pre_user_turn_choices):",
         "        _pre_user_turn_choices = []",
         f'        {response_name} = "Hermes user-turn plugin results conflict. No model request was made."',
         f'        {result_name}["choices"] = []',
         f'        {result_name}["final_response"] = {response_name}',
         (
             "    elif any("
-            f"_label not in {response_name} for _label in _pre_user_turn_labels"
+            f'f"[id: {{_choice_id}}]" not in {response_name} '
+            "for _choice_id, _label, _description in _pre_user_turn_entries"
             "):"
         ),
         (
             f'        {response_name} = f"{{{response_name}}}\\n\\nAvailable choices:\\n" '
-            '+ "\\n".join(f"- {_label}" for _label in _pre_user_turn_labels)'
+            '+ "\\n".join('
+            'f"- {_label} [id: {_choice_id}]" '
+            '+ (f" — {_description}" if _description else "") '
+            "for _choice_id, _label, _description in _pre_user_turn_entries"
+            ")"
         ),
         f'        {result_name}["final_response"] = {response_name}',
     )
@@ -399,6 +723,143 @@ def change_cli_source(source: str) -> str:
         addition=f"is_user_turn=True,  # {_HOOK_MARKER}: interactive CLI user turn.",
         max_lines=12,
         label="cli.py user-turn call",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="result = self.agent.run_conversation(",
+        expected=")",
+        addition=(
+            "result = self._continue_choice_modal_result(",
+            "    result,",
+            "    conversation_history=self.conversation_history[:-1],",
+            "    stream_callback=stream_callback,",
+            "    task_id=self.session_id,",
+            "    moa_config=_moa_cfg,",
+            ")",
+        ),
+        max_lines=14,
+        label="cli.py chooser continuation",
+    )
+    source = _insert_before_unique_line(
+        source,
+        "def _prompt_text_input_modal(",
+        tuple(_CLI_CHOICE_METHODS.strip("\n").splitlines()) + ("",),
+        label="cli.py generic chooser methods",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="def _prompt_text_input_modal(",
+        expected="timeout: float = 120,",
+        addition="_choice_modal_state: dict | None = None,",
+        max_lines=12,
+        label="cli.py modal state argument",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="def _prompt_text_input_modal(",
+        expected="response_queue = queue.Queue()",
+        addition="_choice_modal_state = dict(_choice_modal_state or {})",
+        max_lines=90,
+        label="cli.py modal state preparation",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="def _setup_modal() -> None:",
+        expected='"response_queue": response_queue,',
+        addition="**_choice_modal_state,",
+        max_lines=18,
+        label="cli.py modal state forwarding",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="# --- Slash-command confirmation: submit typed or highlighted choice ---",
+        expected="if self._slash_confirm_state:",
+        addition=(
+            '    if self._slash_confirm_state.get("structured_choice_modal"):',
+            "        submitted = self._submit_choice_modal_selection()",
+            "        if submitted:",
+            "            event.app.current_buffer.reset()",
+            "        event.app.invalidate()",
+            "        return",
+        ),
+        max_lines=3,
+        label="cli.py chooser Enter handler",
+    )
+    source = _insert_before_unique_line(
+        source,
+        "# --- Slash-command confirmation: arrow-key navigation ---",
+        (
+            "# --- Generic multiple chooser: Space toggles the highlighted ID. ---",
+            "@kb.add(' ', filter=Condition(lambda: bool(self._slash_confirm_state) and self._slash_confirm_state.get(\"choice_mode\") == \"multiple\"))",
+            "def choice_modal_toggle(event):",
+            "    self._toggle_choice_modal_selection()",
+            "    event.app.invalidate()",
+            "",
+        ),
+        label="cli.py chooser Space handler",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="def _make_slash_confirm_number_handler(idx):",
+        expected="def handler(event):",
+        addition=(
+            '    if self._slash_confirm_state and self._slash_confirm_state.get("structured_choice_modal"):',
+            '        if self._slash_confirm_state.get("choice_mode") != "single":',
+            "            return",
+            '        if idx < len(self._slash_confirm_state.get("choices") or []):',
+            '            self._slash_confirm_state["selected"] = idx',
+            "            self._submit_choice_modal_selection()",
+            "            event.app.current_buffer.reset()",
+            "            event.app.invalidate()",
+            "        return",
+        ),
+        max_lines=8,
+        label="cli.py chooser number handler",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="def handle_escape_modal(event):",
+        expected="if self._slash_confirm_state:",
+        addition=(
+            '    if self._slash_confirm_state.get("structured_choice_modal"):',
+            "        self._submit_slash_confirm_response(None)",
+            "        event.app.current_buffer.reset()",
+            "        event.app.invalidate()",
+            "        return",
+        ),
+        max_lines=22,
+        label="cli.py chooser Escape handler",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="def _get_slash_confirm_display_fragments(self):",
+        expected='selected = state.get("selected", 0)',
+        addition=(
+            'choice_mode = state.get("choice_mode", "single")',
+            'selected_ids = state.get("selected_ids") or set()',
+            "instructions = self._choice_modal_instructions(state)",
+        ),
+        max_lines=18,
+        label="cli.py chooser display state",
+    )
+    marker_line = '            marker = "❯" if idx == selected else " "'
+    if source.count(marker_line) != 2:
+        raise InstallError("cli.py chooser marker anchors are not unique")
+    source = source.replace(
+        marker_line,
+        '            marker = (("❯" if idx == selected else " ") + (" [x]" if _value in selected_ids else " [ ]")) if choice_mode == "multiple" else ("❯" if idx == selected else " ")',
+    )
+    source = _replace_unique_line(
+        source,
+        'preview_lines.append("Type 1/2/3 or use ↑/↓ then Enter. ESC/Ctrl+C cancels.")',
+        "preview_lines.append(instructions)",
+        label="cli.py chooser preview instructions",
+    )
+    source = _replace_unique_line(
+        source,
+        "_append_panel_line(lines, 'class:approval-border', 'class:approval-cmd', 'Type 1/2/3 or use ↑/↓ then Enter. ESC/Ctrl+C cancels.', box_width)",
+        "_append_panel_line(lines, 'class:approval-border', 'class:approval-cmd', instructions, box_width)",
+        label="cli.py chooser footer instructions",
     )
     source = _replace_unique_line(
         source,

@@ -68,6 +68,69 @@ def test_handled_preserves_valid_structured_choices(monkeypatch) -> None:
     assert result["choices"] == choices
 
 
+def test_handled_preserves_the_complete_choice_prompt_envelope(monkeypatch) -> None:
+    prompt_id = "79df97c7-ff3d-4415-8b2e-dbe93bd10590"
+    prompt = {
+        "choice_prompt_id": prompt_id,
+        "choice_mode": "multiple",
+        "min_choices": 1,
+        "max_choices": None,
+        "submit_label": "Done",
+        "expires_at": "2026-07-18T03:00:00Z",
+        "choices": [
+            {"id": "lint", "label": "Lint", "description": "Run lint."},
+            {"id": "tests", "label": "Tests", "description": "Run tests."},
+        ],
+    }
+
+    result = _run_changed_source(
+        monkeypatch,
+        {"action": "handled", "text": "Choose checks.", **prompt},
+    )
+
+    for key, value in prompt.items():
+        assert result[key] == value
+    assert result["api_calls"] == 0
+
+
+def test_structured_selection_reenters_hook_without_a_model_call(monkeypatch) -> None:
+    prompt_id = "79df97c7-ff3d-4415-8b2e-dbe93bd10590"
+    captured: dict[str, object] = {}
+    plugins = types.ModuleType("hermes_cli.plugins")
+
+    def invoke_hook(name: str, **values: object):
+        captured["name"] = name
+        captured.update(values)
+        return [{"action": "handled", "text": "Choose task flow."}]
+
+    plugins.has_hook = lambda name: True
+    plugins.invoke_hook = invoke_hook
+    package = types.ModuleType("hermes_cli")
+    package.plugins = plugins
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+    namespace: dict[str, object] = {}
+    exec(change_conversation_source(CONVERSATION_SOURCE), namespace)
+
+    result = namespace["run_conversation"](
+        types.SimpleNamespace(platform="cli", _gateway_session_key="s1"),
+        {
+            "choice_prompt_id": prompt_id,
+            "selected_choice_ids": ["task"],
+        },
+        conversation_history=[{"role": "assistant", "content": "Choose mode."}],
+        is_user_turn=True,
+    )
+
+    assert captured["name"] == "pre_user_turn"
+    assert captured["text"] == ""
+    assert captured["choice_prompt_id"] == prompt_id
+    assert captured["selected_choice_ids"] == ["task"]
+    assert captured["is_new_session"] is False
+    assert result["api_calls"] == 0
+    assert result["handled"] is True
+
+
 def test_malformed_choice_objects_fail_closed(monkeypatch) -> None:
     result = _run_changed_source(
         monkeypatch,

@@ -11,6 +11,7 @@ WORKFLOW = ROOT / ".github" / "workflows" / "capability-eval.yml"
 DEPLOY = ROOT / "forge" / "scripts" / "deploy-vps.sh"
 LOCAL_DEPLOY = ROOT / "forge" / "scripts" / "deploy.ps1"
 WINDOWS_DEPLOY = ROOT / "forge" / "scripts" / "deploy-windows.ps1"
+HERMES_INSTALLER = ROOT / "forge" / "hermes_change" / "installer.py"
 
 
 def test_eval_is_the_single_stable_ruleset_context() -> None:
@@ -305,6 +306,18 @@ def test_both_server_deploy_layers_run_the_same_actual_chooser_smoke() -> None:
     assert "sys.path" not in server_smoke
     assert "print(" not in server_smoke
     assert 'rm -rf -- "$CHOOSER_SMOKE_CWD"' not in server_smoke
+
+
+def test_deployable_hermes_change_carries_the_classic_cli_chooser() -> None:
+    installer = HERMES_INSTALLER.read_text(encoding="utf-8")
+    server_deploy = DEPLOY.read_text(encoding="utf-8")
+    windows_deploy = WINDOWS_DEPLOY.read_text(encoding="utf-8")
+
+    assert '"cli.py": change_cli_source' in installer
+    assert "_prompt_choice_modal" in installer
+    assert 'install-hermes-change.py" build' in server_deploy
+    assert '--hermes-root "$HERMES_SOURCE_TEMP"' in server_deploy
+    assert '"cli.py"' in windows_deploy
 
 
 def test_hermes_change_package_is_version_bound_and_committed_atomically() -> None:

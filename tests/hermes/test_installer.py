@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 from pathlib import Path
 
 import pytest
@@ -69,19 +70,126 @@ class AIAgent:
         )
 '''
 
-CLI_SOURCE = '''def unrelated_call(self):
+CLI_SOURCE = '''class ModalShell:
+    def _prompt_text_input_modal(
+        self,
+        *,
+        title: str,
+        detail: str,
+        choices: list[tuple[str, str, str]],
+        timeout: float = 120,
+    ) -> str | None:
+        if not choices:
+            return None
+        response_queue = queue.Queue()
+
+        def _setup_modal() -> None:
+            self._capture_modal_input_snapshot()
+            self._slash_confirm_state = {
+                "title": title,
+                "detail": detail,
+                "choices": choices,
+                "selected": 0,
+                "response_queue": response_queue,
+            }
+            self._slash_confirm_deadline = timeout
+
+        _setup_modal()
+        return response_queue.get()
+
+    def _submit_slash_confirm_response(self, value: str | None) -> None:
+        state = self._slash_confirm_state
+        if not state:
+            return
+        state["response_queue"].put(value)
+        self._slash_confirm_state = None
+        self._slash_confirm_deadline = 0
+
+    def _get_slash_confirm_display_fragments(self):
+        state = self._slash_confirm_state
+        if not state:
+            return []
+        choices = state.get("choices") or []
+        selected = state.get("selected", 0)
+        preview_lines = []
+        for idx, (_value, label, desc) in enumerate(choices):
+            marker = "❯" if idx == selected else " "
+            preview_lines.append(f"{marker} [{idx + 1}] {label} — {desc}")
+        choice_wrapped = []
+        for idx, (_value, label, desc) in enumerate(choices):
+            marker = "❯" if idx == selected else " "
+            choice_wrapped.append((idx, f"{marker} [{idx + 1}] {label} — {desc}"))
+        preview_lines.append("Type 1/2/3 or use ↑/↓ then Enter. ESC/Ctrl+C cancels.")
+        lines = []
+        _append_panel_line(lines, 'class:approval-border', 'class:approval-cmd', 'Type 1/2/3 or use ↑/↓ then Enter. ESC/Ctrl+C cancels.', box_width)
+        return lines
+
+    def run(self, kb, Condition):
+        def handle_enter(event):
+            # --- Slash-command confirmation: submit typed or highlighted choice ---
+            if self._slash_confirm_state:
+                text = event.app.current_buffer.text.strip()
+                choices = self._slash_confirm_state.get("choices") or []
+                choice = self._normalize_slash_confirm_choice(text, choices) if text else None
+                if choice is None:
+                    selected = self._slash_confirm_state.get("selected", 0)
+                    if 0 <= selected < len(choices):
+                        choice = choices[selected][0]
+                self._submit_slash_confirm_response(choice or "cancel")
+                event.app.current_buffer.reset()
+                event.app.invalidate()
+                return
+
+        # --- Slash-command confirmation: arrow-key navigation ---
+        @kb.add('up', filter=Condition(lambda: bool(self._slash_confirm_state)))
+        def slash_confirm_up(event):
+            if self._slash_confirm_state:
+                self._slash_confirm_state["selected"] = max(0, self._slash_confirm_state.get("selected", 0) - 1)
+                event.app.invalidate()
+
+        @kb.add('down', filter=Condition(lambda: bool(self._slash_confirm_state)))
+        def slash_confirm_down(event):
+            if self._slash_confirm_state:
+                max_idx = len(self._slash_confirm_state.get("choices") or []) - 1
+                self._slash_confirm_state["selected"] = min(max_idx, self._slash_confirm_state.get("selected", 0) + 1)
+                event.app.invalidate()
+
+        def _make_slash_confirm_number_handler(idx):
+            def handler(event):
+                if self._slash_confirm_state and idx < len(self._slash_confirm_state.get("choices") or []):
+                    choice = self._slash_confirm_state["choices"][idx][0]
+                    self._submit_slash_confirm_response(choice)
+                    event.app.current_buffer.reset()
+                    event.app.invalidate()
+            return handler
+
+        _modal_prompt_active = Condition(
+            lambda: bool(self._secret_state or self._sudo_state or self._slash_confirm_state)
+        )
+
+        @kb.add('escape', filter=_modal_prompt_active, eager=True)
+        def handle_escape_modal(event):
+            if self._slash_confirm_state:
+                self._submit_slash_confirm_response("cancel")
+                event.app.current_buffer.reset()
+                event.app.invalidate()
+                return
+
+
+def unrelated_call(self):
     schedule(
         task_id=self.session_id,
     )
 
 def process(self, agent_message, message, stream_callback):
+    _moa_cfg = None
     result = self.agent.run_conversation(
         user_message=agent_message,
         conversation_history=self.conversation_history[:-1],
         stream_callback=stream_callback,
         task_id=self.session_id,
         persist_user_message=message,
-        moa_config=None,
+        moa_config=_moa_cfg,
     )
     response = result.get("final_response", "") if result else ""
     if response and result and not result.get("failed") and not result.get("partial"):
@@ -210,20 +318,168 @@ def test_cli_displays_choice_labels_without_changing_stable_ids() -> None:
                 "handled": True,
             }
 
-    cli = type(
-        "CLI",
-        (),
-        {
-            "agent": Agent(),
-            "conversation_history": ["current"],
-            "session_id": "session-1",
-        },
-    )()
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli.conversation_history = ["current"]
+    cli.session_id = "session-1"
     result = namespace["process"](cli, "request", "request", None)
 
     assert result["choices"] == choices
     assert "- Chat" in result["final_response"]
     assert "- Task" in result["final_response"]
+
+
+def test_cli_carries_a_generic_keyboard_choice_modal_without_raw_readers() -> None:
+    changed = installer.change_cli_source(CLI_SOURCE)
+
+    assert "def _prompt_choice_modal(" in changed
+    assert "def _toggle_choice_modal_selection(" in changed
+    assert "def _submit_choice_modal_selection(" in changed
+    assert "@kb.add(' '," in changed
+    assert '"choice_mode": choice_mode' in changed
+    assert '"selected": initial_selected' in changed
+    assert "_capture_modal_input_snapshot()" in changed
+    assert "_restore_modal_input_snapshot()" not in changed.split(
+        "def _prompt_choice_modal(", 1
+    )[1].split("def _prompt_text_input_modal(", 1)[0]
+    generic = changed.split("def _prompt_choice_modal(", 1)[1].split(
+        "def _prompt_text_input_modal(", 1
+    )[0]
+    assert "curses" not in generic
+    assert "input(" not in generic
+    assert "_prompt_text_input(" not in generic
+    assert changed.count("def _prompt_text_input_modal(") == 1
+    compile(changed, "<changed Hermes CLI>", "exec")
+
+
+def test_multiple_choice_requires_space_toggle_before_done() -> None:
+    namespace: dict[str, object] = {"queue": queue}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    cli = namespace["ModalShell"]()
+    response_queue = queue.Queue()
+    cli._slash_confirm_state = {
+        "structured_choice_modal": True,
+        "choice_mode": "multiple",
+        "min_choices": 1,
+        "max_choices": None,
+        "choices": [
+            ("lint", "Lint", "Run lint."),
+            ("tests", "Tests", "Run tests."),
+        ],
+        "selected": 0,
+        "selected_ids": set(),
+        "response_queue": response_queue,
+    }
+    cli._slash_confirm_deadline = 123
+    cli._invalidate = lambda: None
+
+    assert cli._submit_choice_modal_selection() is False
+    assert response_queue.empty()
+    assert cli._slash_confirm_state is not None
+
+    cli._toggle_choice_modal_selection()
+
+    assert cli._submit_choice_modal_selection() is True
+    assert response_queue.get_nowait() == ["lint"]
+    assert cli._slash_confirm_state is None
+
+
+def test_cli_reenters_the_same_user_turn_path_with_stable_ids() -> None:
+    namespace: dict[str, object] = {"queue": queue, "maybe_auto_title": lambda: None}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    prompt_id = "79df97c7-ff3d-4415-8b2e-dbe93bd10590"
+    calls: list[dict[str, object]] = []
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return {
+                    "final_response": "Choose mode.",
+                    "messages": [],
+                    "api_calls": 0,
+                    "handled": True,
+                    "choice_prompt_id": prompt_id,
+                    "choice_mode": "single",
+                    "min_choices": 1,
+                    "max_choices": 1,
+                    "submit_label": "Choose mode",
+                    "expires_at": "2026-07-18T03:00:00Z",
+                    "choices": [
+                        {"id": "chat", "label": "Chat", "description": "Chat."},
+                        {"id": "task", "label": "Task", "description": "Task."},
+                    ],
+                }
+            assert kwargs["user_message"] == {
+                "choice_prompt_id": prompt_id,
+                "selected_choice_ids": ["task"],
+            }
+            assert kwargs["is_user_turn"] is True
+            return {
+                "final_response": "Choose task flow.",
+                "messages": [],
+                "api_calls": 0,
+                "handled": True,
+                "choices": [],
+            }
+
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli.conversation_history = ["current"]
+    cli.session_id = "session-1"
+    cli._prompt_choice_modal = lambda _prompt: {
+        "choice_prompt_id": prompt_id,
+        "selected_choice_ids": ["task"],
+    }
+
+    result = namespace["process"](cli, "first input", "first input", None)
+
+    assert len(calls) == 2
+    assert result["api_calls"] == 0
+    assert result["final_response"] == "Choose task flow."
+
+
+def test_cli_modal_cancel_does_not_reenter_or_auto_select_first_choice() -> None:
+    namespace: dict[str, object] = {"queue": queue, "maybe_auto_title": lambda: None}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    prompt_id = "79df97c7-ff3d-4415-8b2e-dbe93bd10590"
+    calls = 0
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**_kwargs):
+            nonlocal calls
+            calls += 1
+            return {
+                "final_response": "Choose mode.",
+                "messages": [],
+                "api_calls": 0,
+                "handled": True,
+                "choice_prompt_id": prompt_id,
+                "choice_mode": "single",
+                "min_choices": 1,
+                "max_choices": 1,
+                "submit_label": "Choose mode",
+                "expires_at": "2026-07-18T03:00:00Z",
+                "choices": [
+                    {"id": "chat", "label": "Chat", "description": "Chat."},
+                    {"id": "task", "label": "Task", "description": "Task."},
+                ],
+            }
+
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli.conversation_history = ["current"]
+    cli.session_id = "session-1"
+    cli._prompt_choice_modal = lambda _prompt: None
+
+    result = namespace["process"](cli, "first input", "first input", None)
+
+    assert calls == 1
+    assert result["api_calls"] == 0
+    assert result["choices"][0]["id"] == "chat"
+    assert "- Chat [id: chat]" in result["final_response"]
 
 
 def test_tui_transports_choice_objects_in_message_payload() -> None:
