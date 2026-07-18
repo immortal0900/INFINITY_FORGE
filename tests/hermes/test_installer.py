@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import queue
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -171,6 +173,29 @@ CLI_SOURCE = '''class ModalShell:
 
         @kb.add('escape', filter=_modal_prompt_active, eager=True)
         def handle_escape_modal(event):
+            """ESC cancels active secret/sudo prompts."""
+            if self._secret_state:
+                self._cancel_secret_capture()
+                event.app.current_buffer.reset()
+                event.app.invalidate()
+                return
+            if self._sudo_state:
+                self._sudo_state["response_queue"].put("")
+                self._sudo_state = None
+                event.app.invalidate()
+                return
+            if self._slash_confirm_state:
+                self._submit_slash_confirm_response("cancel")
+                event.app.current_buffer.reset()
+                event.app.invalidate()
+                return
+
+        @kb.add('c-z')
+        def handle_ctrl_z(event):
+            event.app.invalidate()
+
+        @kb.add('c-c')
+        def handle_ctrl_c(event):
             if self._slash_confirm_state:
                 self._submit_slash_confirm_response("cancel")
                 event.app.current_buffer.reset()
@@ -427,6 +452,202 @@ def test_choice_modal_cancel_sentinels_never_submit_a_stable_id(path, sentinel) 
     cli._prompt_text_input_modal = lambda **kwargs: sentinel
 
     assert cli._prompt_choice_modal(_valid_cli_prompt()) is None, path
+
+
+def test_structured_ctrl_c_cannot_submit_a_choice_id_named_cancel() -> None:
+    class KeyBindings:
+        def __init__(self) -> None:
+            self.handlers: dict[str, object] = {}
+
+        def add(self, key, **_kwargs):
+            def register(handler):
+                self.handlers[key] = handler
+                return handler
+
+            return register
+
+    class Buffer:
+        def reset(self) -> None:
+            pass
+
+    class App:
+        current_buffer = Buffer()
+
+        def invalidate(self) -> None:
+            pass
+
+    namespace: dict[str, object] = {"queue": queue, "time": time}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    cli = namespace["ModalShell"]()
+    cli._voice_lock = threading.Lock()
+    cli._voice_recording = False
+    cli._voice_recorder = None
+    namespace["cli_ref"] = cli
+    kb = KeyBindings()
+    cli.run(kb, lambda predicate: predicate)
+    event = types.SimpleNamespace(app=App())
+
+    structured_responses = queue.Queue()
+    cli._slash_confirm_state = {
+        "structured_choice_modal": True,
+        "choices": [("cancel", "Cancel", "Discard the request.")],
+        "response_queue": structured_responses,
+    }
+    cli._slash_confirm_deadline = 123
+    kb.handlers["c-c"](event)
+
+    assert structured_responses.get_nowait() is None
+    assert cli._slash_confirm_state is None
+
+    legacy_responses = queue.Queue()
+    cli._slash_confirm_state = {
+        "choices": [("once", "Approve once", "Proceed once.")],
+        "response_queue": legacy_responses,
+    }
+    cli._slash_confirm_deadline = 123
+    kb.handlers["c-c"](event)
+
+    assert legacy_responses.get_nowait() == "cancel"
+
+
+def test_structured_ctrl_c_does_not_reenter_the_user_turn_hook() -> None:
+    class KeyBindings:
+        def __init__(self) -> None:
+            self.handlers: dict[str, object] = {}
+
+        def add(self, key, **_kwargs):
+            def register(handler):
+                self.handlers[key] = handler
+                return handler
+
+            return register
+
+    class Buffer:
+        def reset(self) -> None:
+            pass
+
+    class App:
+        current_buffer = Buffer()
+
+        def invalidate(self) -> None:
+            pass
+
+    tty = type("TTY", (), {"isatty": lambda self: True})()
+    fake_sys = type("Sys", (), {"stdin": tty, "stdout": tty})()
+    namespace: dict[str, object] = {
+        "queue": queue,
+        "sys": fake_sys,
+        "time": time,
+        "maybe_auto_title": lambda: None,
+    }
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    calls = 0
+    prompt = {
+        **_valid_cli_prompt(),
+        "choices": [{"id": "cancel", "label": "Cancel", "description": "Stop."}],
+    }
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**_kwargs):
+            nonlocal calls
+            calls += 1
+            return (
+                prompt
+                if calls == 1
+                else {
+                    "final_response": "Unexpected reentry.",
+                    "messages": [],
+                    "api_calls": 0,
+                    "handled": True,
+                    "choices": [],
+                }
+            )
+
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli._app = object()
+    cli._capture_modal_input_snapshot = lambda: None
+    cli._voice_lock = threading.Lock()
+    cli._voice_recording = False
+    cli._voice_recorder = None
+    cli.conversation_history = ["current"]
+    cli.session_id = "session-1"
+    namespace["cli_ref"] = cli
+    kb = KeyBindings()
+    cli.run(kb, lambda predicate: predicate)
+    result: dict[str, object] = {}
+
+    def run_process() -> None:
+        result["value"] = namespace["process"](cli, "first input", "first input", None)
+
+    worker = threading.Thread(target=run_process)
+    worker.start()
+    deadline = time.monotonic() + 1
+    while cli._slash_confirm_state is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert cli._slash_confirm_state is not None
+    kb.handlers["c-c"](types.SimpleNamespace(app=App()))
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert calls == 1
+    assert result["value"] is prompt
+
+
+def test_choice_modal_rechecks_expiry_after_waiting_before_submitting() -> None:
+    tty = type("TTY", (), {"isatty": lambda self: True})()
+    fake_sys = type("Sys", (), {"stdin": tty, "stdout": tty})()
+    namespace: dict[str, object] = {"queue": queue, "sys": fake_sys}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    cli = namespace["ModalShell"]()
+    cli._app = object()
+    prompt = _valid_cli_prompt()
+
+    def select_after_expiry(**_kwargs):
+        prompt["expires_at"] = "2000-01-01T00:00:00Z"
+        return "chat"
+
+    cli._prompt_text_input_modal = select_after_expiry
+
+    assert cli._prompt_choice_modal(prompt) is None
+
+
+def test_expired_modal_selection_does_not_reenter_the_user_turn_hook() -> None:
+    tty = type("TTY", (), {"isatty": lambda self: True})()
+    fake_sys = type("Sys", (), {"stdin": tty, "stdout": tty})()
+    namespace: dict[str, object] = {
+        "queue": queue,
+        "sys": fake_sys,
+        "maybe_auto_title": lambda: None,
+    }
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    prompt = _valid_cli_prompt()
+    calls = 0
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**_kwargs):
+            nonlocal calls
+            calls += 1
+            return prompt
+
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli._app = object()
+    cli.conversation_history = ["current"]
+    cli.session_id = "session-1"
+
+    def select_after_expiry(**_kwargs):
+        prompt["expires_at"] = "2000-01-01T00:00:00Z"
+        return "chat"
+
+    cli._prompt_text_input_modal = select_after_expiry
+
+    result = namespace["process"](cli, "first input", "first input", None)
+
+    assert calls == 1
+    assert result is prompt
 
 
 def test_cli_reenters_the_same_user_turn_path_with_stable_ids() -> None:

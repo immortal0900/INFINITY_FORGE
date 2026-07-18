@@ -148,7 +148,12 @@ _CONVERSATION_HOOK = fr'''
             ):
                 return False
             if _choice_mode == "single":
-                if _min_choices != 1 or _max_choices != 1:
+                if (
+                    not isinstance(_max_choices, int)
+                    or isinstance(_max_choices, bool)
+                    or _min_choices != 1
+                    or _max_choices != 1
+                ):
                     return False
             elif _choice_mode == "multiple":
                 if _max_choices is not None and (
@@ -626,7 +631,12 @@ def _is_valid_choice_prompt(self, prompt: dict) -> bool:
     ):
         return False
     if choice_mode == "single":
-        if min_choices != 1 or max_choices != 1:
+        if (
+            not isinstance(max_choices, int)
+            or isinstance(max_choices, bool)
+            or min_choices != 1
+            or max_choices != 1
+        ):
             return False
     elif choice_mode == "multiple":
         if max_choices is not None and (
@@ -679,6 +689,8 @@ def _prompt_choice_modal(self, prompt: dict, timeout: float = 120) -> dict | Non
         },
     )
     if selected is None:
+        return None
+    if not self._is_valid_choice_prompt(prompt):
         return None
     selected_ids = [selected] if isinstance(selected, str) else list(selected)
     allowed_ids = {choice[0] for choice in modal_choices}
@@ -962,6 +974,21 @@ def change_cli_source(source: str) -> str:
         ),
         max_lines=22,
         label="cli.py chooser Escape handler",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="def handle_ctrl_c(event):",
+        expected="if self._slash_confirm_state:",
+        addition=(
+            '    # RISK(breaking): upstream Ctrl+C uses "cancel", which can be a stable choice ID.',
+            '    if self._slash_confirm_state.get("structured_choice_modal"):',
+            "        self._submit_slash_confirm_response(None)",
+            "        event.app.current_buffer.reset()",
+            "        event.app.invalidate()",
+            "        return",
+        ),
+        max_lines=90,
+        label="cli.py chooser Ctrl+C handler",
     )
     source = _insert_after_line_in_unique_block(
         source,

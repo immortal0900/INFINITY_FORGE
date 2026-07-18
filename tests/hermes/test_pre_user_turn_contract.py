@@ -250,6 +250,18 @@ def test_structured_chat_replace_calls_model_once_with_stashed_text(monkeypatch)
             {"choice_mode": "single", "min_choices": 1, "max_choices": None},
             id="single-not-exactly-one",
         ),
+        pytest.param(
+            {"choice_mode": "single", "max_choices": True},
+            id="single-max-bool",
+        ),
+        pytest.param(
+            {"choice_mode": "single", "max_choices": 1.0},
+            id="single-max-float",
+        ),
+        pytest.param(
+            {"choice_mode": "single", "max_choices": "1"},
+            id="single-max-string",
+        ),
         pytest.param({"min_choices": 0}, id="multiple-min-below-one"),
         pytest.param({"min_choices": 2, "max_choices": 1}, id="multiple-max-below-min"),
         pytest.param({"max_choices": 3}, id="multiple-max-above-choices"),
