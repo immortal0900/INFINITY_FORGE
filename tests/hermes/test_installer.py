@@ -1605,7 +1605,7 @@ def _valid_cli_prompt() -> dict[str, object]:
     }
 
 
-def test_two_hundred_sixtieth_reentry_returns_a_nonchooser_result_unchanged() -> None:
+def test_two_hundred_sixty_first_reentry_returns_a_nonchooser_result_unchanged() -> None:
     namespace: dict[str, object] = {"queue": queue}
     exec(installer.change_cli_source(CLI_SOURCE), namespace)
     prompt = _valid_cli_prompt()
@@ -1622,7 +1622,7 @@ def test_two_hundred_sixtieth_reentry_returns_a_nonchooser_result_unchanged() ->
         def run_conversation(**kwargs):
             nonlocal calls
             calls += 1
-            return final_result if calls == 260 else dict(prompt)
+            return final_result if calls == 261 else dict(prompt)
 
     cli = namespace["ModalShell"]()
     cli.agent = Agent()
@@ -1639,13 +1639,13 @@ def test_two_hundred_sixtieth_reentry_returns_a_nonchooser_result_unchanged() ->
         moa_config=None,
     )
 
-    assert calls == 260
+    assert calls == 261
     assert result is final_result
     assert result["api_calls"] == 1
     assert result["final_response"] == "Model answer"
 
 
-def test_two_hundred_sixty_first_reentry_stops_when_still_a_chooser() -> None:
+def test_two_hundred_sixty_second_prompt_stops_after_261_reentries() -> None:
     namespace: dict[str, object] = {"queue": queue}
     exec(installer.change_cli_source(CLI_SOURCE), namespace)
     prompt = _valid_cli_prompt()
@@ -1673,7 +1673,7 @@ def test_two_hundred_sixty_first_reentry_stops_when_still_a_chooser() -> None:
         moa_config=None,
     )
 
-    assert calls == 260
+    assert calls == 261
     assert result["handled"] is True
     assert result["api_calls"] == 0
     assert "too many consecutive prompts" in result["final_response"]

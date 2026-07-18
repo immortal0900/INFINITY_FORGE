@@ -7,13 +7,16 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace as update
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from threading import RLock
 from uuid import UUID, uuid4
 
 from .choice_prompt import Choice, ChoiceMode, ChoicePrompt, ChoicePromptError, ChoiceSubmission
 from .task_options import MergeMode, Mode, TaskFlow, TaskSelection
+from .task_projects import TaskProject, TaskProjectError, normalize_github_remote
 from .task_service import TaskCreationRequest
 from .task_settings import TaskContent, TaskSettings
+from .task_settings_v2 import TaskRequestV2
 
 
 SETUP_TIMEOUT = timedelta(minutes=30)
@@ -106,12 +109,96 @@ _MERGE_DETAILS = {
 }
 
 
+def _safe_display_text(value: str) -> str:
+    """Escape terminal controls without changing the trusted stored value."""
+
+    escaped: list[str] = []
+    named = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    for character in value:
+        if character in named:
+            escaped.append(named[character])
+        elif character.isprintable():
+            escaped.append(character)
+        else:
+            codepoint = ord(character)
+            escaped.append(
+                f"\\u{codepoint:04x}"
+                if codepoint <= 0xFFFF
+                else f"\\U{codepoint:08x}"
+            )
+    return "".join(escaped)
+
+
 class SetupStep(str, Enum):
     MODE = "mode"
+    PROJECTS = "projects"
     TASK_FLOW = "task_flow"
     MERGE_MODE = "merge_mode"
+    MERGE_ORDER = "merge_order"
     TASK_CONTENT = "task_content"
     CONFIRM = "confirm"
+
+
+ProjectDiscoverer = Callable[[str | None], tuple[TaskProject, ...]]
+ProjectValidator = Callable[[tuple[TaskProject, ...]], tuple[TaskProject, ...]]
+
+
+@dataclass(frozen=True)
+class TaskSetupContext:
+    """Trusted, non-model context used only by the v2 Project setup path."""
+
+    working_directory: str | None
+    management_repository: str
+    task_owner_host: str
+    discover_projects: ProjectDiscoverer
+    validate_projects: ProjectValidator
+
+    def __post_init__(self) -> None:
+        if self.working_directory is not None and (
+            not isinstance(self.working_directory, str)
+            or not self.working_directory.strip()
+        ):
+            raise ValueError("working_directory must be a non-empty string or None")
+        if self.working_directory is not None:
+            try:
+                working_path = Path(self.working_directory)
+                if not working_path.is_absolute():
+                    raise ValueError
+                resolved = working_path.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                raise ValueError(
+                    "working_directory must be a canonical absolute directory"
+                ) from None
+            if not resolved.is_dir() or str(resolved) != self.working_directory:
+                raise ValueError(
+                    "working_directory must be a canonical absolute directory"
+                )
+        if not isinstance(self.management_repository, str):
+            raise ValueError(
+                "management_repository must use canonical OWNER/REPO format"
+            )
+        try:
+            normalized_repository = normalize_github_remote(
+                f"https://github.com/{self.management_repository}"
+            )
+        except TaskProjectError:
+            raise ValueError(
+                "management_repository must use canonical OWNER/REPO format"
+            ) from None
+        if normalized_repository != self.management_repository:
+            raise ValueError(
+                "management_repository must use canonical OWNER/REPO format"
+            )
+        if not isinstance(self.task_owner_host, str):
+            raise ValueError("task_owner_host must be a canonical UUID")
+        try:
+            parsed_host = UUID(self.task_owner_host)
+        except ValueError:
+            raise ValueError("task_owner_host must be a canonical UUID") from None
+        if str(parsed_host) != self.task_owner_host:
+            raise ValueError("task_owner_host must be a canonical UUID")
+        if not callable(self.discover_projects) or not callable(self.validate_projects):
+            raise ValueError("Project discovery and validation must be callable")
 
 
 @dataclass(frozen=True)
@@ -120,12 +207,42 @@ class SetupDraft:
 
     step: SetupStep
     first_input: str | None
+    project_candidates: tuple[TaskProject, ...]
+    projects: tuple[TaskProject, ...]
     task_flow: TaskFlow | None
     merge_mode: MergeMode | None
+    merge_order: tuple[str, ...] | None
+    management_repository: str | None
+    task_owner_host: str | None
     task_text: str | None
     task_request: TaskCreationRequest | None
+    task_request_v2: TaskRequestV2 | None
     expires_at: datetime
     choice_prompt: ChoicePrompt | None
+    generation: int
+    operation_token: str | None
+
+
+@dataclass(frozen=True)
+class _SetupWork:
+    key: SessionKey
+    context: TaskSetupContext
+    token: str
+    generation: int
+    step: SetupStep
+    expires_at: datetime
+    prompt_id: str | None
+    selected_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _DiscoveryWork(_SetupWork):
+    prefix: str | None = None
+
+
+@dataclass(frozen=True)
+class _ValidationWork(_SetupWork):
+    projects: tuple[TaskProject, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -140,6 +257,7 @@ class TurnResult:
     selection: TaskSelection | None = None
     task_text: str | None = None
     task_request: TaskCreationRequest | None = None
+    task_request_v2: TaskRequestV2 | None = None
 
     @classmethod
     def continue_original(cls) -> "TurnResult":
@@ -160,6 +278,7 @@ class TurnResult:
         selection: TaskSelection | None = None,
         task_text: str | None = None,
         task_request: TaskCreationRequest | None = None,
+        task_request_v2: TaskRequestV2 | None = None,
     ) -> "TurnResult":
         return cls(
             action="handled",
@@ -170,6 +289,7 @@ class TurnResult:
             selection=selection,
             task_text=task_text,
             task_request=task_request,
+            task_request_v2=task_request_v2,
         )
 
 
@@ -214,6 +334,7 @@ class TaskSetup:
         surface: str = DEFAULT_SURFACE,
         is_new_session: bool = False,
         repository: str | None = None,
+        context: TaskSetupContext | None = None,
     ) -> TurnResult:
         """Consume one user input and return continue, replace, or handled."""
 
@@ -223,7 +344,17 @@ class TaskSetup:
             self._sweep(current_time)
             if is_new_session:
                 self._discard(key)
-            return self._handle_locked(key, text, current_time, repository)
+            outcome = self._handle_locked(
+                key,
+                text,
+                current_time,
+                repository,
+                context,
+            )
+        return self._resolve_work(
+            outcome,
+            current_time if now is not None else None,
+        )
 
     def handle_submission(
         self,
@@ -235,6 +366,7 @@ class TaskSetup:
         surface: str = DEFAULT_SURFACE,
         is_new_session: bool = False,
         repository: str | None = None,
+        context: TaskSetupContext | None = None,
     ) -> TurnResult:
         """Apply a structured submission to its pending prompt.
 
@@ -257,9 +389,18 @@ class TaskSetup:
                 selected = draft.choice_prompt.validate_submission(submission, current_time)
             except ChoicePromptError as error:
                 return self._same_prompt_result(draft, str(error))
-            return self._handle_selected_choice(
-                key, draft, selected[0], current_time, repository
+            outcome = self._handle_selected_choices(
+                key,
+                draft,
+                selected,
+                current_time,
+                repository,
+                context,
             )
+        return self._resolve_work(
+            outcome,
+            current_time if now is not None else None,
+        )
 
     def pending_choice_prompt(
         self,
@@ -303,17 +444,142 @@ class TaskSetup:
                 return self._same_prompt_result(draft, str(error))
             return None
 
+    def _resolve_work(
+        self,
+        outcome: TurnResult | _SetupWork,
+        explicit_time: datetime | None,
+    ) -> TurnResult:
+        if isinstance(outcome, _DiscoveryWork):
+            try:
+                projects = outcome.context.discover_projects(
+                    outcome.context.working_directory
+                )
+                if not isinstance(projects, tuple) or any(
+                    not isinstance(project, TaskProject) for project in projects
+                ):
+                    raise ValueError("Project discovery returned invalid data")
+                error = None
+            except Exception:
+                projects = ()
+                error = "Project discovery failed."
+            completion_time = explicit_time or self._clock()
+            with self._lock:
+                draft = self._matching_work_draft(outcome, completion_time)
+                if draft is None:
+                    return TurnResult.handled(
+                        "The Project discovery result was stale and was not applied."
+                    )
+                if error is not None or not projects:
+                    prefix = error or "No Projects were found in the configured workspace roots."
+                    refreshed = self._refresh(
+                        draft,
+                        completion_time,
+                        project_candidates=(),
+                        projects=(),
+                        task_flow=None,
+                        merge_mode=None,
+                        merge_order=None,
+                        task_text=None,
+                        task_request=None,
+                        task_request_v2=None,
+                        operation_token=None,
+                    )
+                    self._store_draft(outcome.key, refreshed, completion_time)
+                    return self._projects_prompt(refreshed, prefix)
+                refreshed = self._refresh(
+                    draft,
+                    completion_time,
+                    project_candidates=projects,
+                    projects=(),
+                    task_flow=None,
+                    merge_mode=None,
+                    merge_order=None,
+                    management_repository=outcome.context.management_repository,
+                    task_owner_host=outcome.context.task_owner_host,
+                    task_text=None,
+                    task_request=None,
+                    task_request_v2=None,
+                    operation_token=None,
+                )
+                self._store_draft(outcome.key, refreshed, completion_time)
+                return self._projects_prompt(refreshed, outcome.prefix)
+
+        if isinstance(outcome, _ValidationWork):
+            try:
+                validated = outcome.context.validate_projects(outcome.projects)
+                valid = validated == outcome.projects
+            except Exception:
+                valid = False
+            completion_time = explicit_time or self._clock()
+            with self._lock:
+                draft = self._matching_work_draft(outcome, completion_time)
+                if draft is None:
+                    return TurnResult.handled(
+                        "The Project validation result was stale and was not applied."
+                    )
+                if not valid:
+                    reset = self._refresh(
+                        draft,
+                        completion_time,
+                        step=SetupStep.PROJECTS,
+                        project_candidates=(),
+                        projects=(),
+                        task_flow=None,
+                        merge_mode=None,
+                        merge_order=None,
+                        task_text=None,
+                        task_request=None,
+                        task_request_v2=None,
+                        operation_token=None,
+                    )
+                    self._store_draft(outcome.key, reset, completion_time)
+                    return self._projects_prompt(
+                        reset,
+                        "Project validation failed. Discover Projects again before confirming.",
+                    )
+                prepared = update(draft, operation_token=None)
+                self._store_draft(outcome.key, prepared, completion_time)
+                return self._prepared_v2_result(prepared)
+
+        return outcome
+
+    def _matching_work_draft(
+        self,
+        work: _SetupWork,
+        now: datetime,
+    ) -> SetupDraft | None:
+        draft = self._drafts.get(work.key)
+        if draft is None or now >= draft.expires_at:
+            return None
+        prompt_id = (
+            None
+            if draft.choice_prompt is None
+            else draft.choice_prompt.choice_prompt_id
+        )
+        selected_ids = tuple(project.project_id for project in draft.projects)
+        if (
+            draft.operation_token != work.token
+            or draft.generation != work.generation
+            or draft.step is not work.step
+            or draft.expires_at != work.expires_at
+            or prompt_id != work.prompt_id
+            or selected_ids != work.selected_ids
+        ):
+            return None
+        return draft
+
     def _handle_locked(
         self,
         key: SessionKey,
         text: str,
         current_time: datetime,
         repository: str | None,
-    ) -> TurnResult:
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _SetupWork:
         choice = text.strip()
 
         if choice == "/task":
-            return self._start_task(key, current_time)
+            return self._start_task(key, current_time, context)
         if choice == "/cancel":
             return self._enter_chat(key, current_time)
 
@@ -329,24 +595,50 @@ class TaskSetup:
             if self._start_in_task:
                 draft = self._new_task_draft(current_time)
                 self._store_draft(key, draft, current_time)
+                if context is not None:
+                    return self._begin_project_discovery(
+                        key,
+                        draft,
+                        current_time,
+                        context,
+                    )
             else:
                 draft = self._new_mode_draft(text, current_time)
                 self._store_draft(key, draft, current_time)
                 return self._mode_prompt(draft)
 
         if draft.step is SetupStep.MODE:
-            return self._handle_mode(key, draft, choice, current_time)
+            return self._handle_mode(key, draft, choice, current_time, context)
+        if draft.step is SetupStep.PROJECTS:
+            selected = tuple(
+                item.strip() for item in choice.split(",") if item.strip()
+            )
+            return self._handle_projects(
+                key,
+                draft,
+                selected,
+                current_time,
+                context,
+            )
         if draft.step is SetupStep.TASK_FLOW:
             return self._handle_task_flow(key, draft, choice, current_time)
         if draft.step is SetupStep.MERGE_MODE:
             return self._handle_merge_mode(
                 key, draft, choice, current_time, repository
             )
+        if draft.step is SetupStep.MERGE_ORDER:
+            return self._handle_merge_order(
+                key,
+                draft,
+                choice,
+                current_time,
+                repository,
+            )
         if draft.step is SetupStep.TASK_CONTENT:
             return self._handle_task_content(
                 key, draft, text, current_time, repository
             )
-        return self._handle_confirm(key, draft, choice, current_time)
+        return self._handle_confirm(key, draft, choice, current_time, context)
 
     def enter_chat(
         self,
@@ -369,37 +661,62 @@ class TaskSetup:
         self._store_chat(key, now)
         return TurnResult.handled("Task setup cancelled. Continuing in Chat.")
 
-    def _start_task(self, key: SessionKey, now: datetime) -> TurnResult:
+    def _start_task(
+        self,
+        key: SessionKey,
+        now: datetime,
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _DiscoveryWork:
         self._chat_sessions.discard(key)
         draft = self._new_task_draft(now)
         self._store_draft(key, draft, now)
+        if context is not None:
+            return self._begin_project_discovery(key, draft, now, context)
         return self._task_flow_prompt(draft)
 
     def _new_task_draft(self, now: datetime) -> SetupDraft:
         expires_at = self._deadline(now)
-        return SetupDraft(
+        draft = SetupDraft(
             step=SetupStep.TASK_FLOW,
             first_input=None,
+            project_candidates=(),
+            projects=(),
             task_flow=None,
             merge_mode=None,
+            merge_order=None,
+            management_repository=None,
+            task_owner_host=None,
             task_text=None,
             task_request=None,
+            task_request_v2=None,
             expires_at=expires_at,
-            choice_prompt=self._choice_prompt(SetupStep.TASK_FLOW, expires_at),
+            choice_prompt=None,
+            generation=0,
+            operation_token=None,
         )
+        return update(draft, choice_prompt=self._choice_prompt(draft, expires_at))
 
     def _new_mode_draft(self, first_input: str, now: datetime) -> SetupDraft:
         expires_at = self._deadline(now)
-        return SetupDraft(
+        draft = SetupDraft(
             step=SetupStep.MODE,
             first_input=first_input,
+            project_candidates=(),
+            projects=(),
             task_flow=None,
             merge_mode=None,
+            merge_order=None,
+            management_repository=None,
+            task_owner_host=None,
             task_text=None,
             task_request=None,
+            task_request_v2=None,
             expires_at=expires_at,
-            choice_prompt=self._choice_prompt(SetupStep.MODE, expires_at),
+            choice_prompt=None,
+            generation=0,
+            operation_token=None,
         )
+        return update(draft, choice_prompt=self._choice_prompt(draft, expires_at))
 
     @staticmethod
     def _deadline(now: datetime) -> datetime:
@@ -408,17 +725,19 @@ class TaskSetup:
     def _refresh(self, draft: SetupDraft, now: datetime, **changes: object) -> SetupDraft:
         expires_at = self._deadline(now)
         step = changes.get("step", draft.step)
+        refreshed = update(
+            draft,
+            expires_at=expires_at,
+            choice_prompt=None,
+            generation=draft.generation + 1,
+            **changes,
+        )
         choice_prompt = (
-            self._choice_prompt(step, expires_at)
+            self._choice_prompt(refreshed, expires_at)
             if isinstance(step, SetupStep) and self._step_has_choices(step)
             else None
         )
-        return update(
-            draft,
-            expires_at=expires_at,
-            choice_prompt=choice_prompt,
-            **changes,
-        )
+        return update(refreshed, choice_prompt=choice_prompt)
 
     def _sweep(self, now: datetime) -> None:
         expired = [
@@ -467,19 +786,28 @@ class TaskSetup:
         draft: SetupDraft,
         choice: str,
         now: datetime,
-    ) -> TurnResult:
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _DiscoveryWork:
         if choice == Mode.CHAT.value:
             self._store_chat(key, now)
             return TurnResult.replace(draft.first_input or "")
         if choice == Mode.TASK.value:
+            if context is not None:
+                return self._begin_project_discovery(key, draft, now, context)
             task_draft = self._refresh(
                 draft,
                 now,
                 step=SetupStep.TASK_FLOW,
+                project_candidates=(),
+                projects=(),
                 task_flow=None,
                 merge_mode=None,
+                merge_order=None,
+                management_repository=None,
+                task_owner_host=None,
                 task_text=None,
                 task_request=None,
+                task_request_v2=None,
             )
             self._store_draft(key, task_draft, now)
             return self._task_flow_prompt(task_draft)
@@ -487,6 +815,107 @@ class TaskSetup:
         refreshed = self._refresh(draft, now)
         self._store_draft(key, refreshed, now)
         return self._mode_prompt(refreshed, "Choose either chat or task.")
+
+    def _begin_project_discovery(
+        self,
+        key: SessionKey,
+        draft: SetupDraft,
+        now: datetime,
+        context: TaskSetupContext,
+        prefix: str | None = None,
+    ) -> _DiscoveryWork:
+        token = str(uuid4())
+        pending = self._refresh(
+            draft,
+            now,
+            step=SetupStep.PROJECTS,
+            project_candidates=(),
+            projects=(),
+            task_flow=None,
+            merge_mode=None,
+            merge_order=None,
+            management_repository=None,
+            task_owner_host=None,
+            task_text=None,
+            task_request=None,
+            task_request_v2=None,
+            operation_token=token,
+        )
+        pending = update(pending, choice_prompt=None)
+        self._store_draft(key, pending, now)
+        return _DiscoveryWork(
+            key=key,
+            context=context,
+            token=token,
+            generation=pending.generation,
+            step=pending.step,
+            expires_at=pending.expires_at,
+            prompt_id=None,
+            selected_ids=(),
+            prefix=prefix,
+        )
+
+    def _handle_projects(
+        self,
+        key: SessionKey,
+        draft: SetupDraft,
+        selected_ids: tuple[str, ...],
+        now: datetime,
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _DiscoveryWork:
+        if draft.operation_token is not None:
+            return TurnResult.handled("Project discovery is already in progress.")
+        if not draft.project_candidates:
+            if selected_ids == ("cancel",):
+                return self._enter_chat(key, now)
+            if selected_ids == ("retry",):
+                if context is None:
+                    return self._projects_prompt(
+                        draft,
+                        "Trusted Project configuration is unavailable.",
+                    )
+                return self._begin_project_discovery(key, draft, now, context)
+            return self._projects_prompt(
+                draft,
+                "Choose Retry to discover Projects or Cancel.",
+            )
+        allowed = {project.project_id: project for project in draft.project_candidates}
+        if (
+            not selected_ids
+            or len(set(selected_ids)) != len(selected_ids)
+            or any(project_id not in allowed for project_id in selected_ids)
+        ):
+            return self._projects_prompt(
+                draft,
+                "Choose one or more listed Projects by stable ID.",
+            )
+        selected_set = set(selected_ids)
+        projects = tuple(
+            project
+            for project in draft.project_candidates
+            if project.project_id in selected_set
+        )
+        repositories = [project.repository.casefold() for project in projects]
+        if len(repositories) != len(set(repositories)):
+            return self._projects_prompt(
+                draft,
+                "The same repository cannot be selected through multiple remotes.",
+            )
+        selected = self._refresh(
+            draft,
+            now,
+            step=SetupStep.TASK_FLOW,
+            projects=projects,
+            task_flow=None,
+            merge_mode=None,
+            merge_order=None,
+            task_text=None,
+            task_request=None,
+            task_request_v2=None,
+            operation_token=None,
+        )
+        self._store_draft(key, selected, now)
+        return self._task_flow_prompt(selected)
 
     def _handle_task_flow(
         self,
@@ -507,8 +936,10 @@ class TaskSetup:
             step=SetupStep.MERGE_MODE,
             task_flow=task_flow,
             merge_mode=None,
+            merge_order=None,
             task_text=None,
             task_request=None,
+            task_request_v2=None,
         )
         self._store_draft(key, selected, now)
         return self._merge_mode_prompt(selected)
@@ -531,14 +962,63 @@ class TaskSetup:
             draft,
             now,
             merge_mode=merge_mode,
+            merge_order=None,
             task_request=None,
+            task_request_v2=None,
         )
+        if merge_mode is MergeMode.FULL_AUTO and len(selected.projects) > 1:
+            ordered = self._refresh(
+                selected,
+                now,
+                step=SetupStep.MERGE_ORDER,
+                merge_order=(),
+            )
+            self._store_draft(key, ordered, now)
+            return self._merge_order_prompt(ordered)
         if selected.first_input is None:
             self._store_draft(
                 key,
                 update(selected, step=SetupStep.TASK_CONTENT, choice_prompt=None),
                 now,
             )
+            return self._task_content_prompt()
+        return self._prepare_preview(
+            key,
+            selected,
+            selected.first_input,
+            now,
+            repository,
+        )
+
+    def _handle_merge_order(
+        self,
+        key: SessionKey,
+        draft: SetupDraft,
+        choice: str,
+        now: datetime,
+        repository: str | None,
+    ) -> TurnResult:
+        if draft.merge_order is None:
+            raise RuntimeError("Merge order state is missing")
+        project_ids = {project.project_id for project in draft.projects}
+        if choice not in project_ids or choice in draft.merge_order:
+            return self._merge_order_prompt(
+                draft,
+                "Choose one remaining Project by stable ID.",
+            )
+        merge_order = (*draft.merge_order, choice)
+        if len(merge_order) < len(draft.projects):
+            selected = self._refresh(draft, now, merge_order=merge_order)
+            self._store_draft(key, selected, now)
+            return self._merge_order_prompt(selected)
+        selected = update(draft, merge_order=merge_order)
+        if selected.first_input is None:
+            content = self._refresh(
+                selected,
+                now,
+                step=SetupStep.TASK_CONTENT,
+            )
+            self._store_draft(key, content, now)
             return self._task_content_prompt()
         return self._prepare_preview(
             key,
@@ -571,10 +1051,35 @@ class TaskSetup:
     ) -> TurnResult:
         if draft.task_flow is None or draft.merge_mode is None:
             raise RuntimeError("Task choices are incomplete")
+        confirmed_at = self._normalized_utc(now)
+        if draft.projects:
+            if draft.management_repository is None or draft.task_owner_host is None:
+                raise RuntimeError("Trusted v2 Task configuration is missing")
+            request_v2 = TaskRequestV2.create(
+                request_id=self._new_request_id(),
+                management_repository=draft.management_repository,
+                task_content=self._task_content(task_text),
+                task_flow=draft.task_flow,
+                merge_mode=draft.merge_mode,
+                merge_order=draft.merge_order,
+                projects=draft.projects,
+                task_owner_host=draft.task_owner_host,
+                confirmed_by=key[2],
+                confirmed_at=confirmed_at,
+            )
+            preview = self._refresh(
+                draft,
+                now,
+                step=SetupStep.CONFIRM,
+                task_text=task_text,
+                task_request=None,
+                task_request_v2=request_v2,
+            )
+            self._store_draft(key, preview, now)
+            return self._preview_prompt(preview)
         if not isinstance(repository, str) or not repository.strip():
             raise RuntimeError("INFINITY_FORGE_REPOSITORY is required")
 
-        confirmed_at = self._normalized_utc(now)
         request = TaskCreationRequest(
             request_id=self._new_request_id(),
             repository=repository,
@@ -601,6 +1106,7 @@ class TaskSetup:
             step=SetupStep.CONFIRM,
             task_text=task_text,
             task_request=request,
+            task_request_v2=None,
         )
         self._store_draft(key, preview, now)
         return self._preview_prompt(preview)
@@ -611,9 +1117,15 @@ class TaskSetup:
         draft: SetupDraft,
         choice: str,
         now: datetime,
-    ) -> TurnResult:
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _ValidationWork:
         if choice == "cancel":
             return self._enter_chat(key, now)
+        if choice == "confirm" and draft.operation_token is not None:
+            return self._preview_prompt(
+                draft,
+                "Project validation is already in progress.",
+            )
         if choice != "confirm":
             refreshed = self._refresh(draft, now)
             self._store_draft(key, refreshed, now)
@@ -623,9 +1135,74 @@ class TaskSetup:
             )
         if draft.task_text is None:
             raise RuntimeError("Task content is missing")
+        if draft.task_request_v2 is not None:
+            if (
+                context is None
+                or context.management_repository != draft.management_repository
+                or context.task_owner_host != draft.task_owner_host
+            ):
+                reset = self._refresh(
+                    draft,
+                    now,
+                    step=SetupStep.PROJECTS,
+                    project_candidates=(),
+                    projects=(),
+                    task_flow=None,
+                    merge_mode=None,
+                    merge_order=None,
+                    task_text=None,
+                    task_request=None,
+                    task_request_v2=None,
+                    operation_token=None,
+                )
+                self._store_draft(key, reset, now)
+                return self._projects_prompt(
+                    reset,
+                    "Trusted Task configuration changed. Discover Projects again.",
+                )
+            token = str(uuid4())
+            pending = update(draft, operation_token=token)
+            self._store_draft(key, pending, now)
+            prompt_id = (
+                None
+                if pending.choice_prompt is None
+                else pending.choice_prompt.choice_prompt_id
+            )
+            return _ValidationWork(
+                key=key,
+                context=context,
+                token=token,
+                generation=pending.generation,
+                step=pending.step,
+                expires_at=pending.expires_at,
+                prompt_id=prompt_id,
+                selected_ids=tuple(
+                    project.project_id for project in pending.projects
+                ),
+                projects=pending.projects,
+            )
         if draft.task_request is None:
             raise RuntimeError("Task request is missing")
         return self._finish_task(key, draft, draft.task_text, draft.task_request, now)
+
+    def _prepared_v2_result(self, draft: SetupDraft) -> TurnResult:
+        if (
+            draft.task_flow is None
+            or draft.merge_mode is None
+            or draft.task_text is None
+            or draft.task_request_v2 is None
+            or draft.choice_prompt is None
+        ):
+            raise RuntimeError("Prepared v2 Task data is incomplete")
+        selection = TaskSelection(Mode.TASK, draft.task_flow, draft.merge_mode)
+        return TurnResult.handled(
+            "Task validated, but v2 Task creation is not enabled yet.",
+            choice_prompt=draft.choice_prompt,
+            next_step=SetupStep.CONFIRM,
+            selection=selection,
+            task_text=draft.task_text,
+            task_request_v2=draft.task_request_v2,
+        )
 
     def _finish_task(
         self,
@@ -666,32 +1243,53 @@ class TaskSetup:
                 return value
         return None
 
-    def _handle_selected_choice(
+    def _handle_selected_choices(
         self,
         key: SessionKey,
         draft: SetupDraft,
-        choice_id: str,
+        choice_ids: tuple[str, ...],
         now: datetime,
         repository: str | None,
-    ) -> TurnResult:
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _SetupWork:
+        if draft.step is SetupStep.PROJECTS:
+            return self._handle_projects(key, draft, choice_ids, now, context)
+        if len(choice_ids) != 1:
+            return self._same_prompt_result(
+                draft,
+                "this step requires exactly one choice",
+            )
+        choice_id = choice_ids[0]
         if draft.step is SetupStep.MODE:
-            return self._handle_mode(key, draft, choice_id, now)
+            return self._handle_mode(key, draft, choice_id, now, context)
         if draft.step is SetupStep.TASK_FLOW:
             return self._handle_task_flow(key, draft, choice_id, now)
         if draft.step is SetupStep.MERGE_MODE:
             return self._handle_merge_mode(key, draft, choice_id, now, repository)
+        if draft.step is SetupStep.MERGE_ORDER:
+            return self._handle_merge_order(
+                key,
+                draft,
+                choice_id,
+                now,
+                repository,
+            )
         if draft.step is SetupStep.CONFIRM:
-            return self._handle_confirm(key, draft, choice_id, now)
+            return self._handle_confirm(key, draft, choice_id, now, context)
         return TurnResult.handled("This Task step requires text input.")
 
     def _same_prompt_result(self, draft: SetupDraft, error: str) -> TurnResult:
         prefix = f"Choice was not applied: {error}."
         if draft.step is SetupStep.MODE:
             return self._mode_prompt(draft, prefix)
+        if draft.step is SetupStep.PROJECTS:
+            return self._projects_prompt(draft, prefix)
         if draft.step is SetupStep.TASK_FLOW:
             return self._task_flow_prompt(draft, prefix)
         if draft.step is SetupStep.MERGE_MODE:
             return self._merge_mode_prompt(draft, prefix)
+        if draft.step is SetupStep.MERGE_ORDER:
+            return self._merge_order_prompt(draft, prefix)
         if draft.step is SetupStep.CONFIRM:
             return self._preview_prompt(draft, prefix)
         return TurnResult.handled(prefix)
@@ -700,44 +1298,111 @@ class TaskSetup:
     def _step_has_choices(step: SetupStep) -> bool:
         return step in {
             SetupStep.MODE,
+            SetupStep.PROJECTS,
             SetupStep.TASK_FLOW,
             SetupStep.MERGE_MODE,
+            SetupStep.MERGE_ORDER,
             SetupStep.CONFIRM,
         }
 
     @staticmethod
-    def _choice_prompt(step: SetupStep, expires_at: datetime) -> ChoicePrompt:
+    def _choice_prompt(draft: SetupDraft, expires_at: datetime) -> ChoicePrompt:
+        step = draft.step
         if step is SetupStep.MODE:
             choices = tuple(
                 Choice(value.value, _MODE_LABELS[value], _MODE_DETAILS[value])
                 for value in Mode
             )
             submit_label = "Choose mode"
+            choice_mode = ChoiceMode.SINGLE
+            max_choices = 1
+        elif step is SetupStep.PROJECTS:
+            if draft.project_candidates:
+                choices = tuple(
+                    Choice(
+                        project.project_id,
+                        (
+                            f"{_safe_display_text(project.repository)} "
+                            f"({_safe_display_text(project.remote_name)}, "
+                            f"{project.project_id[:8]})"
+                        ),
+                        (
+                            f"{_safe_display_text(project.workspace)} — "
+                            f"{_safe_display_text(project.base_branch)} "
+                            f"at {project.base_commit[:12]}"
+                        ),
+                    )
+                    for project in draft.project_candidates
+                )
+                submit_label = "Choose Projects"
+                choice_mode = ChoiceMode.MULTIPLE
+                max_choices = None
+            else:
+                choices = (
+                    Choice("retry", "Retry", "Discover Projects again"),
+                    Choice("cancel", "Cancel", "Return to Chat"),
+                )
+                submit_label = "Project discovery"
+                choice_mode = ChoiceMode.SINGLE
+                max_choices = 1
         elif step is SetupStep.TASK_FLOW:
             choices = tuple(
                 Choice(value.value, _FLOW_LABELS[value], _FLOW_DETAILS[value])
                 for value in TaskFlow
             )
             submit_label = "Choose checks"
+            choice_mode = ChoiceMode.SINGLE
+            max_choices = 1
         elif step is SetupStep.MERGE_MODE:
             choices = tuple(
                 Choice(value.value, _MERGE_LABELS[value], _MERGE_DETAILS[value])
                 for value in MergeMode
             )
             submit_label = "Choose merge mode"
+            choice_mode = ChoiceMode.SINGLE
+            max_choices = 1
+        elif step is SetupStep.MERGE_ORDER:
+            completed = set(draft.merge_order or ())
+            remaining = tuple(
+                project
+                for project in draft.projects
+                if project.project_id not in completed
+            )
+            if not remaining:
+                raise RuntimeError("Merge order has no remaining Project")
+            choices = tuple(
+                Choice(
+                    project.project_id,
+                    (
+                        f"{_safe_display_text(project.repository)} "
+                        f"({_safe_display_text(project.remote_name)}, "
+                        f"{project.project_id[:8]})"
+                    ),
+                    (
+                        f"Merge rank {len(completed) + 1}: "
+                        f"{_safe_display_text(project.workspace)}"
+                    ),
+                )
+                for project in remaining
+            )
+            submit_label = f"Choose merge rank {len(completed) + 1}"
+            choice_mode = ChoiceMode.SINGLE
+            max_choices = 1
         elif step is SetupStep.CONFIRM:
             choices = (
                 Choice("confirm", "Confirm Task", "Create the reviewed Task"),
                 Choice("cancel", "Cancel", "Discard the reviewed Task"),
             )
             submit_label = "Confirm Task"
+            choice_mode = ChoiceMode.SINGLE
+            max_choices = 1
         else:
             raise RuntimeError("Task step does not have choices")
         return ChoicePrompt(
             choice_prompt_id=str(uuid4()),
-            choice_mode=ChoiceMode.SINGLE,
+            choice_mode=choice_mode,
             min_choices=1,
-            max_choices=1,
+            max_choices=max_choices,
             submit_label=submit_label,
             expires_at=expires_at,
             choices=choices,
@@ -783,6 +1448,36 @@ class TaskSetup:
         )
 
     @staticmethod
+    def _projects_prompt(
+        draft: SetupDraft,
+        prefix: str | None = None,
+    ) -> TurnResult:
+        if draft.choice_prompt is None:
+            raise RuntimeError("Project choice prompt is missing")
+        if draft.project_candidates:
+            intro = prefix or (
+                "Choose one or more Projects. Use the arrow keys and Space "
+                "to select, then submit."
+            )
+            options = "\n".join(
+                (
+                    f"- {_safe_display_text(project.repository)} "
+                    f"({_safe_display_text(project.remote_name)}) — "
+                    f"{_safe_display_text(project.workspace)}"
+                )
+                for project in draft.project_candidates
+            )
+        else:
+            intro = prefix or "No Projects were found. Retry discovery or cancel."
+            options = "- Retry — discover Projects again\n- Cancel — return to Chat"
+        return TurnResult.handled(
+            f"{intro}\n\nOptions:\n{options}",
+            choices=TaskSetup._prompt_choice_ids(draft),
+            choice_prompt=draft.choice_prompt,
+            next_step=SetupStep.PROJECTS,
+        )
+
+    @staticmethod
     def _task_flow_prompt(draft: SetupDraft, prefix: str | None = None) -> TurnResult:
         text = TaskSetup._prompt_text(
             prefix or "Choose the checks for this Task.",
@@ -811,6 +1506,30 @@ class TaskSetup:
         )
 
     @staticmethod
+    def _merge_order_prompt(
+        draft: SetupDraft,
+        prefix: str | None = None,
+    ) -> TurnResult:
+        if draft.choice_prompt is None:
+            raise RuntimeError("Merge order choice prompt is missing")
+        rank = len(draft.merge_order or ()) + 1
+        intro = prefix or f"Choose the Project to merge at rank {rank}."
+        remaining_ids = {choice.id for choice in draft.choice_prompt.choices}
+        options = "\n".join(
+            f"- {_safe_display_text(project.repository)} "
+            f"({_safe_display_text(project.remote_name)}) — "
+            f"{_safe_display_text(project.workspace)}"
+            for project in draft.projects
+            if project.project_id in remaining_ids
+        )
+        return TurnResult.handled(
+            f"{intro}\n\nOptions:\n{options}",
+            choices=TaskSetup._prompt_choice_ids(draft),
+            choice_prompt=draft.choice_prompt,
+            next_step=SetupStep.MERGE_ORDER,
+        )
+
+    @staticmethod
     def _task_content_prompt(prefix: str | None = None) -> TurnResult:
         intro = prefix or "Enter the Task content."
         return TurnResult.handled(
@@ -823,6 +1542,71 @@ class TaskSetup:
         draft: SetupDraft,
         prefix: str | None = None,
     ) -> TurnResult:
+        if draft.task_request_v2 is not None:
+            request_v2 = draft.task_request_v2
+            criteria = "\n".join(
+                f"{number}. {criterion}"
+                for number, criterion in enumerate(
+                    request_v2.task_content.acceptance_criteria,
+                    start=1,
+                )
+            )
+            order_ranks = {
+                project_id: rank
+                for rank, project_id in enumerate(
+                    request_v2.merge_order or (),
+                    start=1,
+                )
+            }
+            project_details = "\n".join(
+                (
+                    f"Project {number}: "
+                    f"{_safe_display_text(project.repository)}\n"
+                    f"Workspace: {_safe_display_text(project.workspace)}\n"
+                    f"Remote: {_safe_display_text(project.remote_name)}\n"
+                    f"Base branch: {_safe_display_text(project.base_branch)}\n"
+                    f"Base commit: {project.base_commit}\n"
+                    + (
+                        ""
+                        if project.project_id not in order_ranks
+                        else f"Merge rank: {order_ranks[project.project_id]}\n"
+                    )
+                    + f"Project ID: {project.project_id}"
+                )
+                for number, project in enumerate(request_v2.projects, start=1)
+            )
+            expiry = (
+                "not granted"
+                if request_v2.auto_merge_expires_at is None
+                else TaskSetup._format_timestamp(
+                    request_v2.auto_merge_expires_at
+                )
+            )
+            details = (
+                f"Management: {request_v2.management_repository}\n"
+                f"Task ID: {request_v2.request_id}\n"
+                f"Title: {request_v2.task_content.title}\n"
+                f"Description:\n{request_v2.task_content.description}\n"
+                f"Acceptance criteria:\n{criteria}\n"
+                f"{project_details}\n"
+                f"Checks selected: {_FLOW_LABELS[request_v2.task_flow]}\n"
+                f"Checks: {_FLOW_PATHS[request_v2.task_flow]}\n"
+                f"Merge choice: {_MERGE_LABELS[request_v2.merge_mode]}\n"
+                f"Merge result: {_MERGE_RESULTS[request_v2.merge_mode]}\n"
+                f"Automatic merge permission until: {expiry}\n"
+                f"Task owner host: {request_v2.task_owner_host}\n"
+                f"Confirmed by: {request_v2.confirmed_by}\n"
+                "Confirmed at: "
+                f"{TaskSetup._format_timestamp(request_v2.confirmed_at)}"
+            )
+            text = f"{prefix}\n\n{details}" if prefix else details
+            return TurnResult.handled(
+                text,
+                choices=TaskSetup._prompt_choice_ids(draft),
+                choice_prompt=draft.choice_prompt,
+                next_step=SetupStep.CONFIRM,
+                task_request_v2=request_v2,
+            )
         if (
             draft.task_flow is None
             or draft.merge_mode is None

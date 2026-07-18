@@ -222,7 +222,7 @@ def _make_repo(
 
 
 def _discover(
-    working_directory: Path,
+    working_directory: Path | None,
     allowed_roots: tuple[Path, ...],
     fixtures: list[RepoFixture],
     **kwargs: Any,
@@ -238,6 +238,29 @@ def _discover(
         github_metadata_reader=reader,
         **kwargs,
     )
+
+
+def test_missing_working_directory_scans_only_configured_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = _make_repo(tmp_path / "workspace-b", "alpha", "people/alpha")
+    beta = _make_repo(tmp_path / "workspace-a", "beta", "people/beta")
+    service_directory = tmp_path / "service-process"
+    service_directory.mkdir()
+    monkeypatch.chdir(service_directory)
+
+    projects = _discover(
+        None,
+        (tmp_path / "workspace-b", tmp_path / "workspace-a"),
+        [alpha, beta],
+    )
+
+    assert [project.repository for project in projects] == [
+        "people/beta",
+        "people/alpha",
+    ]
+    assert all(service_directory not in Path(project.workspace).parents for project in projects)
 
 
 def test_discovers_working_directory_git_root_before_sorted_allowed_roots(

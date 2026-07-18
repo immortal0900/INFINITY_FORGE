@@ -800,7 +800,7 @@ def validate_task_project(
 
 
 def discover_projects(
-    working_directory: str | os.PathLike[str],
+    working_directory: str | os.PathLike[str] | None,
     allowed_roots: Sequence[str | os.PathLike[str]],
     limits: DiscoveryLimits | None = None,
     *,
@@ -820,15 +820,17 @@ def discover_projects(
     _remaining(deadline, monotonic)
     roots = _normalize_roots(allowed_roots)
     _remaining(deadline, monotonic)
-    working = _safe_resolve(working_directory, "working directory")
-    _remaining(deadline, monotonic)
-    working_root = _working_git_root(
-        working,
-        roots,
-        deadline=deadline,
-        runner=runner,
-        monotonic=monotonic,
-    )
+    working_root = None
+    if working_directory is not None:
+        working = _safe_resolve(working_directory, "working directory")
+        _remaining(deadline, monotonic)
+        working_root = _working_git_root(
+            working,
+            roots,
+            deadline=deadline,
+            runner=runner,
+            monotonic=monotonic,
+        )
     scanned = _scan_roots(
         roots,
         checked_limits,

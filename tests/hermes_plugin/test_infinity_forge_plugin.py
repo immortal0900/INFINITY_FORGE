@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 from threading import Barrier, Lock
 from time import sleep
@@ -14,7 +15,9 @@ import pytest
 
 import forge.hermes_plugin.infinity_forge as plugin
 from forge.ops.task_options import MergeMode, TaskFlow
+from forge.ops.task_projects import TaskProject
 from forge.ops.task_service import TaskCreationRequest
+from forge.ops.task_setup import TaskSetupContext
 from forge.ops.task_settings import TaskContent
 
 
@@ -24,11 +27,49 @@ REPOSITORY = "owner/repo"
 @pytest.fixture(autouse=True)
 def _reset_plugin_state(monkeypatch) -> None:
     monkeypatch.setattr(plugin, "_task_setup", plugin.TaskSetup())
+    monkeypatch.setattr(
+        plugin,
+        "_task_context_factory",
+        lambda _working_directory: None,
+        raising=False,
+    )
     plugin._failed_inputs.clear()
     pending = getattr(plugin, "_pending_tasks", None)
     if pending is not None:
         pending.clear()
     plugin.set_task_service(None)
+
+
+OWNER_HOST = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+MANAGEMENT_REPOSITORY = "management/forge"
+
+
+def _project(root: Path, repository: str, commit: str = "a" * 40) -> TaskProject:
+    root.mkdir(parents=True, exist_ok=True)
+    return TaskProject.create(
+        repository=repository,
+        workspace=str(root.resolve()),
+        remote_name="origin",
+        base_branch="main",
+        base_commit=commit,
+        host_id=OWNER_HOST,
+    )
+
+
+def _v2_context(
+    working_directory: str | None,
+    projects: tuple[TaskProject, ...],
+    *,
+    discover=None,
+    validate=None,
+) -> TaskSetupContext:
+    return TaskSetupContext(
+        working_directory=working_directory,
+        management_repository=MANAGEMENT_REPOSITORY,
+        task_owner_host=OWNER_HOST,
+        discover_projects=discover or (lambda _working: projects),
+        validate_projects=validate or (lambda selected: selected),
+    )
 
 
 @dataclass
@@ -977,7 +1018,7 @@ def test_failed_structured_confirm_retry_preserves_selected_id_over_accompanying
     assert len(calls) == 1
 
 
-def test_plugin_lock_serializes_global_state_transitions(monkeypatch) -> None:
+def test_plugin_lock_keeps_legacy_task_setup_admission_serialized(monkeypatch) -> None:
     tracker = Lock()
     start = Barrier(3)
     active = 0
@@ -1018,3 +1059,491 @@ def test_plugin_lock_serializes_global_state_transitions(monkeypatch) -> None:
         ]
 
     assert max_active == 1
+
+
+def test_v2_confirmation_is_gated_without_any_v1_write(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path / "project", "owner/project")
+    context = _v2_context(str(tmp_path.resolve()), (project,))
+    monkeypatch.setattr(plugin, "_task_context_factory", lambda _cwd: context)
+    calls: list[object] = []
+    plugin.set_task_service(lambda request: calls.append(request) or "created")
+
+    class MustNotConstruct:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("v1 writer must stay disconnected")
+
+    monkeypatch.setattr(plugin, "TaskSettingsStore", MustNotConstruct)
+    monkeypatch.setattr(plugin, "TaskOutbox", MustNotConstruct)
+    monkeypatch.setattr(plugin, "GitHubTaskIssueClient", MustNotConstruct)
+    common = {
+        "session_id": "v2",
+        "user_id": "alice",
+        "surface": "tui",
+        "working_directory": str(tmp_path.resolve()),
+    }
+    mode = plugin.before_user_turn(text="고칠 내용", is_new_session=True, **common)
+    projects = plugin.before_user_turn(
+        text="ignored",
+        is_new_session=False,
+        choice_prompt_id=mode["choice_prompt_id"],
+        selected_choice_ids=["task"],
+        **common,
+    )
+    flow = plugin.before_user_turn(
+        text="ignored",
+        is_new_session=False,
+        choice_prompt_id=projects["choice_prompt_id"],
+        selected_choice_ids=[project.project_id],
+        **common,
+    )
+    merge = plugin.before_user_turn(
+        text="ignored",
+        is_new_session=False,
+        choice_prompt_id=flow["choice_prompt_id"],
+        selected_choice_ids=["build"],
+        **common,
+    )
+    preview = plugin.before_user_turn(
+        text="ignored",
+        is_new_session=False,
+        choice_prompt_id=merge["choice_prompt_id"],
+        selected_choice_ids=["manual"],
+        **common,
+    )
+    gated = plugin.before_user_turn(
+        text="ignored",
+        is_new_session=False,
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["confirm"],
+        **common,
+    )
+
+    assert gated["action"] == "handled"
+    assert "not enabled" in str(gated["text"]).lower()
+    assert gated["choice_prompt_id"] == preview["choice_prompt_id"]
+    assert calls == []
+    assert plugin._pending_tasks == {}
+
+
+def test_task_entry_carries_working_directory_to_project_discovery(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path / "project", "owner/project")
+    seen: list[str | None] = []
+    working_directory = str(tmp_path.resolve())
+    context = _v2_context(
+        working_directory,
+        (project,),
+        discover=lambda cwd: seen.append(cwd) or (project,),
+    )
+    monkeypatch.setattr(plugin, "_task_context_factory", lambda cwd: context)
+    plugin.before_user_turn(
+        session_id="s1",
+        user_id="u1",
+        text="요청",
+        working_directory=working_directory,
+    )
+    projects = plugin.before_user_turn(
+        session_id="s1",
+        user_id="u1",
+        text="task",
+        working_directory=working_directory,
+    )
+
+    assert projects["choice_mode"] == "multiple"
+    assert seen == [working_directory]
+
+
+def test_blocked_plugin_discovery_does_not_block_another_session(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path / "project", "owner/project")
+    started = Barrier(2)
+    release = Barrier(2)
+
+    def discover(_cwd: str | None) -> tuple[TaskProject, ...]:
+        started.wait()
+        release.wait()
+        return (project,)
+
+    context = _v2_context(str(tmp_path.resolve()), (project,), discover=discover)
+    monkeypatch.setattr(plugin, "_task_context_factory", lambda _cwd: context)
+    common = {
+        "user_id": "u1",
+        "working_directory": str(tmp_path.resolve()),
+    }
+    plugin.before_user_turn(session_id="blocked", text="요청", **common)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            plugin.before_user_turn,
+            session_id="blocked",
+            text="task",
+            **common,
+        )
+        started.wait()
+        unrelated = plugin.before_user_turn(
+            session_id="other",
+            text="다른 요청",
+            **common,
+        )
+        release.wait()
+        pending.result(timeout=1)
+
+    assert unrelated["action"] == "handled"
+    assert [choice["id"] for choice in unrelated["choices"]] == ["chat", "task"]
+
+
+def test_default_context_uses_separate_v2_config_and_one_batch_deadline(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    first = _project(tmp_path / "first", "owner/first", "a" * 40)
+    second = _project(tmp_path / "second", "owner/second", "b" * 40)
+    monkeypatch.setenv("INFINITY_FORGE_REPOSITORY", "legacy/only")
+    monkeypatch.setenv("INFINITY_FORGE_MANAGEMENT_REPOSITORY", MANAGEMENT_REPOSITORY)
+    monkeypatch.setenv("INFINITY_FORGE_WORKSPACE_ROOTS", str(tmp_path.resolve()))
+    monkeypatch.setenv("INFINITY_FORGE_HOST_ID", OWNER_HOST)
+    monkeypatch.setenv("INFINITY_FORGE_GH_PATH", "gh")
+    time_values = iter((0.0, 1.0, 2.0))
+    timeouts: list[float] = []
+
+    def validate(project, **kwargs):
+        timeouts.append(kwargs["timeout_seconds"])
+        return project
+
+    monkeypatch.setattr(plugin, "validate_task_project", validate, raising=False)
+    context = plugin._default_task_context(
+        None,
+        monotonic=lambda: next(time_values),
+    )
+    validated = context.validate_projects((first, second))
+
+    assert context.management_repository == MANAGEMENT_REPOSITORY
+    assert context.working_directory is None
+    assert validated == (first, second)
+    assert timeouts == [4.0, 3.0]
+
+
+def test_default_context_rejects_non_uuid_host(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("INFINITY_FORGE_MANAGEMENT_REPOSITORY", MANAGEMENT_REPOSITORY)
+    monkeypatch.setenv("INFINITY_FORGE_WORKSPACE_ROOTS", str(tmp_path.resolve()))
+    monkeypatch.setenv("INFINITY_FORGE_HOST_ID", "hostname-derived")
+    monkeypatch.setenv("INFINITY_FORGE_GH_PATH", "gh")
+
+    with pytest.raises(RuntimeError, match="INFINITY_FORGE_HOST_ID"):
+        plugin._default_task_context(None)
+
+
+def test_github_metadata_adapter_uses_one_deadline_and_encoded_branch(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("GH_HOST", "attacker.example")
+    commands: list[list[str]] = []
+    timeouts: list[float] = []
+    time_values = iter((10.0, 10.5, 11.0, 11.5, 12.0))
+    outputs = iter(
+        (
+            json.dumps({"full_name": "owner/repo", "default_branch": "main"}),
+            json.dumps({"name": "feature/x", "commit": {"sha": "a" * 40}}),
+        )
+    )
+
+    def runner(command, **kwargs):
+        commands.append(command)
+        timeouts.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, next(outputs), "")
+
+    adapter = plugin._GitHubMetadataAdapter(
+        "gh",
+        runner=runner,
+        monotonic=lambda: next(time_values),
+    )
+    metadata = adapter("owner/repo", "feature/x", 5.0)
+
+    assert metadata.full_name == "owner/repo"
+    assert metadata.branch == "feature/x"
+    assert commands == [
+        [
+            "gh",
+            "api",
+            "--hostname",
+            "github.com",
+            "--method",
+            "GET",
+            "repos/owner/repo",
+        ],
+        [
+            "gh",
+            "api",
+            "--hostname",
+            "github.com",
+            "--method",
+            "GET",
+            "repos/owner/repo/branches/feature%2Fx",
+        ],
+    ]
+    assert timeouts == [4.5, 3.5]
+
+
+def test_github_metadata_deadline_stops_before_second_process() -> None:
+    commands: list[list[str]] = []
+    time_values = iter((0.0, 0.0, 1.0, 5.0))
+
+    def runner(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps({"full_name": "owner/repo", "default_branch": "main"}),
+            "",
+        )
+
+    adapter = plugin._GitHubMetadataAdapter(
+        "gh",
+        runner=runner,
+        monotonic=lambda: next(time_values),
+    )
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        adapter("owner/repo", None, 5.0)
+
+    assert len(commands) == 1
+
+
+def test_github_metadata_nonzero_exit_does_not_expose_output() -> None:
+    secret = "credential-bearing diagnostic"
+    time_values = iter((0.0, 0.0, 0.1))
+
+    def runner(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, secret, secret)
+
+    adapter = plugin._GitHubMetadataAdapter(
+        "gh",
+        runner=runner,
+        monotonic=lambda: next(time_values),
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        adapter("owner/repo", None, 5.0)
+
+    assert secret not in str(captured.value)
+
+
+def test_chat_choice_never_loads_v2_configuration(monkeypatch) -> None:
+    calls = 0
+
+    def forbidden(_working_directory):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("Chat must not read Task configuration")
+
+    monkeypatch.setattr(plugin, "_task_context_factory", forbidden)
+    shown = plugin.before_user_turn(
+        session_id="chat",
+        user_id="u1",
+        text="일반 질문",
+    )
+    replay = plugin.before_user_turn(
+        session_id="chat",
+        user_id="u1",
+        text="ignored",
+        choice_prompt_id=shown["choice_prompt_id"],
+        selected_choice_ids=["chat"],
+    )
+
+    assert replay == {"action": "replace", "text": "일반 질문"}
+    assert calls == 0
+
+
+def test_invalid_task_submission_is_rejected_before_loading_config(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def forbidden(_working_directory):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid choice must not read Task configuration")
+
+    monkeypatch.setattr(plugin, "_task_context_factory", forbidden)
+    shown = plugin.before_user_turn(
+        session_id="invalid",
+        user_id="u1",
+        text="요청",
+    )
+    rejected = plugin.before_user_turn(
+        session_id="invalid",
+        user_id="u1",
+        text="ignored",
+        choice_prompt_id=shown["choice_prompt_id"],
+        selected_choice_ids=["task", "task"],
+    )
+
+    assert rejected["choice_prompt_id"] == shown["choice_prompt_id"]
+    assert calls == 0
+
+
+def test_failed_task_entry_retry_keeps_first_trusted_working_directory(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original"
+    changed = tmp_path / "changed"
+    original.mkdir()
+    changed.mkdir()
+    project = _project(original / "project", "owner/project")
+    seen: list[str | None] = []
+
+    def factory(working_directory: str | None):
+        seen.append(working_directory)
+        if len(seen) == 1:
+            raise RuntimeError("temporary config failure")
+        return _v2_context(working_directory, (project,))
+
+    monkeypatch.setattr(plugin, "_task_context_factory", factory)
+    plugin.before_user_turn(
+        session_id="s1",
+        user_id="u1",
+        text="요청",
+        working_directory=str(original.resolve()),
+    )
+    failed = plugin.before_user_turn(
+        session_id="s1",
+        user_id="u1",
+        text="task",
+        working_directory=str(original.resolve()),
+    )
+    retried = plugin.before_user_turn(
+        session_id="s1",
+        user_id="u1",
+        text="retry",
+        working_directory=str(changed.resolve()),
+    )
+
+    assert "temporary config failure" in str(failed["text"])
+    assert retried["choice_mode"] == "multiple"
+    assert seen == [str(original.resolve()), str(original.resolve())]
+
+
+def test_user_event_working_directory_is_not_trusted(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path / "project", "owner/project")
+    seen: list[str | None] = []
+
+    def factory(working_directory: str | None):
+        seen.append(working_directory)
+        return _v2_context(working_directory, (project,))
+
+    monkeypatch.setattr(plugin, "_task_context_factory", factory)
+    plugin.before_user_turn(
+        {
+            "session_id": "s1",
+            "user_id": "u1",
+            "text": "요청",
+            "working_directory": str(tmp_path.resolve()),
+        }
+    )
+    plugin.before_user_turn(
+        {
+            "session_id": "s1",
+            "user_id": "u1",
+            "text": "task",
+            "working_directory": str(tmp_path.resolve()),
+        }
+    )
+
+    assert seen == [None]
+
+
+def test_relative_working_directory_is_rejected_without_resolving(
+    monkeypatch,
+) -> None:
+    def forbidden_resolve(*args, **kwargs):
+        raise AssertionError("relative cwd must not be resolved")
+
+    monkeypatch.setattr(plugin.Path, "resolve", forbidden_resolve)
+
+    assert plugin._trusted_working_directory(
+        {"working_directory": "relative/project"}
+    ) is None
+
+
+def test_confirm_uses_fresh_context_validator_not_entry_validator(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path / "project", "owner/project")
+    working_directory = str(tmp_path.resolve())
+    entry_validations = 0
+    confirm_validations = 0
+    factory_calls = 0
+
+    def entry_validate(selected: tuple[TaskProject, ...]):
+        nonlocal entry_validations
+        entry_validations += 1
+        return selected
+
+    def confirm_validate(selected: tuple[TaskProject, ...]):
+        nonlocal confirm_validations
+        confirm_validations += 1
+        raise RuntimeError("current roots no longer authorize this Project")
+
+    def factory(_working_directory: str | None):
+        nonlocal factory_calls
+        factory_calls += 1
+        validator = entry_validate if factory_calls == 1 else confirm_validate
+        return _v2_context(
+            working_directory,
+            (project,),
+            validate=validator,
+        )
+
+    monkeypatch.setattr(plugin, "_task_context_factory", factory)
+    common = {
+        "session_id": "fresh-context",
+        "user_id": "u1",
+        "working_directory": working_directory,
+    }
+    mode = plugin.before_user_turn(text="내용", **common)
+    projects = plugin.before_user_turn(
+        text="ignored",
+        choice_prompt_id=mode["choice_prompt_id"],
+        selected_choice_ids=["task"],
+        **common,
+    )
+    flow = plugin.before_user_turn(
+        text="ignored",
+        choice_prompt_id=projects["choice_prompt_id"],
+        selected_choice_ids=[project.project_id],
+        **common,
+    )
+    merge = plugin.before_user_turn(
+        text="ignored",
+        choice_prompt_id=flow["choice_prompt_id"],
+        selected_choice_ids=["build"],
+        **common,
+    )
+    preview = plugin.before_user_turn(
+        text="ignored",
+        choice_prompt_id=merge["choice_prompt_id"],
+        selected_choice_ids=["manual"],
+        **common,
+    )
+    failed = plugin.before_user_turn(
+        text="ignored",
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["confirm"],
+        **common,
+    )
+
+    assert [choice["id"] for choice in failed["choices"]] == ["retry", "cancel"]
+    assert entry_validations == 0
+    assert confirm_validations == 1

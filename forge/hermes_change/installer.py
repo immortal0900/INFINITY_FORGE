@@ -830,9 +830,10 @@ def _continue_choice_modal_result(
     working_directory=None,
 ):
     """Resolve bounded handled choosers through the same user-turn hook path."""
-    # mode, Projects, flow, and merge use four setup turns. The hard maximum
-    # of 256 Projects can each require one ordered merge selection.
-    _max_consecutive_chooser_turns = 260
+    # mode, Projects, flow, and merge use four submissions. The hard maximum
+    # of 256 Projects can each require one ordered merge submission, followed
+    # by one final Confirm submission that must be allowed to leave the chooser.
+    _max_consecutive_chooser_turns = 261
     for _choice_turn in range(_max_consecutive_chooser_turns):
         if (
             not isinstance(result, dict)
