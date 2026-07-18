@@ -272,6 +272,9 @@ _CONVERSATION_HOOK = fr'''
                     getattr(agent, "platform", "")
                     or os.environ.get("HERMES_SESSION_SOURCE", "cli")
                 ),
+                # Trusted transport metadata is carried separately from the
+                # user-controlled message/envelope and is never inferred here.
+                "working_directory": working_directory,
                 "is_new_session": (
                     False
                     if isinstance(user_message, dict)
@@ -436,6 +439,7 @@ def change_conversation_source(source: str) -> str:
     signature_replacement = (
         f"    moa_config: Optional[dict[str, Any]] = None,{newline}"
         f"    is_user_turn: bool = False,{newline}"
+        f"    working_directory: Optional[str] = None,{newline}"
         f") -> Dict[str, Any]:{newline}"
     )
     source = (
@@ -580,7 +584,7 @@ def _insert_after_line_in_unique_block(
 
 
 def change_run_agent_source(source: str) -> str:
-    """Forward the explicit user-transport flag while defaulting internal calls off."""
+    """Forward trusted user-turn metadata while defaulting internal calls off."""
 
     if _HOOK_MARKER in source:
         raise InstallError("run_agent.py user-turn forwarding is already installed")
@@ -591,13 +595,17 @@ def change_run_agent_source(source: str) -> str:
             f"# {_HOOK_MARKER}: internal calls remain False unless a user surface opts in.",
             "# RISK(breaking): this optional public argument defaults off for every existing caller.",
             "is_user_turn: bool = False,",
+            "working_directory: Optional[str] = None,",
         ),
         label="run_agent.py signature",
     )
     return _insert_after_unique_line(
         source,
         "moa_config=moa_config,",
-        ("is_user_turn=is_user_turn,",),
+        (
+            "is_user_turn=is_user_turn,",
+            "working_directory=working_directory,",
+        ),
         label="run_agent.py forwarding",
     )
 
@@ -819,9 +827,13 @@ def _continue_choice_modal_result(
     stream_callback,
     task_id,
     moa_config,
+    working_directory=None,
 ):
     """Resolve bounded handled choosers through the same user-turn hook path."""
-    for _choice_turn in range(16):
+    # mode, Projects, flow, and merge use four setup turns. The hard maximum
+    # of 256 Projects can each require one ordered merge selection.
+    _max_consecutive_chooser_turns = 260
+    for _choice_turn in range(_max_consecutive_chooser_turns):
         if (
             not isinstance(result, dict)
             or not result.get("handled")
@@ -837,6 +849,7 @@ def _continue_choice_modal_result(
             stream_callback=stream_callback,
             task_id=task_id,
             is_user_turn=True,
+            working_directory=working_directory,
             persist_user_message=None,
             moa_config=moa_config,
         )
@@ -909,6 +922,18 @@ def change_cli_source(source: str) -> str:
 
     if _HOOK_MARKER in source:
         raise InstallError("cli.py user-turn handling is already installed")
+    source = _insert_after_unique_line(
+        source,
+        "_moa_cfg = None",
+        (
+            "# Capture once for this real CLI turn; chooser re-entry carries it unchanged.",
+            "try:",
+            "    _forge_working_directory = __import__(\"os\").getcwd()",
+            "except OSError:",
+            "    _forge_working_directory = None",
+        ),
+        label="cli.py initial working directory capture",
+    )
     source = _insert_after_line_in_unique_block(
         source,
         block_start="result = self.agent.run_conversation(",
@@ -916,6 +941,14 @@ def change_cli_source(source: str) -> str:
         addition=f"is_user_turn=True,  # {_HOOK_MARKER}: interactive CLI user turn.",
         max_lines=12,
         label="cli.py user-turn call",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="result = self.agent.run_conversation(",
+        expected=f"is_user_turn=True,  # {_HOOK_MARKER}: interactive CLI user turn.",
+        addition="working_directory=_forge_working_directory,",
+        max_lines=14,
+        label="cli.py trusted working directory",
     )
     source = _insert_after_line_in_unique_block(
         source,
@@ -928,6 +961,7 @@ def change_cli_source(source: str) -> str:
             "    stream_callback=stream_callback,",
             "    task_id=self.session_id,",
             "    moa_config=_moa_cfg,",
+            "    working_directory=_forge_working_directory,",
             ")",
         ),
         max_lines=14,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -1442,6 +1443,107 @@ def test_cli_reenters_the_same_user_turn_path_with_stable_ids() -> None:
     assert result["final_response"] == "Choose task flow."
 
 
+def test_run_agent_carries_working_directory_to_the_conversation_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    changed = installer.change_run_agent_source(RUN_AGENT_SOURCE)
+    captured: dict[str, object] = {}
+    agent_package = types.ModuleType("agent")
+    conversation_loop = types.ModuleType("agent.conversation_loop")
+
+    def run_conversation(*args, **kwargs):
+        captured["args"] = args
+        captured.update(kwargs)
+        return {"ok": True}
+
+    conversation_loop.run_conversation = run_conversation
+    monkeypatch.setitem(sys.modules, "agent", agent_package)
+    monkeypatch.setitem(sys.modules, "agent.conversation_loop", conversation_loop)
+    namespace: dict[str, object] = {}
+    exec(changed, namespace)
+
+    result = namespace["AIAgent"]().run_conversation(
+        "question", working_directory="C:/trusted"
+    )
+
+    assert result == {"ok": True}
+    assert captured["working_directory"] == "C:/trusted"
+
+    captured.clear()
+    result = namespace["AIAgent"]().run_conversation("internal question")
+
+    assert result == {"ok": True}
+    assert captured["working_directory"] is None
+
+
+def test_cli_carries_its_initial_working_directory_across_choice_reentry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    namespace: dict[str, object] = {"queue": queue, "maybe_auto_title": lambda: None}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    first_directory = tmp_path / "first"
+    changed_directory = tmp_path / "changed"
+    first_directory.mkdir()
+    changed_directory.mkdir()
+    monkeypatch.chdir(first_directory)
+    prompt = _valid_cli_prompt()
+    calls: list[dict[str, object]] = []
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                monkeypatch.chdir(changed_directory)
+                return dict(prompt)
+            return {"final_response": "done", "api_calls": 0, "handled": True}
+
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli.conversation_history = ["current"]
+    cli.session_id = "session-1"
+    cli._prompt_choice_modal = lambda _prompt: {
+        "choice_prompt_id": prompt["choice_prompt_id"],
+        "selected_choice_ids": ["task"],
+    }
+
+    namespace["process"](cli, "first input", "first input", None)
+
+    assert [call["working_directory"] for call in calls] == [
+        str(first_directory),
+        str(first_directory),
+    ]
+
+
+def test_cli_uses_none_when_its_initial_working_directory_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace: dict[str, object] = {"queue": queue, "maybe_auto_title": lambda: None}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+
+    def raise_missing_working_directory() -> str:
+        raise OSError("gone")
+
+    monkeypatch.setattr(os, "getcwd", raise_missing_working_directory)
+    calls: list[dict[str, object]] = []
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**kwargs):
+            calls.append(kwargs)
+            return {"final_response": "done", "api_calls": 1}
+
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli.conversation_history = ["current"]
+    cli.session_id = "session-1"
+
+    result = namespace["process"](cli, "first input", "first input", None)
+
+    assert result["final_response"] == "done"
+    assert calls[0]["working_directory"] is None
+
+
 def test_cli_modal_cancel_does_not_reenter_or_auto_select_first_choice() -> None:
     namespace: dict[str, object] = {"queue": queue, "maybe_auto_title": lambda: None}
     exec(installer.change_cli_source(CLI_SOURCE), namespace)
@@ -1503,7 +1605,7 @@ def _valid_cli_prompt() -> dict[str, object]:
     }
 
 
-def test_sixteenth_reentry_returns_a_nonchooser_result_unchanged() -> None:
+def test_two_hundred_sixtieth_reentry_returns_a_nonchooser_result_unchanged() -> None:
     namespace: dict[str, object] = {"queue": queue}
     exec(installer.change_cli_source(CLI_SOURCE), namespace)
     prompt = _valid_cli_prompt()
@@ -1520,7 +1622,7 @@ def test_sixteenth_reentry_returns_a_nonchooser_result_unchanged() -> None:
         def run_conversation(**kwargs):
             nonlocal calls
             calls += 1
-            return final_result if calls == 16 else dict(prompt)
+            return final_result if calls == 260 else dict(prompt)
 
     cli = namespace["ModalShell"]()
     cli.agent = Agent()
@@ -1537,13 +1639,13 @@ def test_sixteenth_reentry_returns_a_nonchooser_result_unchanged() -> None:
         moa_config=None,
     )
 
-    assert calls == 16
+    assert calls == 260
     assert result is final_result
     assert result["api_calls"] == 1
     assert result["final_response"] == "Model answer"
 
 
-def test_sixteenth_reentry_stops_only_when_it_is_still_a_chooser() -> None:
+def test_two_hundred_sixty_first_reentry_stops_when_still_a_chooser() -> None:
     namespace: dict[str, object] = {"queue": queue}
     exec(installer.change_cli_source(CLI_SOURCE), namespace)
     prompt = _valid_cli_prompt()
@@ -1571,7 +1673,7 @@ def test_sixteenth_reentry_stops_only_when_it_is_still_a_chooser() -> None:
         moa_config=None,
     )
 
-    assert calls == 16
+    assert calls == 260
     assert result["handled"] is True
     assert result["api_calls"] == 0
     assert "too many consecutive prompts" in result["final_response"]

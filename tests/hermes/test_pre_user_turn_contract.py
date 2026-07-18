@@ -44,6 +44,7 @@ def _run_changed_source(
     is_user_turn: bool = True,
     user_message: str | dict[str, object] = "first question",
     conversation_history: list[dict[str, object]] | None = None,
+    working_directory: str | None = None,
 ):
     plugins = types.ModuleType("hermes_cli.plugins")
     hook_results = hook_result if isinstance(hook_result, list) else [hook_result]
@@ -61,6 +62,7 @@ def _run_changed_source(
         user_message,
         conversation_history=conversation_history or [],
         is_user_turn=is_user_turn,
+        working_directory=working_directory,
     )
 
 
@@ -417,3 +419,37 @@ def test_hook_receives_transport_neutral_user_turn_fields(monkeypatch) -> None:
     assert captured["user_id"] == "actual-user"
     assert captured["surface"] == "tui"
     assert captured["is_new_session"] is True
+
+
+def test_hook_uses_only_carried_working_directory_not_user_envelope(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    plugins = types.ModuleType("hermes_cli.plugins")
+
+    def invoke_hook(name: str, **values: object):
+        captured["name"] = name
+        captured.update(values)
+        return [{"action": "continue"}]
+
+    plugins.has_hook = lambda name: True
+    plugins.invoke_hook = invoke_hook
+    package = types.ModuleType("hermes_cli")
+    package.plugins = plugins
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+    namespace: dict[str, object] = {}
+    exec(change_conversation_source(CONVERSATION_SOURCE), namespace)
+
+    result = namespace["run_conversation"](
+        types.SimpleNamespace(platform="cli", _gateway_session_key="s1"),
+        {"text": "first question", "working_directory": "C:/untrusted"},
+        conversation_history=[],
+        is_user_turn=True,
+        working_directory="C:/trusted",
+    )
+
+    assert result == {
+        "seen": {"text": "first question", "working_directory": "C:/untrusted"}
+    }
+    assert captured["name"] == "pre_user_turn"
+    assert captured["text"] == "first question"
+    assert captured["working_directory"] == "C:/trusted"
