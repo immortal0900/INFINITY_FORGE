@@ -488,6 +488,10 @@ def before_user_turn(
                         combined.pop("now", None)
                         key = _fallback_key(combined)
                         try:
+                            # RISK(breaking): replay must recover the saved
+                            # envelope before text so selected IDs remain the
+                            # sole selection authority after a retry.
+                            submission = _read_choice_submission(combined)
                             session_id, user_id, surface, text, is_new_session, now = (
                                 _read_event(combined)
                             )
@@ -504,8 +508,21 @@ def before_user_turn(
                             )
                         )
 
+            pending_prompt = None
+            if not is_new_session and _is_confirmation_input(submission, text):
+                pending_prompt = _task_setup.pending_choice_prompt(
+                    session_id,
+                    user_id,
+                    now,
+                    surface=surface,
+                )
             if (
-                _is_confirmation_input(submission, text)
+                pending_prompt is not None
+                and any(choice.id == "confirm" for choice in pending_prompt.choices)
+                and (
+                    submission is None
+                    or submission.choice_prompt_id == pending_prompt.choice_prompt_id
+                )
                 and len(_pending_tasks) >= _MAX_PENDING_TASKS
                 and key not in _pending_tasks
             ):
@@ -513,7 +530,7 @@ def before_user_turn(
                     TurnResult.handled(
                         "Task confirmation is temporarily full. "
                         "Resolve or cancel a pending Task before confirming this one.",
-                        choices=("confirm", "cancel"),
+                        choice_prompt=pending_prompt,
                     )
                 )
 

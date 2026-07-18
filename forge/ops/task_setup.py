@@ -261,6 +261,23 @@ class TaskSetup:
                 key, draft, selected[0], current_time, repository
             )
 
+    def pending_choice_prompt(
+        self,
+        session_id: str,
+        user_id: str,
+        now: datetime | None = None,
+        *,
+        surface: str = DEFAULT_SURFACE,
+    ) -> ChoicePrompt | None:
+        """Return the current immutable prompt without refreshing its deadline."""
+
+        current_time = now or self._clock()
+        key = (surface, session_id, user_id)
+        with self._lock:
+            self._sweep(current_time)
+            draft = self._drafts.get(key)
+            return None if draft is None else draft.choice_prompt
+
     def _handle_locked(
         self,
         key: SessionKey,

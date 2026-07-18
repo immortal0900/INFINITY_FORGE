@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from threading import Barrier, Lock
@@ -410,6 +411,60 @@ def test_structured_confirmation_capacity_uses_selected_id_and_preserves_draft(
     assert len(calls) == 1
 
 
+def test_capacity_rejection_replays_the_same_structured_confirmation_prompt(
+    monkeypatch,
+) -> None:
+    plugin.set_task_service(lambda request: "created")
+    preview = _complete_task_until_confirmation(monkeypatch)
+    monkeypatch.setattr(plugin, "_MAX_PENDING_TASKS", 1)
+    plugin._pending_tasks[("tui", "other", "user")] = object()
+
+    blocked = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        text="not-confirm",
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["confirm"],
+    )
+
+    metadata_keys = (
+        "choice_prompt_id",
+        "choice_mode",
+        "min_choices",
+        "max_choices",
+        "submit_label",
+        "expires_at",
+        "choices",
+    )
+    preview_metadata = {key: preview[key] for key in metadata_keys}
+    blocked_metadata = {key: blocked[key] for key in metadata_keys}
+    assert json.dumps(blocked_metadata, separators=(",", ":")) == json.dumps(
+        preview_metadata, separators=(",", ":")
+    )
+
+
+def test_capacity_does_not_replay_a_previous_session_prompt(monkeypatch) -> None:
+    plugin.set_task_service(lambda request: "created")
+    preview = _complete_task_until_confirmation(monkeypatch)
+    monkeypatch.setattr(plugin, "_MAX_PENDING_TASKS", 1)
+    plugin._pending_tasks[("tui", "other", "user")] = object()
+
+    rejected = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=True,
+        text="ignored",
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["confirm"],
+    )
+
+    assert rejected["action"] == "handled"
+    assert rejected["text"] == "No pending chooser is available."
+
+
 def test_structured_cancel_is_not_blocked_by_confirm_text_when_pending_is_full(
     monkeypatch,
 ) -> None:
@@ -772,6 +827,122 @@ def test_failed_field_retry_keeps_original_input_for_continue_chat(monkeypatch) 
 
     assert retried["action"] == "handled"
     assert continued == {"action": "replace", "text": "보존할 원문"}
+
+
+def test_failed_input_retry_rejects_a_malformed_saved_structured_envelope(
+    monkeypatch,
+) -> None:
+    class MustNotHandle:
+        def handle(self, *args, **kwargs):
+            raise AssertionError("malformed replay must not use raw text authority")
+
+    now = datetime(2026, 7, 18, tzinfo=UTC)
+    key = ("tui", "s1", "u1")
+    monkeypatch.setattr(plugin, "_task_setup", MustNotHandle())
+    plugin._failed_inputs[key] = plugin._FailedInput(
+        text="task",
+        event={
+            "session_id": "s1",
+            "user_id": "u1",
+            "surface": "tui",
+            "is_new_session": False,
+            "text": "task",
+            "choice_prompt_id": "not-a-uuid",
+            "selected_choice_ids": ["task"],
+        },
+        expires_at=now + timedelta(minutes=1),
+    )
+
+    rejected = plugin.before_user_turn(
+        session_id="s1",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        text="retry",
+        now=now,
+    )
+
+    assert rejected["action"] == "handled"
+    assert "choice_prompt_id" in str(rejected["text"])
+
+
+def test_failed_structured_merge_retry_preserves_selected_id_over_accompanying_text(
+    monkeypatch,
+) -> None:
+    class FailsOnceStructuredMerge(plugin.TaskSetup):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def handle_submission(self, *args, **kwargs):
+            submission = args[2]
+            if submission.selected_choice_ids == ("safe_auto",) and not self.failed:
+                self.failed = True
+                raise RuntimeError("temporary structured merge failure")
+            return super().handle_submission(*args, **kwargs)
+
+    monkeypatch.setattr(plugin, "_task_setup", FailsOnceStructuredMerge())
+    monkeypatch.setenv("INFINITY_FORGE_REPOSITORY", REPOSITORY)
+    common = {"session_id": "s1", "user_id": "u1", "surface": "tui"}
+    plugin.before_user_turn(text="원래 요청", is_new_session=True, **common)
+    plugin.before_user_turn(text="task", is_new_session=False, **common)
+    merge = plugin.before_user_turn(text="build_review", is_new_session=False, **common)
+
+    failed = plugin.before_user_turn(
+        text="full_auto",
+        is_new_session=False,
+        choice_prompt_id=merge["choice_prompt_id"],
+        selected_choice_ids=["safe_auto"],
+        **common,
+    )
+    replayed = plugin.before_user_turn(text="retry", is_new_session=False, **common)
+
+    assert failed["action"] == "handled"
+    assert "temporary structured merge failure" in str(failed["text"])
+    assert "Merge choice: Safe Files Auto-Merge" in str(replayed["text"])
+
+
+def test_failed_structured_confirm_retry_preserves_selected_id_over_accompanying_text(
+    monkeypatch,
+) -> None:
+    class FailsOnceStructuredConfirm(plugin.TaskSetup):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def handle_submission(self, *args, **kwargs):
+            submission = args[2]
+            if submission.selected_choice_ids == ("confirm",) and not self.failed:
+                self.failed = True
+                raise RuntimeError("temporary structured confirm failure")
+            return super().handle_submission(*args, **kwargs)
+
+    calls: list[object] = []
+    plugin.set_task_service(lambda request: calls.append(request) or "created")
+    monkeypatch.setattr(plugin, "_task_setup", FailsOnceStructuredConfirm())
+    preview = _complete_task_until_confirmation(monkeypatch)
+
+    failed = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        text="cancel",
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["confirm"],
+    )
+    replayed = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        text="retry",
+    )
+
+    assert failed["action"] == "handled"
+    assert "temporary structured confirm failure" in str(failed["text"])
+    assert replayed == {"action": "handled", "text": "created"}
+    assert len(calls) == 1
 
 
 def test_plugin_lock_serializes_global_state_transitions(monkeypatch) -> None:
