@@ -9,6 +9,7 @@ from time import sleep
 import pytest
 
 import forge.ops.task_setup as task_setup_module
+from forge.ops.project_discovery import ProjectPathProbe, ProjectRemote
 from forge.ops.task_options import MergeMode, Mode, TaskFlow
 from forge.ops.choice_prompt import ChoiceSubmission
 from forge.ops.task_projects import TaskProject
@@ -55,6 +56,8 @@ def _task_context(
     working_directory: str | None = None,
     discover=None,
     validate=None,
+    probe=None,
+    bind=None,
 ) -> TaskSetupContext:
     return TaskSetupContext(
         working_directory=working_directory,
@@ -62,6 +65,8 @@ def _task_context(
         task_owner_host=OWNER_HOST,
         discover_projects=discover or (lambda _working: projects),
         validate_projects=validate or (lambda selected: selected),
+        probe_project_path=probe,
+        bind_project=bind,
     )
 
 
@@ -658,6 +663,7 @@ def test_v2_task_selects_projects_and_builds_exact_repeated_merge_order(
     assert tuple(choice.id for choice in projects.choice_prompt.choices) == (
         alpha.project_id,
         beta.project_id,
+        "add_project",
     )
 
     flow = setup.handle_submission(
@@ -736,6 +742,149 @@ def test_v2_task_selects_projects_and_builds_exact_repeated_merge_order(
     assert prepared.choice_prompt_paused is True
 
 
+def test_direct_project_add_requires_path_remote_and_branch_before_confirm(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "current"
+    current.mkdir()
+    discovered = _task_project(tmp_path / "known", "owner/known")
+    direct = _task_project(
+        tmp_path / "direct",
+        "owner/direct",
+        remote_name="upstream",
+        commit="b" * 40,
+    )
+    probed_paths: list[str] = []
+    bound: list[tuple[str, str]] = []
+    validated: list[tuple[TaskProject, ...]] = []
+    probe = ProjectPathProbe(
+        workspace=direct.workspace,
+        remotes=(
+            ProjectRemote("origin", "owner/fork", "main"),
+            ProjectRemote("upstream", "owner/direct", "trunk"),
+        ),
+    )
+
+    def probe_path(raw_path: str) -> ProjectPathProbe:
+        probed_paths.append(raw_path)
+        return probe
+
+    def bind_project(
+        selected_probe: ProjectPathProbe,
+        remote_name: str,
+        branch: str,
+    ) -> TaskProject:
+        assert selected_probe is probe
+        bound.append((remote_name, branch))
+        return direct
+
+    context = _task_context(
+        (discovered,),
+        working_directory=str(current.resolve()),
+        probe=probe_path,
+        bind=bind_project,
+        validate=lambda selected: validated.append(selected) or selected,
+    )
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+
+    setup.handle("direct", "u1", "직접 프로젝트 수정", NOW, context=context)
+    projects = setup.handle(
+        "direct", "u1", "task", NOW + timedelta(seconds=1), context=context
+    )
+    assert projects.choice_prompt is not None
+    assert [choice.id for choice in projects.choice_prompt.choices][-1] == "add_project"
+
+    path = setup.handle_submission(
+        "direct",
+        "u1",
+        ChoiceSubmission(projects.choice_prompt.choice_prompt_id, ("add_project",)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    assert path.next_step is SetupStep.PROJECT_PATH
+    assert path.choice_prompt is None
+
+    remotes = setup.handle(
+        "direct",
+        "u1",
+        "../direct",
+        NOW + timedelta(seconds=3),
+        context=context,
+    )
+    assert probed_paths == ["../direct"]
+    assert remotes.next_step is SetupStep.PROJECT_REMOTE
+    assert remotes.choice_prompt is not None
+    assert [choice.id for choice in remotes.choice_prompt.choices] == [
+        "origin",
+        "upstream",
+    ]
+
+    branches = setup.handle_submission(
+        "direct",
+        "u1",
+        ChoiceSubmission(remotes.choice_prompt.choice_prompt_id, ("upstream",)),
+        NOW + timedelta(seconds=4),
+        context=context,
+    )
+    assert branches.next_step is SetupStep.PROJECT_BRANCH
+    assert branches.choice_prompt is not None
+    assert [choice.id for choice in branches.choice_prompt.choices] == [
+        "default_branch",
+        "other_branch",
+    ]
+    assert "trunk" in branches.choice_prompt.choices[0].label
+
+    branch_name = setup.handle_submission(
+        "direct",
+        "u1",
+        ChoiceSubmission(branches.choice_prompt.choice_prompt_id, ("other_branch",)),
+        NOW + timedelta(seconds=5),
+        context=context,
+    )
+    assert branch_name.next_step is SetupStep.PROJECT_BRANCH_NAME
+
+    updated_projects = setup.handle(
+        "direct",
+        "u1",
+        "release/stable",
+        NOW + timedelta(seconds=6),
+        context=context,
+    )
+    assert bound == [("upstream", "release/stable")]
+    assert updated_projects.next_step is SetupStep.PROJECTS
+    assert updated_projects.choice_prompt is not None
+    assert direct.project_id in {
+        choice.id for choice in updated_projects.choice_prompt.choices
+    }
+
+    flow = setup.handle_submission(
+        "direct",
+        "u1",
+        ChoiceSubmission(
+            updated_projects.choice_prompt.choice_prompt_id,
+            (direct.project_id,),
+        ),
+        NOW + timedelta(seconds=7),
+        context=context,
+    )
+    merge = setup.handle(
+        "direct", "u1", "build", NOW + timedelta(seconds=8), context=context
+    )
+    preview = setup.handle(
+        "direct", "u1", "manual", NOW + timedelta(seconds=9), context=context
+    )
+    prepared = setup.handle(
+        "direct", "u1", "confirm", NOW + timedelta(seconds=10), context=context
+    )
+
+    assert flow.next_step is SetupStep.TASK_FLOW
+    assert merge.next_step is SetupStep.MERGE_MODE
+    assert preview.next_step is SetupStep.CONFIRM
+    assert prepared.task_request_v2 is not None
+    assert prepared.task_request_v2.projects == (direct,)
+    assert validated == [(direct,)]
+
+
 def test_project_aliases_for_same_repository_cannot_be_selected_together(
     tmp_path: Path,
 ) -> None:
@@ -766,6 +915,7 @@ def test_project_aliases_for_same_repository_cannot_be_selected_together(
     assert {choice.id for choice in rejected.choice_prompt.choices} == {
         origin.project_id,
         upstream.project_id,
+        "add_project",
     }
 
 
@@ -786,7 +936,11 @@ def test_empty_project_discovery_stays_at_projects_without_loading_old_values() 
     )
     assert empty.next_step is SetupStep.PROJECTS
     assert empty.choice_prompt is not None
-    assert [choice.id for choice in empty.choice_prompt.choices] == ["retry", "cancel"]
+    assert [choice.id for choice in empty.choice_prompt.choices] == [
+        "retry",
+        "add_project",
+        "cancel",
+    ]
     assert "no projects" in (empty.text or "").lower()
 
     retried = setup.handle_submission(
@@ -798,6 +952,42 @@ def test_empty_project_discovery_stays_at_projects_without_loading_old_values() 
     )
     assert retried.next_step is SetupStep.PROJECTS
     assert discoveries == 2
+
+
+def test_empty_discovery_keeps_trusted_context_for_direct_project_add(
+    tmp_path: Path,
+) -> None:
+    target = _task_project(tmp_path / "target", "owner/target")
+    probe = ProjectPathProbe(
+        workspace=target.workspace,
+        remotes=(ProjectRemote("origin", "owner/target", "main"),),
+    )
+    context = _task_context(
+        (),
+        working_directory=str(tmp_path.resolve()),
+        probe=lambda _path: probe,
+        bind=lambda _probe, _remote, _branch: target,
+    )
+    setup = TaskSetup()
+    setup.handle("empty-add", "u1", "요청", NOW, context=context)
+    projects = setup.handle(
+        "empty-add",
+        "u1",
+        "task",
+        NOW + timedelta(seconds=1),
+        context=context,
+    )
+    assert projects.choice_prompt is not None
+
+    path = setup.handle_submission(
+        "empty-add",
+        "u1",
+        ChoiceSubmission(projects.choice_prompt.choice_prompt_id, ("add_project",)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+
+    assert path.next_step is SetupStep.PROJECT_PATH
 
 
 def test_failed_confirm_revalidation_rediscovers_and_resets_downstream_choices(
@@ -842,7 +1032,11 @@ def test_failed_confirm_revalidation_rediscovers_and_resets_downstream_choices(
     assert failed.task_request is None
     assert failed.task_request_v2 is None
     assert failed.choice_prompt is not None
-    assert [choice.id for choice in failed.choice_prompt.choices] == ["retry", "cancel"]
+    assert [choice.id for choice in failed.choice_prompt.choices] == [
+        "retry",
+        "add_project",
+        "cancel",
+    ]
     assert discoveries == 1
     rediscovered = setup.handle_submission(
         "s1",
@@ -1235,6 +1429,10 @@ def test_maximum_256_project_flow_reaches_confirm_on_submission_261(
         context=context,
     )
     assert project_prompt.choice_prompt is not None
+    assert len(project_prompt.choice_prompt.choices) == 256
+    assert "add_project" not in {
+        choice.id for choice in project_prompt.choice_prompt.choices
+    }
     flow = setup.handle_submission(
         "max",
         "u1",

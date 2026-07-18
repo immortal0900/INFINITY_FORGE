@@ -91,7 +91,10 @@ from forge.ops.choice_prompt import ChoicePromptError, ChoiceSubmission
 from forge.ops.project_discovery import (
     DEFAULT_TIMEOUT_SECONDS,
     GitHubRepositoryMetadata,
+    ProjectPathProbe,
+    bind_task_project,
     discover_projects,
+    probe_project_path,
     validate_task_project,
 )
 from forge.ops.task_projects import TaskProject, normalize_github_remote
@@ -414,12 +417,40 @@ def _default_task_context(
             )
         return tuple(validated)
 
+    def probe_path(path: str) -> ProjectPathProbe:
+        return probe_project_path(
+            path,
+            working_directory=working_directory,
+            allowed_roots=allowed_roots,
+            runner=runner,
+            github_metadata_reader=metadata_reader,
+            monotonic=monotonic,
+        )
+
+    def bind_project(
+        probe: ProjectPathProbe,
+        remote_name: str,
+        branch: str,
+    ) -> TaskProject:
+        return bind_task_project(
+            probe,
+            remote_name=remote_name,
+            branch=branch,
+            allowed_roots=allowed_roots,
+            host_id=host_id,
+            runner=runner,
+            github_metadata_reader=metadata_reader,
+            monotonic=monotonic,
+        )
+
     return TaskSetupContext(
         working_directory=working_directory,
         management_repository=management_repository,
         task_owner_host=host_id,
         discover_projects=discover,
         validate_projects=validate,
+        probe_project_path=probe_path,
+        bind_project=bind_project,
     )
 
 
@@ -973,7 +1004,21 @@ def before_user_turn(
         if pending_prompt is None
         else {pending_choice.id for pending_choice in pending_prompt.choices}
     )
-    needs_task_context = context_choice == "/task" or bool(
+    context_required_reader = getattr(
+        _task_setup,
+        "requires_task_context",
+        None,
+    )
+    pending_step_requires_context = (
+        not is_new_session
+        and callable(context_required_reader)
+        and context_required_reader(
+            session_id,
+            user_id,
+            surface=surface,
+        )
+    )
+    needs_task_context = pending_step_requires_context or context_choice == "/task" or bool(
         {"task", "retry", "confirm"}
         & (
             set(selected_ids)

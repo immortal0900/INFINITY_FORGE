@@ -14,8 +14,11 @@ import pytest
 from forge.ops.project_discovery import (
     DiscoveryLimits,
     GitHubRepositoryMetadata,
+    ProjectPathProbe,
     ProjectDiscoveryError,
+    bind_task_project,
     discover_projects,
+    probe_project_path,
     validate_task_project,
 )
 from forge.ops.task_projects import TaskProject
@@ -238,6 +241,95 @@ def _discover(
         github_metadata_reader=reader,
         **kwargs,
     )
+
+
+def test_direct_path_probe_accepts_cwd_relative_path_and_explicit_remote_branch(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "current"
+    current.mkdir()
+    fixture = _make_repo(
+        tmp_path,
+        "target",
+        "owner/target",
+        remote_urls={
+            "origin": (
+                ("https://github.com/owner/target.git",),
+                ("https://github.com/owner/target.git",),
+            ),
+            "release": (
+                ("git@github.com:owner/release-target.git",),
+                ("git@github.com:owner/release-target.git",),
+            ),
+        },
+    )
+    runner = FakeGitRunner([fixture])
+
+    def metadata(
+        repository: str,
+        branch: str | None,
+        _timeout: float,
+    ) -> GitHubRepositoryMetadata:
+        selected = branch or "main"
+        return GitHubRepositoryMetadata(
+            full_name=repository,
+            default_branch="main",
+            branch=selected,
+            commit_sha=fixture.commit,
+        )
+
+    probe = probe_project_path(
+        "../target",
+        working_directory=current,
+        allowed_roots=(tmp_path,),
+        runner=runner,
+        github_metadata_reader=metadata,
+    )
+
+    assert isinstance(probe, ProjectPathProbe)
+    assert probe.workspace == str(fixture.root.resolve())
+    assert [remote.remote_name for remote in probe.remotes] == ["origin", "release"]
+    assert [remote.default_branch for remote in probe.remotes] == ["main", "main"]
+    absolute_probe = probe_project_path(
+        str(fixture.root.resolve()),
+        working_directory=current,
+        allowed_roots=(tmp_path,),
+        runner=runner,
+        github_metadata_reader=metadata,
+    )
+    assert absolute_probe == probe
+
+    project = bind_task_project(
+        probe,
+        remote_name="release",
+        branch="release/stable",
+        allowed_roots=(tmp_path,),
+        host_id=str(uuid4()),
+        runner=runner,
+        github_metadata_reader=metadata,
+    )
+
+    assert project.repository == "owner/release-target"
+    assert project.remote_name == "release"
+    assert project.base_branch == "release/stable"
+    assert project.base_commit == fixture.commit
+
+
+def test_direct_path_probe_rejects_an_absolute_path_outside_allowed_roots(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = _make_repo(tmp_path, "outside", "owner/outside")
+
+    with pytest.raises(ProjectDiscoveryError, match="allowed roots"):
+        probe_project_path(
+            str(outside.root.resolve()),
+            working_directory=allowed,
+            allowed_roots=(allowed,),
+            runner=FakeGitRunner([outside]),
+            github_metadata_reader=FakeGitHubReader([outside]),
+        )
 
 
 def test_missing_working_directory_scans_only_configured_roots(

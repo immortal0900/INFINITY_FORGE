@@ -12,6 +12,7 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from .choice_prompt import Choice, ChoiceMode, ChoicePrompt, ChoicePromptError, ChoiceSubmission
+from .project_discovery import HARD_MAX_PROJECTS, ProjectPathProbe
 from .task_options import MergeMode, Mode, TaskFlow, TaskSelection
 from .task_projects import TaskProject, TaskProjectError, normalize_github_remote
 from .task_service import TaskCreationRequest
@@ -132,6 +133,10 @@ def _safe_display_text(value: str) -> str:
 class SetupStep(str, Enum):
     MODE = "mode"
     PROJECTS = "projects"
+    PROJECT_PATH = "project_path"
+    PROJECT_REMOTE = "project_remote"
+    PROJECT_BRANCH = "project_branch"
+    PROJECT_BRANCH_NAME = "project_branch_name"
     TASK_FLOW = "task_flow"
     MERGE_MODE = "merge_mode"
     MERGE_ORDER = "merge_order"
@@ -141,6 +146,8 @@ class SetupStep(str, Enum):
 
 ProjectDiscoverer = Callable[[str | None], tuple[TaskProject, ...]]
 ProjectValidator = Callable[[tuple[TaskProject, ...]], tuple[TaskProject, ...]]
+ProjectPathProber = Callable[[str], ProjectPathProbe]
+ProjectBinder = Callable[[ProjectPathProbe, str, str], TaskProject]
 
 
 @dataclass(frozen=True)
@@ -152,6 +159,8 @@ class TaskSetupContext:
     task_owner_host: str
     discover_projects: ProjectDiscoverer
     validate_projects: ProjectValidator
+    probe_project_path: ProjectPathProber | None = None
+    bind_project: ProjectBinder | None = None
 
     def __post_init__(self) -> None:
         if self.working_directory is not None and (
@@ -199,6 +208,12 @@ class TaskSetupContext:
             raise ValueError("task_owner_host must be a canonical UUID")
         if not callable(self.discover_projects) or not callable(self.validate_projects):
             raise ValueError("Project discovery and validation must be callable")
+        direct_callbacks = (self.probe_project_path, self.bind_project)
+        if any(callback is None for callback in direct_callbacks):
+            if any(callback is not None for callback in direct_callbacks):
+                raise ValueError("Direct Project callbacks must be configured together")
+        elif any(not callable(callback) for callback in direct_callbacks):
+            raise ValueError("Direct Project callbacks must be callable")
 
 
 @dataclass(frozen=True)
@@ -209,6 +224,8 @@ class SetupDraft:
     first_input: str | None
     project_candidates: tuple[TaskProject, ...]
     projects: tuple[TaskProject, ...]
+    project_probe: ProjectPathProbe | None
+    project_remote_name: str | None
     task_flow: TaskFlow | None
     merge_mode: MergeMode | None
     merge_order: tuple[str, ...] | None
@@ -244,6 +261,19 @@ class _DiscoveryWork(_SetupWork):
 @dataclass(frozen=True)
 class _ValidationWork(_SetupWork):
     projects: tuple[TaskProject, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ProjectProbeWork(_SetupWork):
+    raw_path: str = ""
+
+
+@dataclass(frozen=True)
+class _ProjectBindWork(_SetupWork):
+    probe: ProjectPathProbe | None = None
+    remote_name: str = ""
+    branch: str = ""
+    return_step: SetupStep = SetupStep.PROJECT_BRANCH
 
 
 @dataclass(frozen=True)
@@ -426,6 +456,25 @@ class TaskSetup:
             draft = self._drafts.get(key)
             return None if draft is None else draft.choice_prompt
 
+    def requires_task_context(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        surface: str = DEFAULT_SURFACE,
+    ) -> bool:
+        """Return whether the pending step needs trusted Project callbacks."""
+
+        with self._lock:
+            draft = self._drafts.get((surface, session_id, user_id))
+            return draft is not None and draft.step in {
+                SetupStep.PROJECTS,
+                SetupStep.PROJECT_PATH,
+                SetupStep.PROJECT_REMOTE,
+                SetupStep.PROJECT_BRANCH,
+                SetupStep.PROJECT_BRANCH_NAME,
+            }
+
     def invalid_submission_result(
         self,
         session_id: str,
@@ -485,6 +534,10 @@ class TaskSetup:
                         completion_time,
                         project_candidates=(),
                         projects=(),
+                        project_probe=None,
+                        project_remote_name=None,
+                        management_repository=outcome.context.management_repository,
+                        task_owner_host=outcome.context.task_owner_host,
                         task_flow=None,
                         merge_mode=None,
                         merge_order=None,
@@ -501,6 +554,8 @@ class TaskSetup:
                     completion_time,
                     project_candidates=projects,
                     projects=(),
+                    project_probe=None,
+                    project_remote_name=None,
                     task_flow=None,
                     merge_mode=None,
                     merge_order=None,
@@ -514,6 +569,138 @@ class TaskSetup:
                 )
                 self._store_draft(outcome.key, refreshed, completion_time)
                 return self._projects_prompt(refreshed, outcome.prefix)
+
+        if isinstance(outcome, _ProjectProbeWork):
+            callback = outcome.context.probe_project_path
+            try:
+                if callback is None:
+                    raise ValueError("Direct Project probing is unavailable")
+                probe = callback(outcome.raw_path)
+                if not isinstance(probe, ProjectPathProbe):
+                    raise ValueError("Project path probe returned invalid data")
+                error = None
+            except Exception:
+                probe = None
+                error = "Project path could not be verified."
+            completion_time = explicit_time or self._clock()
+            with self._lock:
+                draft = self._matching_work_draft(outcome, completion_time)
+                if draft is None:
+                    return TurnResult.handled(
+                        "The Project path result was stale and was not applied."
+                    )
+                if error is not None or probe is None:
+                    refreshed = self._refresh(
+                        draft,
+                        completion_time,
+                        step=SetupStep.PROJECT_PATH,
+                        project_probe=None,
+                        project_remote_name=None,
+                        operation_token=None,
+                    )
+                    self._store_draft(outcome.key, refreshed, completion_time)
+                    return self._project_path_prompt(refreshed, error)
+                refreshed = self._refresh(
+                    draft,
+                    completion_time,
+                    step=SetupStep.PROJECT_REMOTE,
+                    project_probe=probe,
+                    project_remote_name=None,
+                    operation_token=None,
+                )
+                self._store_draft(outcome.key, refreshed, completion_time)
+                return self._project_remote_prompt(refreshed)
+
+        if isinstance(outcome, _ProjectBindWork):
+            callback = outcome.context.bind_project
+            try:
+                if callback is None or outcome.probe is None:
+                    raise ValueError("Direct Project binding is unavailable")
+                project = callback(
+                    outcome.probe,
+                    outcome.remote_name,
+                    outcome.branch,
+                )
+                if not isinstance(project, TaskProject):
+                    raise ValueError("Project binding returned invalid data")
+                error = None
+            except Exception:
+                project = None
+                error = "Project remote and branch could not be verified."
+            completion_time = explicit_time or self._clock()
+            with self._lock:
+                draft = self._matching_work_draft(outcome, completion_time)
+                if draft is None:
+                    return TurnResult.handled(
+                        "The Project binding result was stale and was not applied."
+                    )
+                if error is not None or project is None:
+                    refreshed = self._refresh(
+                        draft,
+                        completion_time,
+                        step=outcome.return_step,
+                        operation_token=None,
+                    )
+                    self._store_draft(outcome.key, refreshed, completion_time)
+                    if outcome.return_step is SetupStep.PROJECT_BRANCH_NAME:
+                        return self._project_branch_name_prompt(refreshed, error)
+                    return self._project_branch_prompt(refreshed, error)
+                if len(draft.project_candidates) >= HARD_MAX_PROJECTS:
+                    refreshed = self._refresh(
+                        draft,
+                        completion_time,
+                        step=SetupStep.PROJECTS,
+                        project_probe=None,
+                        project_remote_name=None,
+                        operation_token=None,
+                    )
+                    self._store_draft(outcome.key, refreshed, completion_time)
+                    return self._projects_prompt(
+                        refreshed,
+                        "The Project limit was reached; the new Project was not added.",
+                    )
+                duplicate = any(
+                    candidate.project_id == project.project_id
+                    or candidate.repository.casefold() == project.repository.casefold()
+                    or Path(candidate.workspace) == Path(project.workspace)
+                    for candidate in draft.project_candidates
+                )
+                if duplicate:
+                    refreshed = self._refresh(
+                        draft,
+                        completion_time,
+                        step=SetupStep.PROJECTS,
+                        project_probe=None,
+                        project_remote_name=None,
+                        operation_token=None,
+                    )
+                    self._store_draft(outcome.key, refreshed, completion_time)
+                    return self._projects_prompt(
+                        refreshed,
+                        "That Project is already listed.",
+                    )
+                refreshed = self._refresh(
+                    draft,
+                    completion_time,
+                    step=SetupStep.PROJECTS,
+                    project_candidates=(*draft.project_candidates, project),
+                    projects=(),
+                    project_probe=None,
+                    project_remote_name=None,
+                    task_flow=None,
+                    merge_mode=None,
+                    merge_order=None,
+                    task_text=None,
+                    task_request=None,
+                    v2_request_id=None,
+                    task_request_v2=None,
+                    operation_token=None,
+                )
+                self._store_draft(outcome.key, refreshed, completion_time)
+                return self._projects_prompt(
+                    refreshed,
+                    "Project added. Choose one or more Projects.",
+                )
 
         if isinstance(outcome, _ValidationWork):
             try:
@@ -535,6 +722,8 @@ class TaskSetup:
                         step=SetupStep.PROJECTS,
                         project_candidates=(),
                         projects=(),
+                        project_probe=None,
+                        project_remote_name=None,
                         task_flow=None,
                         merge_mode=None,
                         merge_order=None,
@@ -632,6 +821,37 @@ class TaskSetup:
                 current_time,
                 context,
             )
+        if draft.step is SetupStep.PROJECT_PATH:
+            return self._handle_project_path(
+                key,
+                draft,
+                text,
+                current_time,
+                context,
+            )
+        if draft.step is SetupStep.PROJECT_REMOTE:
+            return self._handle_project_remote(
+                key,
+                draft,
+                choice,
+                current_time,
+            )
+        if draft.step is SetupStep.PROJECT_BRANCH:
+            return self._handle_project_branch(
+                key,
+                draft,
+                choice,
+                current_time,
+                context,
+            )
+        if draft.step is SetupStep.PROJECT_BRANCH_NAME:
+            return self._handle_project_branch_name(
+                key,
+                draft,
+                text,
+                current_time,
+                context,
+            )
         if draft.step is SetupStep.TASK_FLOW:
             return self._handle_task_flow(key, draft, choice, current_time)
         if draft.step is SetupStep.MERGE_MODE:
@@ -722,6 +942,8 @@ class TaskSetup:
             first_input=None,
             project_candidates=(),
             projects=(),
+            project_probe=None,
+            project_remote_name=None,
             task_flow=None,
             merge_mode=None,
             merge_order=None,
@@ -745,6 +967,8 @@ class TaskSetup:
             first_input=first_input,
             project_candidates=(),
             projects=(),
+            project_probe=None,
+            project_remote_name=None,
             task_flow=None,
             merge_mode=None,
             merge_order=None,
@@ -843,6 +1067,8 @@ class TaskSetup:
                 step=SetupStep.TASK_FLOW,
                 project_candidates=(),
                 projects=(),
+                project_probe=None,
+                project_remote_name=None,
                 task_flow=None,
                 merge_mode=None,
                 merge_order=None,
@@ -875,6 +1101,8 @@ class TaskSetup:
             step=SetupStep.PROJECTS,
             project_candidates=(),
             projects=(),
+            project_probe=None,
+            project_remote_name=None,
             task_flow=None,
             merge_mode=None,
             merge_order=None,
@@ -910,6 +1138,35 @@ class TaskSetup:
     ) -> TurnResult | _DiscoveryWork:
         if draft.operation_token is not None:
             return TurnResult.handled("Project discovery is already in progress.")
+        if selected_ids == ("add_project",):
+            if len(draft.project_candidates) >= HARD_MAX_PROJECTS:
+                return self._projects_prompt(
+                    draft,
+                    "The Project limit has been reached.",
+                )
+            if not self._direct_context_matches(draft, context):
+                return self._projects_prompt(
+                    draft,
+                    "Trusted direct Project configuration is unavailable.",
+                )
+            path_draft = self._refresh(
+                draft,
+                now,
+                step=SetupStep.PROJECT_PATH,
+                projects=(),
+                project_probe=None,
+                project_remote_name=None,
+                task_flow=None,
+                merge_mode=None,
+                merge_order=None,
+                task_text=None,
+                task_request=None,
+                v2_request_id=None,
+                task_request_v2=None,
+                operation_token=None,
+            )
+            self._store_draft(key, path_draft, now)
+            return self._project_path_prompt(path_draft)
         if not draft.project_candidates:
             if selected_ids == ("cancel",):
                 return self._enter_chat(key, now)
@@ -922,7 +1179,12 @@ class TaskSetup:
                 return self._begin_project_discovery(key, draft, now, context)
             return self._projects_prompt(
                 draft,
-                "Choose Retry to discover Projects or Cancel.",
+                "Choose Retry, Add Project, or Cancel.",
+            )
+        if "add_project" in selected_ids:
+            return self._projects_prompt(
+                draft,
+                "Add Project must be selected by itself.",
             )
         allowed = {project.project_id: project for project in draft.project_candidates}
         if (
@@ -962,6 +1224,204 @@ class TaskSetup:
         )
         self._store_draft(key, selected, now)
         return self._task_flow_prompt(selected)
+
+    @staticmethod
+    def _direct_context_matches(
+        draft: SetupDraft,
+        context: TaskSetupContext | None,
+    ) -> bool:
+        return (
+            context is not None
+            and context.management_repository == draft.management_repository
+            and context.task_owner_host == draft.task_owner_host
+            and context.probe_project_path is not None
+            and context.bind_project is not None
+        )
+
+    def _handle_project_path(
+        self,
+        key: SessionKey,
+        draft: SetupDraft,
+        raw_path: str,
+        now: datetime,
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _ProjectProbeWork:
+        if draft.operation_token is not None:
+            return self._project_path_prompt(
+                draft,
+                "Project path verification is already in progress.",
+            )
+        if not raw_path.strip():
+            return self._project_path_prompt(draft, "Project path cannot be empty.")
+        if not self._direct_context_matches(draft, context):
+            return self._project_path_prompt(
+                draft,
+                "Trusted direct Project configuration is unavailable.",
+            )
+        token = str(uuid4())
+        pending = self._refresh(
+            draft,
+            now,
+            operation_token=token,
+        )
+        self._store_draft(key, pending, now)
+        return _ProjectProbeWork(
+            key=key,
+            context=context,
+            token=token,
+            generation=pending.generation,
+            step=pending.step,
+            expires_at=pending.expires_at,
+            prompt_id=None,
+            selected_ids=tuple(project.project_id for project in pending.projects),
+            raw_path=raw_path.strip(),
+        )
+
+    def _handle_project_remote(
+        self,
+        key: SessionKey,
+        draft: SetupDraft,
+        remote_name: str,
+        now: datetime,
+    ) -> TurnResult:
+        probe = draft.project_probe
+        if probe is None:
+            raise RuntimeError("Project path probe is missing")
+        allowed = {remote.remote_name for remote in probe.remotes}
+        if remote_name not in allowed:
+            refreshed = self._refresh(draft, now)
+            self._store_draft(key, refreshed, now)
+            return self._project_remote_prompt(
+                refreshed,
+                "Choose one listed remote.",
+            )
+        selected = self._refresh(
+            draft,
+            now,
+            step=SetupStep.PROJECT_BRANCH,
+            project_remote_name=remote_name,
+            operation_token=None,
+        )
+        self._store_draft(key, selected, now)
+        return self._project_branch_prompt(selected)
+
+    def _handle_project_branch(
+        self,
+        key: SessionKey,
+        draft: SetupDraft,
+        choice: str,
+        now: datetime,
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _ProjectBindWork:
+        if draft.operation_token is not None:
+            return TurnResult.handled(
+                "Project binding is already in progress.",
+                next_step=SetupStep.PROJECT_BRANCH,
+            )
+        if choice == "other_branch":
+            selected = self._refresh(
+                draft,
+                now,
+                step=SetupStep.PROJECT_BRANCH_NAME,
+                operation_token=None,
+            )
+            self._store_draft(key, selected, now)
+            return self._project_branch_name_prompt(selected)
+        if choice != "default_branch":
+            refreshed = self._refresh(draft, now)
+            self._store_draft(key, refreshed, now)
+            return self._project_branch_prompt(
+                refreshed,
+                "Choose the default branch or another branch.",
+            )
+        remote = self._selected_project_remote(draft)
+        return self._begin_project_bind(
+            key,
+            draft,
+            remote.default_branch,
+            SetupStep.PROJECT_BRANCH,
+            now,
+            context,
+        )
+
+    def _handle_project_branch_name(
+        self,
+        key: SessionKey,
+        draft: SetupDraft,
+        branch: str,
+        now: datetime,
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _ProjectBindWork:
+        if draft.operation_token is not None:
+            return self._project_branch_name_prompt(
+                draft,
+                "Project binding is already in progress.",
+            )
+        if not branch.strip():
+            return self._project_branch_name_prompt(
+                draft,
+                "Branch name cannot be empty.",
+            )
+        return self._begin_project_bind(
+            key,
+            draft,
+            branch.strip(),
+            SetupStep.PROJECT_BRANCH_NAME,
+            now,
+            context,
+        )
+
+    @staticmethod
+    def _selected_project_remote(draft: SetupDraft):
+        if draft.project_probe is None or draft.project_remote_name is None:
+            raise RuntimeError("Project remote selection is missing")
+        matches = [
+            remote
+            for remote in draft.project_probe.remotes
+            if remote.remote_name == draft.project_remote_name
+        ]
+        if len(matches) != 1:
+            raise RuntimeError("Project remote selection is invalid")
+        return matches[0]
+
+    def _begin_project_bind(
+        self,
+        key: SessionKey,
+        draft: SetupDraft,
+        branch: str,
+        return_step: SetupStep,
+        now: datetime,
+        context: TaskSetupContext | None,
+    ) -> TurnResult | _ProjectBindWork:
+        if not self._direct_context_matches(draft, context):
+            if return_step is SetupStep.PROJECT_BRANCH_NAME:
+                return self._project_branch_name_prompt(
+                    draft,
+                    "Trusted direct Project configuration is unavailable.",
+                )
+            return self._project_branch_prompt(
+                draft,
+                "Trusted direct Project configuration is unavailable.",
+            )
+        remote = self._selected_project_remote(draft)
+        token = str(uuid4())
+        pending = self._refresh(draft, now, operation_token=token)
+        pending = update(pending, choice_prompt=None)
+        self._store_draft(key, pending, now)
+        return _ProjectBindWork(
+            key=key,
+            context=context,
+            token=token,
+            generation=pending.generation,
+            step=pending.step,
+            expires_at=pending.expires_at,
+            prompt_id=None,
+            selected_ids=tuple(project.project_id for project in pending.projects),
+            probe=pending.project_probe,
+            remote_name=remote.remote_name,
+            branch=branch,
+            return_step=return_step,
+        )
 
     def _handle_task_flow(
         self,
@@ -1184,6 +1644,8 @@ class TaskSetup:
                     step=SetupStep.PROJECTS,
                     project_candidates=(),
                     projects=(),
+                    project_probe=None,
+                    project_remote_name=None,
                     task_flow=None,
                     merge_mode=None,
                     merge_order=None,
@@ -1319,6 +1781,16 @@ class TaskSetup:
         choice_id = choice_ids[0]
         if draft.step is SetupStep.MODE:
             return self._handle_mode(key, draft, choice_id, now, context)
+        if draft.step is SetupStep.PROJECT_REMOTE:
+            return self._handle_project_remote(key, draft, choice_id, now)
+        if draft.step is SetupStep.PROJECT_BRANCH:
+            return self._handle_project_branch(
+                key,
+                draft,
+                choice_id,
+                now,
+                context,
+            )
         if draft.step is SetupStep.TASK_FLOW:
             return self._handle_task_flow(key, draft, choice_id, now)
         if draft.step is SetupStep.MERGE_MODE:
@@ -1341,6 +1813,10 @@ class TaskSetup:
             return self._mode_prompt(draft, prefix)
         if draft.step is SetupStep.PROJECTS:
             return self._projects_prompt(draft, prefix)
+        if draft.step is SetupStep.PROJECT_REMOTE:
+            return self._project_remote_prompt(draft, prefix)
+        if draft.step is SetupStep.PROJECT_BRANCH:
+            return self._project_branch_prompt(draft, prefix)
         if draft.step is SetupStep.TASK_FLOW:
             return self._task_flow_prompt(draft, prefix)
         if draft.step is SetupStep.MERGE_MODE:
@@ -1356,6 +1832,8 @@ class TaskSetup:
         return step in {
             SetupStep.MODE,
             SetupStep.PROJECTS,
+            SetupStep.PROJECT_REMOTE,
+            SetupStep.PROJECT_BRANCH,
             SetupStep.TASK_FLOW,
             SetupStep.MERGE_MODE,
             SetupStep.MERGE_ORDER,
@@ -1375,7 +1853,7 @@ class TaskSetup:
             max_choices = 1
         elif step is SetupStep.PROJECTS:
             if draft.project_candidates:
-                choices = tuple(
+                project_choices = tuple(
                     Choice(
                         project.project_id,
                         (
@@ -1391,17 +1869,67 @@ class TaskSetup:
                     )
                     for project in draft.project_candidates
                 )
+                choices = project_choices + (
+                    (
+                        Choice(
+                            "add_project",
+                            "Add Project",
+                            "Add an allowed absolute or working-directory-relative path",
+                        ),
+                    )
+                    if len(project_choices) < HARD_MAX_PROJECTS
+                    else ()
+                )
                 submit_label = "Choose Projects"
                 choice_mode = ChoiceMode.MULTIPLE
                 max_choices = None
             else:
                 choices = (
                     Choice("retry", "Retry", "Discover Projects again"),
+                    Choice(
+                        "add_project",
+                        "Add Project",
+                        "Add an allowed absolute or working-directory-relative path",
+                    ),
                     Choice("cancel", "Cancel", "Return to Chat"),
                 )
                 submit_label = "Project discovery"
                 choice_mode = ChoiceMode.SINGLE
                 max_choices = 1
+        elif step is SetupStep.PROJECT_REMOTE:
+            if draft.project_probe is None:
+                raise RuntimeError("Project path probe is missing")
+            choices = tuple(
+                Choice(
+                    remote.remote_name,
+                    (
+                        f"{_safe_display_text(remote.repository)} "
+                        f"({_safe_display_text(remote.remote_name)})"
+                    ),
+                    f"Default branch: {_safe_display_text(remote.default_branch)}",
+                )
+                for remote in draft.project_probe.remotes
+            )
+            submit_label = "Choose remote"
+            choice_mode = ChoiceMode.SINGLE
+            max_choices = 1
+        elif step is SetupStep.PROJECT_BRANCH:
+            remote = TaskSetup._selected_project_remote(draft)
+            choices = (
+                Choice(
+                    "default_branch",
+                    f"Default: {_safe_display_text(remote.default_branch)}",
+                    "Use the repository default branch",
+                ),
+                Choice(
+                    "other_branch",
+                    "Another branch",
+                    "Enter a different existing branch",
+                ),
+            )
+            submit_label = "Choose branch"
+            choice_mode = ChoiceMode.SINGLE
+            max_choices = 1
         elif step is SetupStep.TASK_FLOW:
             choices = tuple(
                 Choice(value.value, _FLOW_LABELS[value], _FLOW_DETAILS[value])
@@ -1524,14 +2052,86 @@ class TaskSetup:
                 )
                 for project in draft.project_candidates
             )
+            if len(draft.project_candidates) < HARD_MAX_PROJECTS:
+                options += "\n- Add Project — enter another allowed Git root"
         else:
-            intro = prefix or "No Projects were found. Retry discovery or cancel."
-            options = "- Retry — discover Projects again\n- Cancel — return to Chat"
+            intro = prefix or (
+                "No Projects were found. Retry discovery, add a Project, or cancel."
+            )
+            options = (
+                "- Retry — discover Projects again\n"
+                "- Add Project — enter an allowed Git root\n"
+                "- Cancel — return to Chat"
+            )
         return TurnResult.handled(
             f"{intro}\n\nOptions:\n{options}",
             choices=TaskSetup._prompt_choice_ids(draft),
             choice_prompt=draft.choice_prompt,
             next_step=SetupStep.PROJECTS,
+        )
+
+    @staticmethod
+    def _project_path_prompt(
+        draft: SetupDraft,
+        prefix: str | None = None,
+    ) -> TurnResult:
+        intro = prefix or (
+            "Enter an allowed absolute Project path or a path relative to "
+            "the Task working directory."
+        )
+        return TurnResult.handled(intro, next_step=SetupStep.PROJECT_PATH)
+
+    @staticmethod
+    def _project_remote_prompt(
+        draft: SetupDraft,
+        prefix: str | None = None,
+    ) -> TurnResult:
+        if draft.choice_prompt is None or draft.project_probe is None:
+            raise RuntimeError("Project remote prompt is missing")
+        intro = prefix or "Choose the Git remote to use for push and pull requests."
+        options = "\n".join(
+            (
+                f"- {_safe_display_text(remote.repository)} "
+                f"({_safe_display_text(remote.remote_name)})"
+            )
+            for remote in draft.project_probe.remotes
+        )
+        return TurnResult.handled(
+            f"{intro}\n\nOptions:\n{options}",
+            choices=TaskSetup._prompt_choice_ids(draft),
+            choice_prompt=draft.choice_prompt,
+            next_step=SetupStep.PROJECT_REMOTE,
+        )
+
+    @staticmethod
+    def _project_branch_prompt(
+        draft: SetupDraft,
+        prefix: str | None = None,
+    ) -> TurnResult:
+        if draft.choice_prompt is None:
+            raise RuntimeError("Project branch prompt is missing")
+        remote = TaskSetup._selected_project_remote(draft)
+        intro = prefix or "Choose the Project base branch."
+        return TurnResult.handled(
+            (
+                f"{intro}\n\n"
+                f"Default branch: {_safe_display_text(remote.default_branch)}\n"
+                "You may choose Another branch and enter its name."
+            ),
+            choices=TaskSetup._prompt_choice_ids(draft),
+            choice_prompt=draft.choice_prompt,
+            next_step=SetupStep.PROJECT_BRANCH,
+        )
+
+    @staticmethod
+    def _project_branch_name_prompt(
+        draft: SetupDraft,
+        prefix: str | None = None,
+    ) -> TurnResult:
+        intro = prefix or "Enter the existing non-default branch name."
+        return TurnResult.handled(
+            intro,
+            next_step=SetupStep.PROJECT_BRANCH_NAME,
         )
 
     @staticmethod

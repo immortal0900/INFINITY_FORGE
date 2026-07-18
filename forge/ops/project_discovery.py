@@ -90,6 +90,55 @@ class GitHubRepositoryMetadata:
         _validate_commit(self.commit_sha)
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectRemote:
+    """One explicitly selectable Git remote and its current default branch."""
+
+    remote_name: str
+    repository: str
+    default_branch: str
+
+    def __post_init__(self) -> None:
+        try:
+            _validate_remote_name(self.remote_name)
+            _validate_repository(self.repository)
+            _validate_branch(self.default_branch)
+        except TaskProjectError:
+            raise ProjectDiscoveryError("project remote option is invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectPathProbe:
+    """A canonical direct path plus every remote the user may select."""
+
+    workspace: str
+    remotes: tuple[ProjectRemote, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.workspace, str) or not self.workspace:
+            raise ProjectDiscoveryError("project workspace option is invalid")
+        try:
+            workspace = Path(self.workspace)
+            resolved = workspace.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            raise ProjectDiscoveryError("project workspace option is invalid") from None
+        if (
+            not workspace.is_absolute()
+            or not resolved.is_dir()
+            or str(resolved) != self.workspace
+        ):
+            raise ProjectDiscoveryError("project workspace option is invalid")
+        if (
+            not isinstance(self.remotes, tuple)
+            or not self.remotes
+            or any(not isinstance(remote, ProjectRemote) for remote in self.remotes)
+        ):
+            raise ProjectDiscoveryError("project remote options are invalid")
+        names = tuple(remote.remote_name for remote in self.remotes)
+        if len(set(names)) != len(names):
+            raise ProjectDiscoveryError("project remote options are ambiguous")
+
+
 class GitHubMetadataReader(Protocol):
     def __call__(
         self,
@@ -713,6 +762,7 @@ def _validate_evidence_binding(
     runner: GitRunner,
     monotonic: Monotonic,
     github_metadata_reader: GitHubMetadataReader,
+    expected_default_branch: str | None = None,
 ) -> tuple[str, str, str]:
     metadata = _read_metadata(
         github_metadata_reader,
@@ -729,6 +779,10 @@ def _validate_evidence_binding(
             and metadata.full_name != expected_repository
         )
         or metadata.branch != selected_branch
+        or (
+            expected_default_branch is not None
+            and metadata.default_branch != expected_default_branch
+        )
         or (branch is None and metadata.default_branch != metadata.branch)
     ):
         raise ProjectDiscoveryError("GitHub binding does not match local project")
@@ -744,6 +798,175 @@ def _validate_evidence_binding(
     if expected_commit is not None and expected_commit != local_commit:
         raise ProjectDiscoveryError("local Git binding does not match TaskProject")
     return metadata.full_name, selected_branch, local_commit
+
+
+def _direct_workspace(
+    path: str | os.PathLike[str],
+    *,
+    working_directory: str | os.PathLike[str] | None,
+    roots: Sequence[Path],
+) -> Path:
+    if isinstance(path, bool) or not isinstance(path, (str, os.PathLike)):
+        raise ProjectDiscoveryError("project path is invalid")
+    try:
+        unresolved = Path(path)
+    except (TypeError, ValueError):
+        raise ProjectDiscoveryError("project path is invalid") from None
+    if not unresolved.is_absolute():
+        if working_directory is None:
+            raise ProjectDiscoveryError(
+                "relative project path requires a working directory"
+            )
+        base = _safe_resolve(working_directory, "working directory")
+        unresolved = base / unresolved
+    workspace = _safe_resolve(unresolved, "project")
+    containing = _containing_root(workspace, roots)
+    if containing is None:
+        raise ProjectDiscoveryError("project path boundary escaped allowed roots")
+    _assert_no_reparse_components(workspace, containing)
+    return workspace
+
+
+# RISK(security): direct user paths never become TaskProjects until the same
+# allowed-root, Git, remote, GitHub, branch, and commit evidence is re-read.
+def probe_project_path(
+    path: str | os.PathLike[str],
+    *,
+    working_directory: str | os.PathLike[str] | None,
+    allowed_roots: Sequence[str | os.PathLike[str]],
+    runner: GitRunner = subprocess.run,
+    github_metadata_reader: GitHubMetadataReader,
+    monotonic: Monotonic = time.monotonic,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> ProjectPathProbe:
+    """Probe one explicit absolute or working-directory-relative Git root."""
+
+    limits = _validate_limits(DiscoveryLimits(timeout_seconds=timeout_seconds))
+    deadline = _start_deadline(limits, monotonic)
+    roots = _normalize_roots(allowed_roots)
+    workspace = _direct_workspace(
+        path,
+        working_directory=working_directory,
+        roots=roots,
+    )
+    evidence = _git_evidence(
+        workspace,
+        roots,
+        deadline=deadline,
+        runner=runner,
+        monotonic=monotonic,
+    )
+    remotes = _remote_bindings(
+        evidence,
+        deadline=deadline,
+        runner=runner,
+        monotonic=monotonic,
+    )
+    if len(remotes) > HARD_MAX_PROJECTS:
+        raise ProjectDiscoveryError("project remote count limit exceeded")
+    options: list[ProjectRemote] = []
+    for remote in remotes:
+        repository, default_branch, _commit = _validate_evidence_binding(
+            remote,
+            branch=None,
+            expected_commit=None,
+            expected_repository=None,
+            deadline=deadline,
+            runner=runner,
+            monotonic=monotonic,
+            github_metadata_reader=github_metadata_reader,
+        )
+        options.append(
+            ProjectRemote(
+                remote_name=remote.remote_name,
+                repository=repository,
+                default_branch=default_branch,
+            )
+        )
+    _recheck_git_evidence(evidence, roots)
+    _remaining(deadline, monotonic)
+    return ProjectPathProbe(str(evidence.workspace), tuple(options))
+
+
+def bind_task_project(
+    probe: ProjectPathProbe,
+    *,
+    remote_name: str,
+    branch: str,
+    allowed_roots: Sequence[str | os.PathLike[str]],
+    host_id: str,
+    runner: GitRunner = subprocess.run,
+    github_metadata_reader: GitHubMetadataReader,
+    monotonic: Monotonic = time.monotonic,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> TaskProject:
+    """Re-probe and bind one user-selected remote and branch."""
+
+    if not isinstance(probe, ProjectPathProbe):
+        raise ProjectDiscoveryError("project path probe is invalid")
+    try:
+        checked_remote = _validate_remote_name(remote_name)
+        checked_branch = _validate_branch(branch)
+        checked_host = _validate_host_id(host_id)
+    except TaskProjectError:
+        raise ProjectDiscoveryError("project binding selection is invalid") from None
+    options = {
+        option.remote_name: option
+        for option in probe.remotes
+    }
+    option = options.get(checked_remote)
+    if option is None:
+        raise ProjectDiscoveryError("project remote selection is invalid")
+    limits = _validate_limits(DiscoveryLimits(timeout_seconds=timeout_seconds))
+    deadline = _start_deadline(limits, monotonic)
+    roots = _normalize_roots(allowed_roots)
+    workspace = _direct_workspace(
+        probe.workspace,
+        working_directory=None,
+        roots=roots,
+    )
+    if str(workspace) != probe.workspace:
+        raise ProjectDiscoveryError("project path changed after selection")
+    evidence = _git_evidence(
+        workspace,
+        roots,
+        deadline=deadline,
+        runner=runner,
+        monotonic=monotonic,
+    )
+    remotes = _remote_bindings(
+        evidence,
+        deadline=deadline,
+        runner=runner,
+        monotonic=monotonic,
+    )
+    matches = [remote for remote in remotes if remote.remote_name == checked_remote]
+    if len(matches) != 1:
+        raise ProjectDiscoveryError("project remote binding changed")
+    repository, selected_branch, commit = _validate_evidence_binding(
+        matches[0],
+        branch=checked_branch,
+        expected_commit=None,
+        expected_repository=option.repository,
+        deadline=deadline,
+        runner=runner,
+        monotonic=monotonic,
+        github_metadata_reader=github_metadata_reader,
+        expected_default_branch=option.default_branch,
+    )
+    _recheck_git_evidence(evidence, roots)
+    _remaining(deadline, monotonic)
+    try:
+        return TaskProject.create(
+            repository=repository,
+            workspace=str(evidence.workspace),
+            remote_name=checked_remote,
+            base_branch=selected_branch,
+            base_commit=commit,
+            host_id=checked_host,
+        )
+    except TaskProjectError:
+        raise ProjectDiscoveryError("project binding is invalid") from None
 
 
 # RISK(security): This validator is the authorization boundary between stored

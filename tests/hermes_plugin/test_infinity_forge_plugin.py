@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 import forge.hermes_plugin.infinity_forge as plugin
+from forge.ops.project_discovery import ProjectPathProbe, ProjectRemote
 from forge.ops.task_options import MergeMode, TaskFlow
 from forge.ops.task_projects import TaskProject
 from forge.ops.task_service import TaskCreationRequest
@@ -62,6 +63,8 @@ def _v2_context(
     *,
     discover=None,
     validate=None,
+    probe=None,
+    bind=None,
 ) -> TaskSetupContext:
     return TaskSetupContext(
         working_directory=working_directory,
@@ -69,6 +72,8 @@ def _v2_context(
         task_owner_host=OWNER_HOST,
         discover_projects=discover or (lambda _working: projects),
         validate_projects=validate or (lambda selected: selected),
+        probe_project_path=probe,
+        bind_project=bind,
     )
 
 
@@ -1229,6 +1234,8 @@ def test_default_context_uses_separate_v2_config_and_one_batch_deadline(
     assert context.working_directory is None
     assert validated == (first, second)
     assert timeouts == [4.0, 3.0]
+    assert callable(context.probe_project_path)
+    assert callable(context.bind_project)
 
 
 def test_default_context_rejects_non_uuid_host(monkeypatch, tmp_path: Path) -> None:
@@ -1514,6 +1521,57 @@ def test_delayed_rank_one_project_reply_cannot_apply_to_rank_two(
     assert [choice["id"] for choice in stale["choices"]] == [beta.project_id]
 
 
+def test_direct_project_path_turn_receives_fresh_trusted_context(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    target = _project(tmp_path / "target", "owner/target")
+    probe_calls: list[str] = []
+    probe = ProjectPathProbe(
+        workspace=target.workspace,
+        remotes=(ProjectRemote("origin", "owner/target", "main"),),
+    )
+    context = _v2_context(
+        str(tmp_path.resolve()),
+        (target,),
+        probe=lambda path: probe_calls.append(path) or probe,
+        bind=lambda _probe, _remote, _branch: target,
+    )
+    context_calls = 0
+
+    def factory(_working_directory: str | None) -> TaskSetupContext:
+        nonlocal context_calls
+        context_calls += 1
+        return context
+
+    monkeypatch.setattr(plugin, "_task_context_factory", factory)
+    common = {
+        "session_id": "direct-path-context",
+        "user_id": "u1",
+        "working_directory": str(tmp_path.resolve()),
+    }
+    mode = plugin.before_user_turn(text="직접 추가", **common)
+    projects = plugin.before_user_turn(
+        text="ignored",
+        choice_prompt_id=mode["choice_prompt_id"],
+        selected_choice_ids=["task"],
+        **common,
+    )
+    path = plugin.before_user_turn(
+        text="ignored",
+        choice_prompt_id=projects["choice_prompt_id"],
+        selected_choice_ids=["add_project"],
+        **common,
+    )
+    remotes = plugin.before_user_turn(text="target", **common)
+
+    assert path["action"] == "handled"
+    assert "choice_prompt_id" not in path
+    assert [choice["id"] for choice in remotes["choices"]] == ["origin"]
+    assert probe_calls == ["target"]
+    assert context_calls == 3
+
+
 def test_failed_task_entry_retry_keeps_first_trusted_working_directory(
     monkeypatch,
     tmp_path: Path,
@@ -1669,6 +1727,10 @@ def test_confirm_uses_fresh_context_validator_not_entry_validator(
         **common,
     )
 
-    assert [choice["id"] for choice in failed["choices"]] == ["retry", "cancel"]
+    assert [choice["id"] for choice in failed["choices"]] == [
+        "retry",
+        "add_project",
+        "cancel",
+    ]
     assert entry_validations == 0
     assert confirm_validations == 1
