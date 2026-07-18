@@ -268,16 +268,16 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 - Produces: `TaskRequestV2`, `TaskSettingsV2`
 - Preserves: `TaskCreationRequest`, `TaskSettings` v1
 
-- [ ] **Step 1: exact JSON field·type·canonical hash RED test 작성**
+- [x] **Step 1: exact JSON field·type·canonical hash RED test 작성**
 
   sorted Projects, exact `merge_order` permutation, owner host UUID, UTC Z, unknown/extra field 거부와
   v1 hash 불변 fixture를 포함한다.
 
-- [ ] **Step 2: immutable v2 records와 parser 구현**
+- [x] **Step 2: immutable v2 records와 parser 구현**
 
   공개 schema 경계에 `RISK(breaking)`을 남기고 v1 class나 format marker를 수정하지 않는다.
 
-- [ ] **Step 3: test 통과 후 commit**
+- [x] **Step 3: test 통과 후 commit**
 
   Run: `python -m pytest tests/ops/test_task_settings_v2.py tests/ops/test_plain_names.py tests/ops/test_task_settings.py -q`
 
