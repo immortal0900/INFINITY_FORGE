@@ -238,21 +238,21 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 - Flow: `mode → Projects → task_flow → merge_mode → merge_order? → content → Confirm`
 - Consumes: trusted `working_directory`, Project discovery results
 
-- [ ] **Step 1: exact flow와 필수 선택 RED test 작성**
+- [x] **Step 1: exact flow와 필수 선택 RED test 작성**
 
   Projects 0개, multi `full_auto` merge order 누락·중복, 이전 Task 값 자동 불러오기를 거부한다.
 
-- [ ] **Step 2: multiple chooser와 동적 stable project IDs 연결**
+- [x] **Step 2: multiple chooser와 동적 stable project IDs 연결**
 
   Project path나 label을 선택 authority로 쓰지 않고 Confirm 직전에 binding을 다시 검증한다.
 
-- [ ] **Step 3: preview가 Management와 각 Project를 구분하는지 검증**
+- [x] **Step 3: preview가 Management와 각 Project를 구분하는지 검증**
 
   Run: `python -m pytest tests/ops/test_task_setup.py tests/hermes_plugin/test_infinity_forge_plugin.py -q`
 
   Expected: PASS, handled turns의 model calls 0
 
-- [ ] **Step 4: commit**
+- [x] **Step 4: commit**
 
   Commit: `feat: select projects in Hermes task setup`
 
