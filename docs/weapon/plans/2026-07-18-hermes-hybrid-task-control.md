@@ -207,22 +207,22 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 - Produces: `discover_projects(working_directory, allowed_roots, limits)`
 - Produces: canonical `OWNER/REPO` and 64-hex `project_id`
 
-- [ ] **Step 1: 임의 이름 저장소·Git root·상위 폴더 발견 test 작성**
+- [x] **Step 1: 임의 이름 저장소·Git root·상위 폴더 발견 test 작성**
 
   SSH/HTTPS remote 동일화, depth 3/count 64/time 5초, hard limit 8/256을 포함한다.
 
-- [ ] **Step 2: 탈출·중복·remote 불일치 RED test 작성**
+- [x] **Step 2: 탈출·중복·remote 불일치 RED test 작성**
 
   symlink/junction/root 탈출, 같은 repo의 다른 worktree 중복, credential remote, missing remote,
   GitHub canonical repo/base branch/base commit 불일치를 거부한다.
 
-- [ ] **Step 3: RED 확인 후 순수 discovery와 validator 구현**
+- [x] **Step 3: RED 확인 후 순수 discovery와 validator 구현**
 
   Run: `python -m pytest tests/ops/test_task_projects.py tests/ops/test_project_discovery.py -q`
 
   Expected before implementation: FAIL; after implementation: PASS
 
-- [ ] **Step 4: deterministic project ID와 timeout 실패 표시 검증 후 commit**
+- [x] **Step 4: deterministic project ID와 timeout 실패 표시 검증 후 commit**
 
   Commit: `feat: discover and validate generic task projects`
 
