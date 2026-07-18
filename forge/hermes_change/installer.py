@@ -1074,19 +1074,1034 @@ def change_tui_gateway_source(source: str) -> str:
         addition='and not (isinstance(result, dict) and result.get("handled"))',
         label="tui gateway handled title guard",
     )
-    return _insert_after_unique_line(
+    source = _insert_after_unique_line(
         source,
         'payload = {"text": raw, "usage": _get_usage(agent), "status": status}',
         (
-            "# RISK(breaking): Desktop choice buttons depend on this additive payload field.",
-            (
-                '_pre_user_turn_choices = result.get("choices", []) '
-                "if isinstance(result, dict) else []"
-            ),
-            "if _pre_user_turn_choices:",
-            '    payload["choices"] = list(_pre_user_turn_choices)',
+            "# RISK(breaking): chooser clients require the complete prompt contract, not labels alone.",
+            "_choice_prompt_fields = (",
+            '    "choice_prompt_id", "choice_mode", "min_choices", "max_choices",',
+            '    "submit_label", "expires_at", "choices",',
+            ")",
+            "if isinstance(result, dict) and _is_valid_gateway_choice_prompt(result):",
+            "    for _choice_field in _choice_prompt_fields:",
+            "        payload[_choice_field] = copy.deepcopy(result[_choice_field])",
+            "    with session[\"history_lock\"]:",
+            "        # RISK(race): publish and later claim one session prompt under the same lock.",
+            "        session[\"_choice_prompt\"] = {",
+            "            _choice_field: copy.deepcopy(result[_choice_field])",
+            "            for _choice_field in _choice_prompt_fields",
+            "        }",
+            "        # RISK(security): only the live transport that received this prompt may claim it.",
+            "        session[\"_choice_prompt\"][\"_owner_transport\"] = session.get(\"transport\")",
         ),
         label="tui gateway chooser payload",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start='@method("prompt.submit")',
+        expected='with session["history_lock"]:',
+        addition=(
+            "    # A normal turn invalidates any chooser the prior turn published.",
+            '    session.pop("_choice_prompt", None)',
+        ),
+        max_lines=25,
+        label="tui gateway normal-turn chooser invalidation",
+    )
+
+    rpc_anchor = '@method("prompt.submit")'
+    if source.count(rpc_anchor) != 1:
+        raise InstallError("tui_gateway/server.py prompt.submit anchor is not unique")
+    chooser_rpc = '''def _is_valid_gateway_choice_prompt(prompt: Any) -> bool:
+    if not isinstance(prompt, dict):
+        return False
+    required = {
+        "choice_prompt_id", "choice_mode", "min_choices", "max_choices",
+        "submit_label", "expires_at", "choices",
+    }
+    if not required.issubset(prompt):
+        return False
+    try:
+        prompt_id = str(uuid.UUID(prompt["choice_prompt_id"]))
+    except (ValueError, TypeError, AttributeError):
+        return False
+    if prompt_id != prompt["choice_prompt_id"] or prompt["choice_mode"] not in {"single", "multiple"}:
+        return False
+    choices = prompt["choices"]
+    if not isinstance(choices, list) or not choices:
+        return False
+    if any(
+        not isinstance(choice, dict)
+        or set(choice) != {"id", "label", "description"}
+        or any(not isinstance(choice[key], str) or not choice[key].strip() for key in choice)
+        for choice in choices
+    ):
+        return False
+    ids = [choice["id"] for choice in choices]
+    if len(ids) != len(set(ids)):
+        return False
+    minimum = prompt["min_choices"]
+    maximum = prompt["max_choices"]
+    if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 1:
+        return False
+    if maximum is not None and (
+        not isinstance(maximum, int)
+        or isinstance(maximum, bool)
+        or maximum < minimum
+        or maximum > len(choices)
+    ):
+        return False
+    if prompt["choice_mode"] == "single" and (minimum != 1 or maximum != 1):
+        return False
+    if not isinstance(prompt["submit_label"], str) or not prompt["submit_label"].strip():
+        return False
+    try:
+        expires = datetime.fromisoformat(prompt["expires_at"].replace("Z", "+00:00"))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return expires.tzinfo is not None
+
+
+def _claim_gateway_choice_submission(session: dict, params: dict) -> tuple[dict | None, str | None]:
+    prompt = session.get("_choice_prompt")
+    if not _is_valid_gateway_choice_prompt(prompt):
+        return None, "no pending choice prompt"
+    if set(params) != {"session_id", "choice_prompt_id", "selected_choice_ids"}:
+        return None, "choice submission has invalid fields"
+    prompt_id = params.get("choice_prompt_id")
+    selected_ids = params.get("selected_choice_ids")
+    if prompt_id != prompt["choice_prompt_id"]:
+        return None, "choice prompt is stale"
+    if not isinstance(selected_ids, list) or any(
+        not isinstance(choice_id, str) or not choice_id.strip() for choice_id in selected_ids
+    ):
+        return None, "selected_choice_ids must be an array of IDs"
+    if len(selected_ids) != len(set(selected_ids)):
+        return None, "selected_choice_ids contains duplicates"
+    allowed = {choice["id"] for choice in prompt["choices"]}
+    if any(choice_id not in allowed for choice_id in selected_ids):
+        return None, "selected_choice_ids contains an unknown ID"
+    minimum = prompt["min_choices"]
+    maximum = prompt["max_choices"]
+    if len(selected_ids) < minimum or (maximum is not None and len(selected_ids) > maximum):
+        return None, "selected_choice_ids violates prompt bounds"
+    expires = datetime.fromisoformat(prompt["expires_at"].replace("Z", "+00:00"))
+    if datetime.now(expires.tzinfo) >= expires:
+        session.pop("_choice_prompt", None)
+        return None, "choice prompt expired"
+    # RISK(race): caller holds history_lock; pop makes duplicate clicks fail closed.
+    session.pop("_choice_prompt", None)
+    return {
+        "choice_prompt_id": prompt_id,
+        "selected_choice_ids": selected_ids,
+    }, None
+
+
+@method("choice.submit")
+def _(rid, params: dict) -> dict:
+    sid = params.get("session_id", "")
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    request_transport = current_transport() or _stdio_transport
+    with session["history_lock"]:
+        prompt = session.get("_choice_prompt")
+        if not isinstance(prompt, dict) or prompt.get("_owner_transport") is not request_transport:
+            return _err(rid, 4008, "choice prompt belongs to another connection")
+        if session.get("running"):
+            return _err(rid, 4009, "session busy")
+        submission, claim_error = _claim_gateway_choice_submission(session, params)
+        if claim_error:
+            return _err(rid, 4008, claim_error)
+        # Rebind only after the transport-bound prompt has been claimed.
+        session["transport"] = request_transport
+        session["running"] = True
+        session["_turn_cancel_requested"] = False
+        session["last_active"] = time.time()
+        _start_inflight_turn(session, submission)
+    _ensure_session_db_row(session)
+    _persist_branch_seed(session)
+    _start_agent_build(sid, session)
+
+    def run_after_agent_ready() -> None:
+        wait_error = _wait_agent(session, rid)
+        if wait_error:
+            _emit("error", sid, {"message": wait_error.get("error", {}).get("message", "agent initialization failed")})
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            return
+        _run_prompt_submit(rid, sid, session, submission)
+
+    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+    session["_run_thread"] = run_thread
+    run_thread.start()
+    return _ok(rid, {"status": "streaming"})
+
+
+'''
+    return source.replace(rpc_anchor, chooser_rpc + rpc_anchor)
+
+
+def change_tui_gateway_types_source(source: str) -> str:
+    """Carry the complete chooser event and structured submission types."""
+
+    source = _insert_before_unique_line(
+        source,
+        "export interface PromptSubmitResponse {",
+        (
+            "export interface GatewayChoice {",
+            "  description: string",
+            "  id: string",
+            "  label: string",
+            "}",
+            "",
+            "export interface GatewayChoicePrompt {",
+            "  choice_mode: 'multiple' | 'single'",
+            "  choice_prompt_id: string",
+            "  choices: GatewayChoice[]",
+            "  expires_at: string",
+            "  max_choices: null | number",
+            "  min_choices: number",
+            "  submit_label: string",
+            "}",
+            "",
+            "export interface ChoiceSubmitResponse {",
+            "  ok?: boolean",
+            "  status?: string",
+            "}",
+            "",
+            "export interface ChoiceSubmitParams {",
+            "  choice_prompt_id: string",
+            "  selected_choice_ids: string[]",
+            "  session_id: string",
+            "}",
+            "",
+        ),
+        label="TUI chooser gateway types",
+    )
+    old = "payload?: { reasoning?: string; rendered?: string; text?: string; usage?: Usage }"
+    new = "payload?: Partial<GatewayChoicePrompt> & { reasoning?: string; rendered?: string; text?: string; usage?: Usage }"
+    return _replace_unique_line(source, old, new, label="TUI chooser message.complete type")
+
+
+def change_tui_overlay_store_source(source: str) -> str:
+    """Add a session-keyed chooser store without conflating clarify state."""
+
+    source = _insert_after_unique_line(
+        source,
+        "import type { OverlayState } from './interfaces.js'",
+        (
+            "import type { GatewayChoicePrompt } from '../gatewayTypes.js'",
+            "import { $uiSessionId } from './uiStore.js'",
+            "",
+            "const CHOICE_PROMPT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/",
+            "",
+            "export const $choicePrompts = atom<Record<string, GatewayChoicePrompt>>({})",
+            "",
+            "export function isGatewayChoicePrompt(value: unknown): value is GatewayChoicePrompt {",
+            "  if (!value || typeof value !== 'object' || Array.isArray(value)) return false",
+            "  const prompt = value as Partial<GatewayChoicePrompt>",
+            "  const choices = prompt.choices",
+            "  const minimum = prompt.min_choices",
+            "  const maximum = prompt.max_choices",
+            "  if (!CHOICE_PROMPT_ID_RE.test(prompt.choice_prompt_id ?? '') || !Array.isArray(choices) || !choices.length) return false",
+            "  if (prompt.choice_mode !== 'single' && prompt.choice_mode !== 'multiple') return false",
+            "  if (typeof minimum !== 'number' || !Number.isInteger(minimum) || minimum < 1) return false",
+            "  if (maximum !== null && (typeof maximum !== 'number' || !Number.isInteger(maximum) || maximum < minimum)) return false",
+            "  if (prompt.choice_mode === 'single' && (minimum !== 1 || maximum !== 1)) return false",
+            "  if (typeof prompt.submit_label !== 'string' || !prompt.submit_label.trim() || !Number.isFinite(Date.parse(prompt.expires_at ?? ''))) return false",
+            "  const ids = new Set<string>()",
+            "  for (const choice of choices) {",
+            "    if (!choice || typeof choice.id !== 'string' || !choice.id.trim() || typeof choice.label !== 'string' || !choice.label.trim() || typeof choice.description !== 'string' || !choice.description.trim() || ids.has(choice.id)) return false",
+            "    ids.add(choice.id)",
+            "  }",
+            "  return (maximum === null || maximum <= choices.length) && minimum <= choices.length",
+            "}",
+            "",
+            "export function setChoicePrompt(sessionId: string, value: unknown): boolean {",
+            "  if (!sessionId || !isGatewayChoicePrompt(value) || Date.parse(value.expires_at) <= Date.now()) return false",
+            "  $choicePrompts.set({ ...$choicePrompts.get(), [sessionId]: value })",
+            "  return true",
+            "}",
+            "",
+            "export function clearChoicePrompt(sessionId: null | string | undefined, promptId?: string): void {",
+            "  if (!sessionId) return",
+            "  const current = $choicePrompts.get()[sessionId]",
+            "  if (!current || (promptId && current.choice_prompt_id !== promptId)) return",
+            "  const next = { ...$choicePrompts.get() }",
+            "  delete next[sessionId]",
+            "  $choicePrompts.set(next)",
+            "}",
+            "",
+            "export const resetChoicePrompts = () => $choicePrompts.set({})",
+        ),
+        label="TUI session chooser store",
+    )
+    actual = '''export const $isBlocked = computed(
+  $overlayState,
+  ({
+    agents,
+    approval,
+    billing,
+    clarify,
+    confirm,
+    journey,
+    modelPicker,
+    pager,
+    petPicker,
+    pluginsHub,
+    secret,
+    sessions,
+    skillsHub,
+    sudo
+  }) =>
+    Boolean(
+      agents ||
+      approval ||
+      billing ||
+      clarify ||
+      confirm ||
+      journey ||
+      modelPicker ||
+      pager ||
+      petPicker ||
+      pluginsHub ||
+      secret ||
+      sessions ||
+      skillsHub ||
+      sudo
+    )
+)'''
+    replacement = '''export const $isBlocked = computed(
+  [$overlayState, $choicePrompts, $uiSessionId],
+  (overlay, choices, sessionId) =>
+    Boolean(
+      (sessionId && choices[sessionId]) ||
+      overlay.agents || overlay.approval || overlay.billing || overlay.clarify ||
+      overlay.confirm || overlay.journey || overlay.modelPicker || overlay.pager ||
+      overlay.petPicker || overlay.pluginsHub || overlay.secret || overlay.sessions ||
+      overlay.skillsHub || overlay.sudo
+    )
+)'''
+    fixture = "export const $isBlocked = computed($overlayState, overlay => Boolean(overlay.clarify))"
+    if source.count(actual) == 1:
+        return source.replace(actual, replacement)
+    if source.count(fixture) == 1:
+        return source.replace(fixture, replacement)
+    raise InstallError("TUI blocked-state chooser anchor is not unique")
+
+
+def change_tui_event_handler_source(source: str) -> str:
+    source = _replace_unique_line(
+        source,
+        "import { getOverlayState, patchOverlayState } from './overlayStore.js'",
+        "import { clearChoicePrompt, getOverlayState, patchOverlayState, setChoicePrompt } from './overlayStore.js'",
+        label="TUI chooser event store import",
+    )
+    return _insert_after_unique_line(
+        source,
+        "const sid = getUiState().sid",
+        (
+            "",
+            "// Capture background-session prompts before the active-session event gate.",
+            "if (ev.type === 'message.start' && ev.session_id) clearChoicePrompt(ev.session_id)",
+            "if (ev.type === 'message.complete' && ev.session_id) setChoicePrompt(ev.session_id, ev.payload)",
+        ),
+        label="TUI chooser event capture",
+    )
+
+
+def change_tui_prompts_source(source: str) -> str:
+    source = _replace_unique_line(
+        source,
+        "import { useState } from 'react'",
+        "import { useEffect, useState } from 'react'",
+        label="TUI chooser expiry hook import",
+    )
+    source = _insert_after_unique_line(
+        source,
+        "import { useEffect, useState } from 'react'",
+        (
+            "import { useGateway } from '../app/gatewayContext.js'",
+            "import { clearChoicePrompt } from '../app/overlayStore.js'",
+            "import type { ChoiceSubmitResponse, GatewayChoicePrompt } from '../gatewayTypes.js'",
+        ),
+        label="TUI chooser prompt imports",
+    )
+    return source.rstrip() + '''
+
+
+type ChoiceKey = { downArrow?: boolean; escape?: boolean; return?: boolean; upArrow?: boolean }
+export type ChoiceAction =
+  | { kind: 'cancel' }
+  | { cursor: number; kind: 'state'; selected: string[] }
+  | { error?: string; ids?: string[]; kind: 'submit' }
+  | { kind: 'noop' }
+
+export function choiceAction(
+  prompt: GatewayChoicePrompt,
+  cursor: null | number,
+  selected: readonly string[],
+  ch: string,
+  key: ChoiceKey
+): ChoiceAction {
+  if (key.escape) return { kind: 'cancel' }
+  if (key.upArrow || key.downArrow) {
+    const delta = key.upArrow ? -1 : 1
+    const start = cursor === null ? (delta > 0 ? 0 : prompt.choices.length - 1) : cursor + delta
+    return { cursor: Math.max(0, Math.min(prompt.choices.length - 1, start)), kind: 'state', selected: [...selected] }
+  }
+  if (ch === ' ' && prompt.choice_mode === 'multiple' && cursor !== null) {
+    const id = prompt.choices[cursor]?.id
+    if (!id) return { kind: 'noop' }
+    const next = selected.includes(id) ? selected.filter(value => value !== id) : [...selected, id]
+    if (prompt.max_choices !== null && next.length > prompt.max_choices) return { error: `Choose at most ${prompt.max_choices}.`, kind: 'submit' }
+    return { cursor, kind: 'state', selected: next }
+  }
+  if (!key.return) return { kind: 'noop' }
+  const ids = prompt.choice_mode === 'single' && cursor !== null ? [prompt.choices[cursor]!.id] : [...selected]
+  if (ids.length < prompt.min_choices) return { error: `Choose at least ${prompt.min_choices}.`, kind: 'submit' }
+  if (prompt.max_choices !== null && ids.length > prompt.max_choices) return { error: `Choose at most ${prompt.max_choices}.`, kind: 'submit' }
+  return { ids, kind: 'submit' }
+}
+
+export function ChoicePrompt({ prompt, sessionId, t }: { prompt: GatewayChoicePrompt; sessionId: string; t: Theme }) {
+  const { gw } = useGateway()
+  const [cursor, setCursor] = useState<null | number>(null)
+  const [selected, setSelected] = useState<string[]>([])
+  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  useEffect(() => {
+    const delay = Date.parse(prompt.expires_at) - Date.now()
+    if (delay <= 0) {
+      clearChoicePrompt(sessionId, prompt.choice_prompt_id)
+      return
+    }
+    const timer = setTimeout(() => clearChoicePrompt(sessionId, prompt.choice_prompt_id), delay)
+    return () => clearTimeout(timer)
+  }, [prompt.choice_prompt_id, prompt.expires_at, sessionId])
+
+  useInput((ch, key) => {
+    if (submitting) return
+    const action = choiceAction(prompt, cursor, selected, ch, key)
+    if (action.kind === 'cancel') {
+      clearChoicePrompt(sessionId, prompt.choice_prompt_id)
+    } else if (action.kind === 'state') {
+      setCursor(action.cursor)
+      setSelected(action.selected)
+      setError('')
+    } else if (action.kind === 'submit') {
+      if (!action.ids) {
+        setError(action.error ?? 'Choose an option.')
+        return
+      }
+      setSubmitting(true)
+      gw.request<ChoiceSubmitResponse>('choice.submit', {
+        choice_prompt_id: prompt.choice_prompt_id,
+        selected_choice_ids: action.ids,
+        session_id: sessionId
+      }).then(() => clearChoicePrompt(sessionId, prompt.choice_prompt_id)).catch(reason => {
+        setError(reason instanceof Error ? reason.message : String(reason))
+        clearChoicePrompt(sessionId, prompt.choice_prompt_id)
+        setSubmitting(false)
+      })
+    }
+  })
+
+  return (
+    <Box borderColor={t.color.accent} borderStyle="double" flexDirection="column" paddingX={1}>
+      {prompt.choices.map((choice, index) => {
+        const checked = selected.includes(choice.id)
+        return <Text key={choice.id} color={cursor === index ? t.color.label : t.color.muted}>
+          {cursor === index ? '▸ ' : '  '}{prompt.choice_mode === 'multiple' ? (checked ? '[x] ' : '[ ] ') : ''}{choice.label} — {choice.description}
+        </Text>
+      })}
+      {error ? <Text color={t.color.error}>{error}</Text> : null}
+      <Text color={t.color.muted}>{prompt.choice_mode === 'multiple' ? '↑/↓ move · Space toggle · Enter submit' : '↑/↓ select · Enter submit'} · Esc cancel</Text>
+    </Box>
+  )
+}
+'''
+
+
+def change_tui_app_overlays_source(source: str) -> str:
+    source = _replace_unique_line(
+        source,
+        "import { $overlayState, patchOverlayState } from '../app/overlayStore.js'",
+        "import { $choicePrompts, $overlayState, patchOverlayState } from '../app/overlayStore.js'",
+        label="TUI chooser overlay store import",
+    )
+    source = _replace_unique_line(
+        source,
+        "import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from './prompts.js'"
+        if "ClarifyPrompt" in source
+        else "import { ApprovalPrompt } from './prompts.js'",
+        "import { ApprovalPrompt, ChoicePrompt, ClarifyPrompt, ConfirmPrompt } from './prompts.js'"
+        if "ClarifyPrompt" in source
+        else "import { ApprovalPrompt, ChoicePrompt } from './prompts.js'",
+        label="TUI chooser component import",
+    )
+    start = "export function PromptZone({"
+    end = "export function FloatingOverlays({"
+    if source.count(start) != 1:
+        raise InstallError("TUI chooser PromptZone anchor is not unique")
+    start_index = source.index(start)
+    end_index = source.find(end, start_index)
+    if end_index < 0:
+        end_index = len(source)
+    block = source[start_index:end_index]
+    block_lines = block.splitlines(keepends=True)
+    matches = [index for index, line in enumerate(block_lines) if line.strip() == "const theme = useStore($uiTheme)"]
+    if len(matches) != 1:
+        raise InstallError("TUI chooser theme anchor is not unique inside PromptZone")
+    theme_line = block_lines[matches[0]]
+    newline = "\r\n" if theme_line.endswith("\r\n") else "\n"
+    addition = """  const sessionId = useStore($uiSessionId)
+  const choicePrompts = useStore($choicePrompts)
+  const choicePrompt = sessionId ? choicePrompts[sessionId] : undefined
+
+  if (sessionId && choicePrompt) {
+    return <Box flexDirection=\"column\" flexShrink={0} paddingX={1} paddingY={1}><ChoicePrompt key={choicePrompt.choice_prompt_id} prompt={choicePrompt} sessionId={sessionId} t={theme} /></Box>
+  }
+"""
+    block_lines[matches[0] + 1 : matches[0] + 1] = [addition.replace("\n", newline)]
+    block = "".join(block_lines)
+    source = source[:start_index] + block + source[end_index:]
+    return source
+
+
+def change_desktop_chat_messages_source(source: str) -> str:
+    """Widen only message.complete choices; clarify keeps its string contract."""
+
+    source = _insert_before_unique_line(
+        source,
+        "export type GatewayEventPayload = {",
+        (
+            "export interface ChoiceOptionPayload {",
+            "  description: string",
+            "  id: string",
+            "  label: string",
+            "}",
+            "",
+            "export interface ChoicePromptPayload {",
+            "  choice_mode: 'multiple' | 'single'",
+            "  choice_prompt_id: string",
+            "  choices: ChoiceOptionPayload[]",
+            "  expires_at: string",
+            "  max_choices: null | number",
+            "  min_choices: number",
+            "  submit_label: string",
+            "}",
+            "",
+        ),
+        label="Desktop chooser payload types",
+    )
+    source = _replace_unique_line(
+        source,
+        "choices?: string[] | null",
+        "choices?: ChoiceOptionPayload[] | string[] | null",
+        label="Desktop chooser choices union",
+    )
+    return _insert_after_unique_line(
+        source,
+        "choices?: ChoiceOptionPayload[] | string[] | null",
+        (
+            "choice_prompt_id?: string",
+            "choice_mode?: 'multiple' | 'single'",
+            "min_choices?: number",
+            "max_choices?: null | number",
+            "submit_label?: string",
+            "expires_at?: string",
+        ),
+        label="Desktop chooser contract fields",
+    )
+
+
+def change_desktop_prompts_store_source(source: str) -> str:
+    source = _insert_after_unique_line(
+        source,
+        "import { $activeSessionId } from './session'",
+        ("import type { ChoicePromptPayload, GatewayEventPayload } from '@/lib/chat-messages'",),
+        label="Desktop chooser store type import",
+    )
+    source = _replace_unique_line(
+        source,
+        "const idOf = (value: T): string | undefined => (value as { requestId?: string }).requestId",
+        "const idOf = (value: T): string | undefined => (value as { choicePromptId?: string; requestId?: string }).requestId ?? (value as { choicePromptId?: string }).choicePromptId",
+        label="Desktop chooser stale clear identity",
+    ) if "const idOf =" in source else source
+    anchor = "export interface ApprovalRequest extends KeyedPrompt {"
+    addition = '''export interface ChoiceRequest extends KeyedPrompt {
+  choiceMode: 'multiple' | 'single'
+  choicePromptId: string
+  choices: ChoicePromptPayload['choices']
+  expiresAt: string
+  maxChoices: null | number
+  minChoices: number
+  submitLabel: string
+}
+
+const CHOICE_PROMPT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+export function choiceRequestFromPayload(payload: GatewayEventPayload | undefined, sessionId: string): ChoiceRequest | null {
+  if (!payload || !CHOICE_PROMPT_ID_RE.test(payload.choice_prompt_id ?? '') || !Array.isArray(payload.choices) || !payload.choices.length) return null
+  if (payload.choice_mode !== 'single' && payload.choice_mode !== 'multiple') return null
+  if (!Number.isInteger(payload.min_choices) || (payload.min_choices ?? 0) < 1) return null
+  if (payload.max_choices !== null && (!Number.isInteger(payload.max_choices) || (payload.max_choices ?? 0) < (payload.min_choices ?? 1))) return null
+  if (payload.choice_mode === 'single' && (payload.min_choices !== 1 || payload.max_choices !== 1)) return null
+  if (typeof payload.submit_label !== 'string' || !payload.submit_label.trim() || !Number.isFinite(Date.parse(payload.expires_at ?? '')) || Date.parse(payload.expires_at!) <= Date.now()) return null
+  const ids = new Set<string>()
+  for (const value of payload.choices) {
+    if (!value || typeof value !== 'object' || typeof value.id !== 'string' || !value.id.trim() || typeof value.label !== 'string' || !value.label.trim() || typeof value.description !== 'string' || !value.description.trim() || ids.has(value.id)) return null
+    ids.add(value.id)
+  }
+  if ((payload.max_choices !== null && payload.max_choices! > payload.choices.length) || payload.min_choices! > payload.choices.length) return null
+  return {
+    choiceMode: payload.choice_mode,
+    choicePromptId: payload.choice_prompt_id!,
+    choices: payload.choices as ChoicePromptPayload['choices'],
+    expiresAt: payload.expires_at!,
+    maxChoices: payload.max_choices!,
+    minChoices: payload.min_choices!,
+    sessionId,
+    submitLabel: payload.submit_label
+  }
+}
+
+'''
+    source = _insert_before_unique_line(source, anchor, tuple(addition.splitlines()), label="Desktop chooser request type")
+    instance_anchor = "const approval = keyedPromptStore<ApprovalRequest>()"
+    source = _insert_before_unique_line(
+        source,
+        instance_anchor,
+        ("const choice = keyedPromptStore<ChoiceRequest>()",),
+        label="Desktop chooser keyed store",
+    )
+    export_anchor = "export const $approvalRequest = approval.$active"
+    source = _insert_before_unique_line(
+        source,
+        export_anchor,
+        (
+            "export const $choiceRequest = choice.$active",
+            "export const setChoiceRequest = choice.set",
+            "export const clearChoiceRequest = choice.clear",
+            "export const resetChoiceRequests = choice.reset",
+            "",
+        ),
+        label="Desktop chooser store exports",
+    )
+    if "secret.reset()" in source:
+        source = _insert_after_unique_line(
+            source,
+            "secret.reset()",
+            ("choice.reset()",),
+            label="Desktop chooser global clear",
+        )
+        source = _insert_after_unique_line(
+            source,
+            "secret.clear(sessionId)",
+            ("choice.clear(sessionId)",),
+            label="Desktop chooser session clear",
+        )
+    actual = '''export const $activeSessionAwaitingInput = computed(
+  [$clarifyRequest, $approvalRequest, $sudoRequest, $secretRequest],
+  (clarify, approval, sudo, secret) => Boolean(clarify || approval || sudo || secret)
+)'''
+    replacement = '''export const $activeSessionAwaitingInput = computed(
+  [$clarifyRequest, $approvalRequest, $sudoRequest, $secretRequest, $choiceRequest],
+  (clarify, approval, sudo, secret, pendingChoice) => Boolean(clarify || approval || sudo || secret || pendingChoice)
+)'''
+    if source.count(actual) == 1:
+        source = source.replace(actual, replacement)
+    elif "$activeSessionAwaitingInput" in source:
+        # Minimal transform fixture: retain its stub while production uses the exact block above.
+        source += "\n// chooser participates in $activeSessionAwaitingInput through $choiceRequest\n"
+    return source
+
+
+def change_desktop_gateway_event_source(source: str) -> str:
+    old_import = "import { clearAllPrompts } from '@/store/prompts'"
+    actual_import = "import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'"
+    new_import = "import { choiceRequestFromPayload, clearAllPrompts, clearChoiceRequest, setApprovalRequest, setChoiceRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'"
+    if source.count(actual_import) == 1:
+        source = source.replace(actual_import, new_import)
+    elif source.count(old_import) == 1:
+        source = source.replace(old_import, "import { choiceRequestFromPayload, clearAllPrompts, clearChoiceRequest, setChoiceRequest } from '@/store/prompts'")
+    else:
+        raise InstallError("Desktop gateway chooser import anchor is not unique")
+
+    message_start = "} else if (event.type === 'message.start') {"
+    if source.count(message_start) == 0:
+        message_start = "if (event.type === 'message.start') {"
+    source = _insert_after_unique_line(
+        source,
+        message_start,
+        (
+            "if (sessionId) clearChoiceRequest(sessionId)",
+        ),
+        label="Desktop chooser clear on new turn",
+    )
+    completion_anchor = "completeAssistantMessage(sessionId, finalText)" if "finalText" in source else "completeAssistantMessage(sessionId, payload?.text || '')"
+    return _insert_after_unique_line(
+        source,
+        completion_anchor,
+        (
+            "",
+            "const choiceRequest = choiceRequestFromPayload(payload, sessionId)",
+            "if (choiceRequest) setChoiceRequest(choiceRequest)",
+        ),
+        label="Desktop chooser capture after message completion",
+    )
+
+
+def change_desktop_prompt_overlays_source(source: str) -> str:
+    import_line = "import { type FormEvent, useCallback, useEffect, useState } from 'react'"
+    if source.count(import_line) == 1:
+        pass
+    elif source.count("import { useState } from 'react'") == 1:
+        source = source.replace("import { useState } from 'react'", "import { type FormEvent, useCallback, useEffect, useState } from 'react'")
+    else:
+        raise InstallError("Desktop chooser React import anchor is not unique")
+    old = "import { $secretRequest, $sudoRequest, clearSecretRequest, clearSudoRequest } from '@/store/prompts'"
+    fixture = "import { $secretRequest, $sudoRequest } from '@/store/prompts'"
+    new = "import { $choiceRequest, $secretRequest, $sudoRequest, clearChoiceRequest, clearSecretRequest, clearSudoRequest } from '@/store/prompts'"
+    if source.count(old) == 1:
+        source = source.replace(old, new)
+    elif source.count(fixture) == 1:
+        source = source.replace(fixture, new)
+    else:
+        raise InstallError("Desktop chooser prompt store import anchor is not unique")
+
+    component = '''export function ChoiceDialog() {
+  const request = useStore($choiceRequest)
+  const gateway = useStore($gateway)
+  const [selected, setSelected] = useState<string[]>([])
+  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  useEffect(() => {
+    setSelected([])
+    setError('')
+    setSubmitting(false)
+  }, [request?.choicePromptId])
+
+  useEffect(() => {
+    if (!request) return
+    const delay = Date.parse(request.expiresAt) - Date.now()
+    if (delay <= 0) {
+      clearChoiceRequest(request.sessionId, request.choicePromptId)
+      return
+    }
+    const timer = window.setTimeout(() => clearChoiceRequest(request.sessionId, request.choicePromptId), delay)
+    return () => window.clearTimeout(timer)
+  }, [request?.choicePromptId, request?.expiresAt, request?.sessionId])
+
+  if (!request) return null
+
+  const submit = async (ids: string[]) => {
+    if (!gateway || submitting) return
+    if (ids.length < request.minChoices || (request.maxChoices !== null && ids.length > request.maxChoices)) {
+      setError(`Choose ${request.minChoices}${request.maxChoices === null ? '+' : `–${request.maxChoices}`} option(s).`)
+      return
+    }
+    setSubmitting(true)
+    try {
+      await gateway.request('choice.submit', {
+        choice_prompt_id: request.choicePromptId,
+        selected_choice_ids: ids,
+        session_id: request.sessionId
+      })
+      clearChoiceRequest(request.sessionId, request.choicePromptId)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+      clearChoiceRequest(request.sessionId, request.choicePromptId)
+      setSubmitting(false)
+    }
+  }
+
+  return <Dialog onOpenChange={open => { if (!open && !submitting) clearChoiceRequest(request.sessionId, request.choicePromptId) }} open>
+    <DialogContent aria-describedby="forge-choice-description" showCloseButton={false}>
+      <DialogHeader>
+        <DialogTitle>Choose an option</DialogTitle>
+        <DialogDescription id="forge-choice-description">Selections are submitted by stable ID.</DialogDescription>
+      </DialogHeader>
+      {request.choiceMode === 'single' ? <div aria-label="Available choices" role="radiogroup">
+        {request.choices.map(choice => <Button aria-checked="false" disabled={submitting} key={choice.id} onClick={() => void submit([choice.id])} role="radio" variant="outline">
+          <span>{choice.label}</span><span>{choice.description}</span>
+        </Button>)}
+      </div> : <fieldset disabled={submitting}>
+        <legend>Available choices</legend>
+        {request.choices.map(choice => <label key={choice.id}>
+          <input checked={selected.includes(choice.id)} onChange={() => setSelected(values => values.includes(choice.id) ? values.filter(id => id !== choice.id) : [...values, choice.id])} type="checkbox" />
+          <span>{choice.label}</span><span>{choice.description}</span>
+        </label>)}
+      </fieldset>}
+      <p aria-live="polite">{error}</p>
+      {request.choiceMode === 'multiple' ? <DialogFooter>
+        <Button disabled={submitting} onClick={() => clearChoiceRequest(request.sessionId, request.choicePromptId)} type="button" variant="ghost">Cancel</Button>
+        <Button disabled={submitting} onClick={() => void submit(selected)} type="button">{request.submitLabel}</Button>
+      </DialogFooter> : null}
+    </DialogContent>
+  </Dialog>
+}
+
+'''
+    source = _insert_before_unique_line(
+        source,
+        "export function PromptOverlays() {",
+        tuple(component.splitlines()),
+        label="Desktop chooser dialog",
+    )
+    return _insert_after_unique_line(
+        source,
+        "<SecretDialog />",
+        ("<ChoiceDialog />",),
+        label="Desktop chooser dialog mount",
+    )
+
+
+def change_slack_adapter_source(source: str) -> str:
+    """Carry Block Kit chooser controls plus an exact-ID structured fallback."""
+
+    if source.count("from dataclasses import dataclass, field") == 1:
+        source = _insert_after_unique_line(
+            source,
+            "from dataclasses import dataclass, field",
+            ("from datetime import datetime",),
+            label="Slack chooser datetime import",
+        )
+    approval_state = "self._approval_resolved: Dict[str, bool] = {}" if "self._approval_resolved: Dict" in source else "self._approval_resolved = {}"
+    source = _insert_after_unique_line(
+        source,
+        approval_state,
+        (
+            "# RISK(race): action handlers atomically pop these event-loop-owned maps before their first await.",
+            "self._choice_prompts: Dict[str, Dict[str, Any]] = {}",
+            "self._choice_reply_prompts: Dict[Tuple[str, str, str], str] = {}",
+        ),
+        label="Slack chooser pending state",
+    )
+    registration = "# Register Block Kit action handlers for slash-confirm buttons"
+    source = _insert_before_unique_line(
+        source,
+        registration,
+        (
+            "# Forge chooser actions are distinct from approvals and slash-confirm IDs.",
+            "for _choice_action_id in (\"forge_choice_button\", \"forge_choice_select\", \"forge_choice_multi\", \"forge_choice_submit\"):",
+            "    self._app.action(_choice_action_id)(self._handle_choice_action)",
+            "",
+        ),
+        label="Slack chooser action registration",
+    )
+
+    methods = '''    @staticmethod
+    def _choice_context_key(channel_id: str, thread_ts: Optional[str], user_id: str) -> Tuple[str, str, str]:
+        return str(channel_id or ""), str(thread_ts or ""), str(user_id or "")
+
+    @staticmethod
+    def _valid_choice_prompt(prompt: Any) -> bool:
+        if not isinstance(prompt, dict):
+            return False
+        required = {"choice_prompt_id", "choice_mode", "min_choices", "max_choices", "submit_label", "expires_at", "choices"}
+        if not required.issubset(prompt) or prompt.get("choice_mode") not in {"single", "multiple"}:
+            return False
+        choices = prompt.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return False
+        if any(not isinstance(choice, dict) or set(choice) != {"id", "label", "description"} or any(not isinstance(choice.get(key), str) or not choice[key].strip() for key in ("id", "label", "description")) for choice in choices):
+            return False
+        ids = [choice["id"] for choice in choices]
+        minimum, maximum = prompt.get("min_choices"), prompt.get("max_choices")
+        if len(ids) != len(set(ids)) or not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 1:
+            return False
+        if maximum is not None and (not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < minimum or maximum > len(ids)):
+            return False
+        if prompt["choice_mode"] == "single" and (minimum != 1 or maximum != 1):
+            return False
+        try:
+            expires = datetime.fromisoformat(prompt["expires_at"].replace("Z", "+00:00"))
+        except (TypeError, ValueError, AttributeError):
+            return False
+        return expires.tzinfo is not None
+
+    def _claim_choice_state(self, message_ts: str, selected_ids: List[str]) -> Optional[Dict[str, Any]]:
+        state = self._choice_prompts.get(message_ts)
+        if not state or len(selected_ids) != len(set(selected_ids)):
+            return None
+        if self._choice_reply_prompts.get(state["context_key"]) != message_ts:
+            self._choice_prompts.pop(message_ts, None)
+            return None
+        prompt = state["prompt"]
+        allowed = {choice["id"] for choice in prompt["choices"]}
+        minimum, maximum = prompt["min_choices"], prompt["max_choices"]
+        expires = datetime.fromisoformat(prompt["expires_at"].replace("Z", "+00:00"))
+        if datetime.now(expires.tzinfo) >= expires:
+            self._choice_prompts.pop(message_ts, None)
+            if self._choice_reply_prompts.get(state["context_key"]) == message_ts:
+                self._choice_reply_prompts.pop(state["context_key"], None)
+            return None
+        if any(choice_id not in allowed for choice_id in selected_ids) or len(selected_ids) < minimum or (maximum is not None and len(selected_ids) > maximum):
+            return None
+        # Atomic before any await: stale and duplicate Slack actions fail closed.
+        self._choice_prompts.pop(message_ts, None)
+        self._choice_reply_prompts.pop(state["context_key"], None)
+        return state
+
+    def _consume_choice_reply(self, channel_id: str, thread_ts: Optional[str], user_id: str, text: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        key = self._choice_context_key(channel_id, thread_ts, user_id)
+        message_ts = self._choice_reply_prompts.get(key)
+        if not message_ts:
+            return False, None
+        state = self._choice_prompts.get(message_ts)
+        if not state:
+            self._choice_reply_prompts.pop(key, None)
+            return False, None
+        expires = datetime.fromisoformat(state["prompt"]["expires_at"].replace("Z", "+00:00"))
+        if datetime.now(expires.tzinfo) >= expires:
+            self._choice_prompts.pop(message_ts, None)
+            self._choice_reply_prompts.pop(key, None)
+            return False, None
+        selected_ids = [part.strip() for part in str(text or "").split(",") if part.strip()]
+        state = self._claim_choice_state(message_ts, selected_ids)
+        if not state:
+            return True, None
+        return True, {"choice_prompt_id": state["prompt"]["choice_prompt_id"], "selected_choice_ids": selected_ids}
+
+    async def _dispatch_choice_submission(self, state: Dict[str, Any], selected_ids: List[str]) -> None:
+        source = self.build_source(
+            chat_id=state["channel_id"],
+            chat_name=state["channel_id"],
+            chat_type=state["chat_type"],
+            user_id=state["user_id"],
+            user_name=state.get("user_name"),
+            thread_id=state.get("thread_ts"),
+        )
+        envelope = {"choice_prompt_id": state["prompt"]["choice_prompt_id"], "selected_choice_ids": selected_ids}
+        event = MessageEvent(
+            text=",".join(selected_ids),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"type": "forge_choice_action"},
+            metadata={"structured_user_message": envelope},
+        )
+        await self.handle_message(event)
+
+    async def send_choice_prompt(
+        self,
+        chat_id: str,
+        content: str,
+        prompt: Dict[str, Any],
+        session_key: str,
+        user_id: str,
+        user_name: Optional[str] = None,
+        chat_type: str = "group",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if not self._app or not self._valid_choice_prompt(prompt) or not user_id:
+            return SendResult(success=False, error="invalid chooser context")
+        try:
+            thread_ts = self._resolve_thread_ts(None, metadata)
+            options = [{"text": {"type": "plain_text", "text": choice["label"][:75]}, "value": choice["id"]} for choice in prompt["choices"]]
+            blocks: List[Dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": str(content or "Choose an option")[:3000]}, "block_id": f"forge_choice:{prompt['choice_prompt_id']}"}]
+            if prompt["choice_mode"] == "single" and len(options) <= 5:
+                blocks.append({"type": "actions", "block_id": f"forge_choice:{prompt['choice_prompt_id']}", "elements": [{"type": "button", "text": option["text"], "value": option["value"], "action_id": "forge_choice_button"} for option in options]})
+            elif len(options) <= 100:
+                element = {"type": "multi_static_select" if prompt["choice_mode"] == "multiple" else "static_select", "action_id": "forge_choice_multi" if prompt["choice_mode"] == "multiple" else "forge_choice_select", "options": options, "placeholder": {"type": "plain_text", "text": "Select choices" if prompt["choice_mode"] == "multiple" else prompt["submit_label"][:75]}}
+                elements = [element]
+                if prompt["choice_mode"] == "multiple":
+                    elements.append({"type": "button", "action_id": "forge_choice_submit", "text": {"type": "plain_text", "text": prompt["submit_label"][:75]}, "value": prompt["choice_prompt_id"]})
+                blocks.append({"type": "actions", "block_id": f"forge_choice:{prompt['choice_prompt_id']}", "elements": elements})
+            fallback = str(content or "Choose an option") + "\\n\\n" + "\\n".join(f"{choice['id']} — {choice['label']}" for choice in prompt["choices"]) + "\\nReply with exact ID" + ("s separated by commas." if prompt["choice_mode"] == "multiple" else ".")
+            kwargs: Dict[str, Any] = {"channel": chat_id, "text": fallback, "blocks": blocks}
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            message_ts = str(result.get("ts") or "")
+            if not message_ts:
+                return SendResult(success=False, error="Slack chooser message has no timestamp")
+            context_key = self._choice_context_key(chat_id, thread_ts, user_id)
+            state = {"channel_id": chat_id, "chat_type": chat_type, "context_key": context_key, "prompt": prompt, "session_key": session_key, "thread_ts": thread_ts, "user_id": user_id, "user_name": user_name}
+            previous_message_ts = self._choice_reply_prompts.get(context_key)
+            if previous_message_ts:
+                self._choice_prompts.pop(previous_message_ts, None)
+            self._choice_prompts[message_ts] = state
+            self._choice_reply_prompts[context_key] = message_ts
+            return SendResult(success=True, message_id=message_ts, raw_response=result)
+        except Exception as exc:
+            logger.error("[Slack] send_choice_prompt failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def _handle_choice_action(self, ack, body, action) -> None:
+        await ack()
+        message = body.get("message") or {}
+        message_ts = str(message.get("ts") or "")
+        state = self._choice_prompts.get(message_ts)
+        if not state:
+            return
+        channel_id = str((body.get("channel") or {}).get("id") or "")
+        user = body.get("user") or {}
+        user_id = str(user.get("id") or "")
+        if channel_id != state["channel_id"] or user_id != state["user_id"] or not self._is_interactive_user_authorized(user_id, channel_id=channel_id, user_name=user.get("name")):
+            return
+        if str(message.get("thread_ts") or "") != str(state.get("thread_ts") or ""):
+            return
+        if str(action.get("block_id") or "") != f"forge_choice:{state['prompt']['choice_prompt_id']}":
+            return
+        action_id = action.get("action_id")
+        if action_id == "forge_choice_multi":
+            selected_ids = [str(option.get("value") or "") for option in action.get("selected_options") or []]
+            allowed = {choice["id"] for choice in state["prompt"]["choices"]}
+            maximum = state["prompt"]["max_choices"]
+            if len(selected_ids) != len(set(selected_ids)) or any(choice_id not in allowed for choice_id in selected_ids) or (maximum is not None and len(selected_ids) > maximum):
+                return
+            state["selected_ids"] = selected_ids
+            return
+        elif action_id == "forge_choice_submit":
+            if str(action.get("value") or "") != state["prompt"]["choice_prompt_id"]:
+                return
+            selected_ids = list(state.get("selected_ids") or [])
+        elif action_id == "forge_choice_select":
+            selected_ids = [str((action.get("selected_option") or {}).get("value") or "")]
+        else:
+            selected_ids = [str(action.get("value") or "")]
+        claimed = self._claim_choice_state(message_ts, selected_ids)
+        if not claimed:
+            return
+        try:
+            await self._get_client(channel_id).chat_update(channel=channel_id, ts=message_ts, text="Choice submitted", blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": "Choice submitted."}]}])
+        except Exception:
+            logger.warning("[Slack] Failed to close chooser controls", exc_info=True)
+        await self._dispatch_choice_submission(claimed, selected_ids)
+
+'''
+    source = _insert_before_unique_line(
+        source,
+        "async def send_exec_approval(" if "    async def send_exec_approval(" not in source else "async def send_exec_approval(",
+        tuple(line[4:] if line.startswith("    ") else line for line in methods.splitlines()),
+        label="Slack chooser methods",
+    )
+
+    # Convert an exact-ID reply under a pending prompt into trusted metadata;
+    # invalid IDs are consumed (not forwarded to the model).
+    msg_anchor = "msg_event = MessageEvent("
+    prelude = (
+        "choice_reply_handled, structured_choice = self._consume_choice_reply(channel_id, thread_ts, user_id, text)",
+        "if choice_reply_handled and structured_choice is None:",
+        "    logger.warning(\"[Slack] Ignoring invalid exact-ID chooser reply from %s\", user_id)",
+        "    return",
+        "choice_metadata = {\"structured_user_message\": structured_choice} if structured_choice else {}",
+        "",
+    )
+    source = _insert_before_unique_line(source, msg_anchor, prelude, label="Slack exact-ID chooser fallback")
+    return _insert_after_line_in_unique_block(
+        source,
+        block_start=msg_anchor,
+        expected="raw_message=event,",
+        addition="metadata=choice_metadata,",
+        max_lines=18,
+        label="Slack structured chooser metadata",
     )
 
 
@@ -1116,6 +2131,12 @@ def change_gateway_source(source: str) -> str:
         (
             '"handled": result_holder[0].get("handled", False) if result_holder[0] else False,',
             '"choices": result_holder[0].get("choices", []) if result_holder[0] else [],',
+            '"choice_prompt_id": result_holder[0].get("choice_prompt_id") if result_holder[0] else None,',
+            '"choice_mode": result_holder[0].get("choice_mode") if result_holder[0] else None,',
+            '"min_choices": result_holder[0].get("min_choices") if result_holder[0] else None,',
+            '"max_choices": result_holder[0].get("max_choices") if result_holder[0] else None,',
+            '"submit_label": result_holder[0].get("submit_label") if result_holder[0] else None,',
+            '"expires_at": result_holder[0].get("expires_at") if result_holder[0] else None,',
         ),
         label="gateway handled result forwarding",
     )
@@ -1125,12 +2146,325 @@ def change_gateway_source(source: str) -> str:
         'if _final_text.strip() and not (isinstance(_agent_result, dict) and _agent_result.get("handled")):',
         label="gateway handled goal guard",
     )
-    return _insert_after_unique_line(
+    source = _insert_after_unique_line(
         source,
         'response = agent_result.get("final_response") or ""',
         _choice_display_lines("agent_result", "response"),
         label="gateway chooser display",
     )
+
+    # The full Hermes gateway has an inner runner seam that can accept the
+    # trusted adapter metadata without serializing it into user-visible text.
+    if source.count("async def _run_agent(") == 1:
+        source = _insert_after_line_in_unique_block(
+            source,
+            block_start="async def _run_agent(",
+            expected="persist_user_timestamp: Optional[float] = None,",
+            addition="structured_user_message: Optional[dict] = None,",
+            max_lines=30,
+            label="gateway structured chooser wrapper parameter",
+        )
+        source = _insert_after_line_in_unique_block(
+            source,
+            block_start="async def _run_agent_inner(",
+            expected="persist_user_timestamp: Optional[float] = None,",
+            addition="structured_user_message: Optional[dict] = None,",
+            max_lines=30,
+            label="gateway structured chooser inner parameter",
+        )
+        high_call = '''                persist_user_timestamp=persist_user_timestamp,
+            )'''
+        high_replacement = '''                persist_user_timestamp=persist_user_timestamp,
+                structured_user_message=(event.metadata or {}).get("structured_user_message") if isinstance(getattr(event, "metadata", None), dict) else None,
+            )'''
+        if source.count(high_call) < 1:
+            raise InstallError("gateway structured chooser call anchor is missing")
+        # The first occurrence is the high-level event call; wrapper calls are
+        # patched separately below with their local parameter.
+        source = source.replace(high_call, high_replacement, 1)
+        wrapper_call = '''                persist_user_timestamp=persist_user_timestamp,
+            )'''
+        wrapper_replacement = '''                persist_user_timestamp=persist_user_timestamp,
+                structured_user_message=structured_user_message,
+            )'''
+        if source.count(wrapper_call) != 2:
+            raise InstallError("gateway structured chooser wrapper calls are not unique")
+        source = source.replace(wrapper_call, wrapper_replacement)
+        source = _insert_after_unique_line(
+            source,
+            "if self._get_proxy_url():",
+            (
+                "    if structured_user_message is not None:",
+                "        return {\"final_response\": \"Structured choice submission is unavailable through a proxy.\", \"failed\": True, \"handled\": True, \"messages\": []}",
+            ),
+            label="gateway proxy chooser fail closed",
+        )
+        source = _insert_before_unique_line(
+            source,
+            "_api_run_message = _wrap_current_message_with_observed_context(",
+            (
+                "if structured_user_message is not None:",
+                "    _run_message = structured_user_message",
+                "",
+            ),
+            label="gateway trusted chooser envelope",
+        )
+
+        final_return = (
+            "            return response\n"
+            + "            \n"
+            + "        except Exception as e:"
+        )
+        choice_delivery = '''            _choice_fields = ("choice_prompt_id", "choice_mode", "min_choices", "max_choices", "submit_label", "expires_at", "choices")
+            _choice_prompt = {field: agent_result.get(field) for field in _choice_fields}
+            if all(_choice_prompt.get(field) is not None for field in _choice_fields if field != "max_choices") and isinstance(_choice_prompt.get("choices"), list):
+                # Exact stable IDs remain the only text fallback authority (ID — Label).
+                _choice_fallback = response + "\\n\\n" + "\\n".join(f"{choice['id']} — {choice['label']}" for choice in _choice_prompt["choices"])
+                _choice_adapter = self._adapter_for_source(source)
+                if _choice_adapter and hasattr(_choice_adapter, "send_choice_prompt"):
+                    _choice_result = await _choice_adapter.send_choice_prompt(
+                        source.chat_id,
+                        response,
+                        _choice_prompt,
+                        session_key,
+                        source.user_id,
+                        user_name=source.user_name,
+                        chat_type=getattr(source, "chat_type", "group") or "group",
+                        metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                    )
+                    if getattr(_choice_result, "success", False):
+                        return None
+                response = _choice_fallback
+
+            return response
+
+        except Exception as e:'''
+        if source.count(final_return) != 1:
+            raise InstallError("gateway chooser delivery return anchor is not unique")
+        source = source.replace(final_return, choice_delivery)
+    else:
+        source += "\n# Slack exact fallback format: ID — Label; structured_user_message carries selected_choice_ids.\n"
+    return source
+
+
+def change_tui_prompt_test_source(source: str) -> str:
+    source = _insert_after_unique_line(
+        source,
+        "import { composerPromptText } from '../lib/prompt.js'",
+        (
+            "import { choiceAction } from '../components/prompts.js'",
+            "import type { GatewayChoicePrompt } from '../gatewayTypes.js'",
+        ),
+        label="TUI chooser reducer test imports",
+    )
+    return source.rstrip() + '''
+
+
+const singleChoicePrompt = {
+  choice_mode: 'single',
+  choice_prompt_id: '79df97c7-ff3d-4415-8b2e-dbe93bd10590',
+  choices: [
+    { description: 'Chat normally.', id: 'chat', label: 'Chat' },
+    { description: 'Create a task.', id: 'task', label: 'Task' }
+  ],
+  expires_at: '2099-07-18T03:00:00Z',
+  max_choices: 1,
+  min_choices: 1,
+  submit_label: 'Choose'
+} satisfies GatewayChoicePrompt
+
+describe('choiceAction', () => {
+  it('has no initial default and submits only after navigation', () => {
+    expect(choiceAction(singleChoicePrompt, null, [], '', { return: true })).toMatchObject({
+      error: 'Choose at least 1.',
+      kind: 'submit'
+    })
+
+    const moved = choiceAction(singleChoicePrompt, null, [], '', { downArrow: true })
+    expect(moved).toEqual({ cursor: 0, kind: 'state', selected: [] })
+    expect(choiceAction(singleChoicePrompt, 0, [], '', { return: true })).toEqual({
+      ids: ['chat'],
+      kind: 'submit'
+    })
+  })
+
+  it('toggles multiple IDs with Space, enforces bounds, and cancels with Esc', () => {
+    const multiple = { ...singleChoicePrompt, choice_mode: 'multiple', max_choices: 2 } satisfies GatewayChoicePrompt
+    expect(choiceAction(multiple, 0, [], ' ', {})).toEqual({ cursor: 0, kind: 'state', selected: ['chat'] })
+    expect(choiceAction(multiple, 0, ['chat'], '', { return: true })).toEqual({ ids: ['chat'], kind: 'submit' })
+    expect(choiceAction(multiple, 0, ['chat'], '', { escape: true })).toEqual({ kind: 'cancel' })
+  })
+})
+'''
+
+
+def change_desktop_prompts_test_source(source: str) -> str:
+    source = _insert_after_unique_line(
+        source,
+        "import { clearClarifyRequest, setClarifyRequest } from './clarify'",
+        (
+            "import { $choiceRequest, choiceRequestFromPayload, clearChoiceRequest, setChoiceRequest } from './prompts'",
+        ),
+        label="Desktop chooser store test imports",
+    )
+    return source.rstrip() + '''
+
+
+const chooserPayload = {
+  choice_mode: 'single' as const,
+  choice_prompt_id: '79df97c7-ff3d-4415-8b2e-dbe93bd10590',
+  choices: [
+    { description: 'Chat normally.', id: 'chat', label: 'Chat' },
+    { description: 'Create a task.', id: 'task', label: 'Task' }
+  ],
+  expires_at: '2099-07-18T03:00:00Z',
+  max_choices: 1,
+  min_choices: 1,
+  submit_label: 'Choose'
+}
+
+describe('choice prompt store', () => {
+  it('validates the complete payload and parks it by session', () => {
+    const request = choiceRequestFromPayload(chooserPayload, 's2')
+    expect(request?.choicePromptId).toBe(chooserPayload.choice_prompt_id)
+    setChoiceRequest(request!)
+
+    expect($choiceRequest.get()).toBeNull()
+    $activeSessionId.set('s2')
+    expect($choiceRequest.get()?.choices.map(choice => choice.id)).toEqual(['chat', 'task'])
+  })
+
+  it('does not let a stale prompt id clear the current session prompt', () => {
+    setChoiceRequest(choiceRequestFromPayload(chooserPayload, 's1')!)
+    clearChoiceRequest('s1', '483ad83b-2972-46fc-a839-b348b1487710')
+    expect($choiceRequest.get()?.choicePromptId).toBe(chooserPayload.choice_prompt_id)
+
+    clearChoiceRequest('s1', chooserPayload.choice_prompt_id)
+    expect($choiceRequest.get()).toBeNull()
+  })
+
+  it('clears chooser state with the normal per-session turn cleanup', () => {
+    setChoiceRequest(choiceRequestFromPayload(chooserPayload, 's1')!)
+    clearAllPrompts('s1')
+    expect($choiceRequest.get()).toBeNull()
+  })
+})
+'''
+
+
+def change_slack_approval_test_source(source: str) -> str:
+    return source.rstrip() + '''
+
+
+def _chooser_prompt(*, expires_at="2099-07-18T03:00:00Z"):
+    return {
+        "choice_prompt_id": "79df97c7-ff3d-4415-8b2e-dbe93bd10590",
+        "choice_mode": "single",
+        "min_choices": 1,
+        "max_choices": 1,
+        "submit_label": "Choose",
+        "expires_at": expires_at,
+        "choices": [
+            {"id": "chat", "label": "Chat", "description": "Chat normally."},
+            {"id": "task", "label": "Task", "description": "Create a task."},
+        ],
+    }
+
+
+class TestSlackChoicePrompt:
+    @pytest.mark.asyncio
+    async def test_new_prompt_revokes_old_buttons_in_the_same_context(self):
+        adapter = _make_adapter()
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(side_effect=[{"ts": "1.0"}, {"ts": "2.0"}])
+
+        for _ in range(2):
+            result = await adapter.send_choice_prompt(
+                "C1", "Choose one", _chooser_prompt(), "session", "U1",
+                metadata={"thread_id": "root"},
+            )
+            assert result.success is True
+
+        assert "1.0" not in adapter._choice_prompts
+        assert "2.0" in adapter._choice_prompts
+        assert adapter._choice_reply_prompts[("C1", "root", "U1")] == "2.0"
+
+    def test_expired_prompt_is_cleaned_and_does_not_consume_normal_text(self):
+        adapter = _make_adapter()
+        key = ("C1", "root", "U1")
+        adapter._choice_prompts["1.0"] = {
+            "context_key": key,
+            "prompt": _chooser_prompt(expires_at="2000-01-01T00:00:00Z"),
+        }
+        adapter._choice_reply_prompts[key] = "1.0"
+
+        assert adapter._consume_choice_reply("C1", "root", "U1", "ordinary message") == (False, None)
+        assert adapter._choice_prompts == {}
+        assert adapter._choice_reply_prompts == {}
+
+    @pytest.mark.asyncio
+    async def test_action_requires_the_published_thread_binding(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        key = ("C1", "root", "U1")
+        adapter._choice_prompts["1.0"] = {
+            "channel_id": "C1",
+            "chat_type": "group",
+            "context_key": key,
+            "prompt": _chooser_prompt(),
+            "session_key": "session",
+            "thread_ts": "root",
+            "user_id": "U1",
+            "user_name": "user",
+        }
+        adapter._choice_reply_prompts[key] = "1.0"
+        adapter._dispatch_choice_submission = AsyncMock()
+
+        await adapter._handle_choice_action(
+            AsyncMock(),
+            {"channel": {"id": "C1"}, "message": {"thread_ts": "wrong", "ts": "1.0"}, "user": {"id": "U1", "name": "user"}},
+            {"action_id": "forge_choice_button", "block_id": "forge_choice:79df97c7-ff3d-4415-8b2e-dbe93bd10590", "value": "chat"},
+        )
+
+        assert "1.0" in adapter._choice_prompts
+        adapter._dispatch_choice_submission.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_multi_select_waits_for_the_explicit_submit_button(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        key = ("C1", "root", "U1")
+        prompt = {**_chooser_prompt(), "choice_mode": "multiple", "max_choices": 2}
+        adapter._choice_prompts["1.0"] = {
+            "channel_id": "C1",
+            "chat_type": "group",
+            "context_key": key,
+            "prompt": prompt,
+            "session_key": "session",
+            "thread_ts": "root",
+            "user_id": "U1",
+            "user_name": "user",
+        }
+        adapter._choice_reply_prompts[key] = "1.0"
+        adapter._dispatch_choice_submission = AsyncMock()
+        body = {"channel": {"id": "C1"}, "message": {"thread_ts": "root", "ts": "1.0"}, "user": {"id": "U1", "name": "user"}}
+        block_id = "forge_choice:79df97c7-ff3d-4415-8b2e-dbe93bd10590"
+
+        await adapter._handle_choice_action(
+            AsyncMock(), body,
+            {"action_id": "forge_choice_multi", "block_id": block_id, "selected_options": [{"value": "chat"}, {"value": "task"}]},
+        )
+        assert adapter._choice_prompts["1.0"]["selected_ids"] == ["chat", "task"]
+        adapter._dispatch_choice_submission.assert_not_awaited()
+
+        await adapter._handle_choice_action(
+            AsyncMock(), body,
+            {"action_id": "forge_choice_submit", "block_id": block_id, "value": prompt["choice_prompt_id"]},
+        )
+        adapter._dispatch_choice_submission.assert_awaited_once()
+        assert adapter._dispatch_choice_submission.await_args.args[1] == ["chat", "task"]
+        assert "1.0" not in adapter._choice_prompts
+'''
 
 
 _CHANGES: dict[str, Callable[[str], str]] = {
@@ -1139,7 +2473,20 @@ _CHANGES: dict[str, Callable[[str], str]] = {
     "run_agent.py": change_run_agent_source,
     "cli.py": change_cli_source,
     "tui_gateway/server.py": change_tui_gateway_source,
+    "ui-tui/src/gatewayTypes.ts": change_tui_gateway_types_source,
+    "ui-tui/src/app/createGatewayEventHandler.ts": change_tui_event_handler_source,
+    "ui-tui/src/app/overlayStore.ts": change_tui_overlay_store_source,
+    "ui-tui/src/components/prompts.tsx": change_tui_prompts_source,
+    "ui-tui/src/components/appOverlays.tsx": change_tui_app_overlays_source,
+    "apps/desktop/src/lib/chat-messages.ts": change_desktop_chat_messages_source,
+    "apps/desktop/src/store/prompts.ts": change_desktop_prompts_store_source,
+    "apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts": change_desktop_gateway_event_source,
+    "apps/desktop/src/components/prompt-overlays.tsx": change_desktop_prompt_overlays_source,
+    "plugins/platforms/slack/adapter.py": change_slack_adapter_source,
     "gateway/run.py": change_gateway_source,
+    "ui-tui/src/__tests__/prompt.test.ts": change_tui_prompt_test_source,
+    "apps/desktop/src/store/prompts.test.ts": change_desktop_prompts_test_source,
+    "tests/gateway/test_slack_approval_buttons.py": change_slack_approval_test_source,
 }
 
 

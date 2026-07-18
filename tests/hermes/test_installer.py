@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import types
+import typing
 from pathlib import Path
 
 import pytest
@@ -224,7 +225,31 @@ def process(self, agent_message, message, stream_callback):
     return result
 '''
 
-TUI_GATEWAY_SOURCE = '''def process(agent, history, _stream, session, text, raw, status):
+TUI_GATEWAY_SOURCE = '''import copy
+import threading
+import time
+import uuid
+from datetime import datetime
+from typing import Any
+
+_METHODS = {}
+
+def method(name):
+    def register(function):
+        _METHODS[name] = function
+        return function
+    return register
+
+@method("prompt.submit")
+def prompt_submit(rid, params):
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    with session["history_lock"]:
+        session["running"] = True
+    return None
+
+def process(agent, history, _stream, session, text, raw, status):
     run_kwargs = {
         "conversation_history": list(history),
         "stream_callback": _stream,
@@ -271,6 +296,210 @@ def run(self, agent, agent_history, session_id, final_response):
     }
 '''
 
+TUI_GATEWAY_TYPES_SOURCE = """export interface PromptSubmitResponse {
+  ok?: boolean
+}
+
+export type GatewayEvent =
+  | {
+      payload?: { reasoning?: string; rendered?: string; text?: string; usage?: Usage }
+      session_id?: string
+      type: 'message.complete'
+    }
+"""
+
+TUI_EVENT_HANDLER_SOURCE = """import type { GatewayEvent } from '../gatewayTypes.js'
+import { getOverlayState, patchOverlayState } from './overlayStore.js'
+import { getUiState } from './uiStore.js'
+
+export function createGatewayEventHandler(ctx: any): (ev: GatewayEvent) => void {
+  return (ev: GatewayEvent) => {
+    const sid = getUiState().sid
+
+    if (ev.session_id && sid && ev.session_id !== sid && !ev.type.startsWith('gateway.')) {
+      return
+    }
+
+    switch (ev.type) {
+      case 'message.complete': {
+        record(ev.payload ?? {})
+        return
+      }
+    }
+  }
+}
+"""
+
+TUI_OVERLAY_STORE_SOURCE = """import { atom, computed } from 'nanostores'
+import type { OverlayState } from './interfaces.js'
+
+export const $overlayState = atom<OverlayState>({} as OverlayState)
+export const $isBlocked = computed($overlayState, overlay => Boolean(overlay.clarify))
+export const getOverlayState = () => $overlayState.get()
+export const patchOverlayState = (next: Partial<OverlayState>) => $overlayState.set({ ...$overlayState.get(), ...next })
+export const resetOverlayState = () => $overlayState.set({} as OverlayState)
+"""
+
+TUI_PROMPTS_SOURCE = """import { Box, Text, useInput } from '@hermes/ink'
+import { useState } from 'react'
+import type { Theme } from '../theme.js'
+
+export function ExistingPrompt({ t }: { t: Theme }) {
+  return <Box><Text color={t.color.text}>existing</Text></Box>
+}
+"""
+
+TUI_APP_OVERLAYS_SOURCE = """import { Box } from '@hermes/ink'
+import { useStore } from '@nanostores/react'
+import { $overlayState, patchOverlayState } from '../app/overlayStore.js'
+import { $uiSessionId, $uiTheme } from '../app/uiStore.js'
+import { ApprovalPrompt } from './prompts.js'
+
+export function PromptZone({ cols, onApprovalChoice }: any) {
+  const overlay = useStore($overlayState)
+  const theme = useStore($uiTheme)
+
+  if (overlay.approval) {
+    return <ApprovalPrompt cols={cols} onChoice={onApprovalChoice} req={overlay.approval} t={theme} />
+  }
+
+  return null
+}
+"""
+
+DESKTOP_CHAT_MESSAGES_SOURCE = """export type GatewayEventPayload = {
+  text?: string
+  request_id?: string
+  question?: string
+  choices?: string[] | null
+}
+"""
+
+DESKTOP_PROMPTS_STORE_SOURCE = """import { atom, computed, type ReadableAtom } from 'nanostores'
+import { $activeSessionId } from './session'
+
+const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
+interface KeyedPrompt { sessionId: string | null }
+function keyedPromptStore<T extends KeyedPrompt>() { return {} as any }
+export interface ApprovalRequest extends KeyedPrompt {
+  command: string
+  description: string
+}
+const approval = keyedPromptStore<ApprovalRequest>()
+const sudo = keyedPromptStore<ApprovalRequest>()
+const secret = keyedPromptStore<ApprovalRequest>()
+export const $approvalRequest = approval.$active
+export const $activeSessionAwaitingInput = computed($activeSessionId, value => Boolean(value && false))
+export function clearAllPrompts(sessionId?: string | null): void {
+  if (sessionId === undefined) {
+    approval.reset()
+    sudo.reset()
+    secret.reset()
+    return
+  }
+  approval.clear(sessionId)
+  sudo.clear(sessionId)
+  secret.clear(sessionId)
+}
+"""
+
+DESKTOP_GATEWAY_EVENT_SOURCE = """import { clearAllPrompts } from '@/store/prompts'
+
+export function onGatewayEvent(event: any, sessionId: string | null) {
+  const payload = event.payload
+  if (event.type === 'message.start') {
+    return
+  } else if (event.type === 'message.complete') {
+    if (!sessionId) return
+    clearAllPrompts(sessionId)
+    completeAssistantMessage(sessionId, payload?.text || '')
+  }
+}
+"""
+
+DESKTOP_PROMPT_OVERLAYS_SOURCE = """'use client'
+import { useStore } from '@nanostores/react'
+import { useState } from 'react'
+import { Button } from '@/components/ui/button'
+import { $gateway } from '@/store/gateway'
+import { $secretRequest, $sudoRequest } from '@/store/prompts'
+
+export function PromptOverlays() {
+  return (
+    <>
+      <SudoDialog />
+      <SecretDialog />
+    </>
+  )
+}
+"""
+
+SLACK_ADAPTER_SOURCE = """class SlackAdapter(BasePlatformAdapter):
+    def __init__(self, config):
+        super().__init__(config, Platform.SLACK)
+        self._approval_resolved = {}
+
+    async def connect(self):
+        for _action_id in (
+            "hermes_approve_once",
+            "hermes_deny",
+        ):
+            self._app.action(_action_id)(self._handle_approval_action)
+
+        # Register Block Kit action handlers for slash-confirm buttons
+
+    async def _handle_slack_message(self, event):
+        text = event.get("text", "")
+        user_id = event.get("user", "")
+        channel_id = event.get("channel", "")
+        thread_ts = event.get("thread_ts")
+        source = self.build_source(chat_id=channel_id, user_id=user_id, thread_id=thread_ts)
+        msg_event = MessageEvent(
+            text=text,
+            source=source,
+            raw_message=event,
+        )
+        await self.handle_message(msg_event)
+
+    async def send_exec_approval(
+        self, chat_id, command, session_key
+    ):
+        return SendResult(success=True)
+"""
+
+TUI_PROMPT_TEST_SOURCE = """import { describe, expect, it } from 'vitest'
+
+import { composerPromptText } from '../lib/prompt.js'
+
+describe('composerPromptText', () => {
+  it('returns a prompt', () => expect(composerPromptText('>', 'default')).toBe('>'))
+})
+"""
+
+DESKTOP_PROMPTS_TEST_SOURCE = """import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
+import { clearClarifyRequest, setClarifyRequest } from './clarify'
+import {
+  $activeSessionAwaitingInput,
+  clearAllPrompts,
+  setApprovalRequest,
+  setSecretRequest,
+  setSudoRequest
+} from './prompts'
+import { $activeSessionId } from './session'
+
+describe('existing prompts', () => {
+  it('keeps the fixture imports used', () => expect(clearAllPrompts).toBeDefined())
+})
+"""
+
+SLACK_APPROVAL_TEST_SOURCE = """import pytest
+
+
+def test_existing_slack_approval_surface():
+    assert True
+"""
+
 
 def _hermes_tree(root: Path) -> None:
     (root / "hermes_cli").mkdir(parents=True)
@@ -289,6 +518,54 @@ def _hermes_tree(root: Path) -> None:
     )
     (root / "gateway").mkdir(parents=True)
     (root / "gateway" / "run.py").write_text(GATEWAY_SOURCE, encoding="utf-8")
+    (root / "ui-tui" / "src" / "app").mkdir(parents=True)
+    (root / "ui-tui" / "src" / "components").mkdir(parents=True)
+    (root / "ui-tui" / "src" / "gatewayTypes.ts").write_text(
+        TUI_GATEWAY_TYPES_SOURCE, encoding="utf-8"
+    )
+    (root / "ui-tui" / "src" / "app" / "createGatewayEventHandler.ts").write_text(
+        TUI_EVENT_HANDLER_SOURCE, encoding="utf-8"
+    )
+    (root / "ui-tui" / "src" / "app" / "overlayStore.ts").write_text(
+        TUI_OVERLAY_STORE_SOURCE, encoding="utf-8"
+    )
+    (root / "ui-tui" / "src" / "components" / "prompts.tsx").write_text(
+        TUI_PROMPTS_SOURCE, encoding="utf-8"
+    )
+    (root / "ui-tui" / "src" / "components" / "appOverlays.tsx").write_text(
+        TUI_APP_OVERLAYS_SOURCE, encoding="utf-8"
+    )
+    (root / "apps" / "desktop" / "src" / "lib").mkdir(parents=True)
+    (root / "apps" / "desktop" / "src" / "store").mkdir(parents=True)
+    (root / "apps" / "desktop" / "src" / "app" / "session" / "hooks" / "use-message-stream").mkdir(parents=True)
+    (root / "apps" / "desktop" / "src" / "components").mkdir(parents=True)
+    (root / "apps" / "desktop" / "src" / "lib" / "chat-messages.ts").write_text(
+        DESKTOP_CHAT_MESSAGES_SOURCE, encoding="utf-8"
+    )
+    (root / "apps" / "desktop" / "src" / "store" / "prompts.ts").write_text(
+        DESKTOP_PROMPTS_STORE_SOURCE, encoding="utf-8"
+    )
+    (root / "apps" / "desktop" / "src" / "app" / "session" / "hooks" / "use-message-stream" / "gateway-event.ts").write_text(
+        DESKTOP_GATEWAY_EVENT_SOURCE, encoding="utf-8"
+    )
+    (root / "apps" / "desktop" / "src" / "components" / "prompt-overlays.tsx").write_text(
+        DESKTOP_PROMPT_OVERLAYS_SOURCE, encoding="utf-8"
+    )
+    (root / "plugins" / "platforms" / "slack").mkdir(parents=True)
+    (root / "plugins" / "platforms" / "slack" / "adapter.py").write_text(
+        SLACK_ADAPTER_SOURCE, encoding="utf-8"
+    )
+    (root / "ui-tui" / "src" / "__tests__").mkdir(parents=True, exist_ok=True)
+    (root / "ui-tui" / "src" / "__tests__" / "prompt.test.ts").write_text(
+        TUI_PROMPT_TEST_SOURCE, encoding="utf-8"
+    )
+    (root / "apps" / "desktop" / "src" / "store" / "prompts.test.ts").write_text(
+        DESKTOP_PROMPTS_TEST_SOURCE, encoding="utf-8"
+    )
+    (root / "tests" / "gateway").mkdir(parents=True, exist_ok=True)
+    (root / "tests" / "gateway" / "test_slack_approval_buttons.py").write_text(
+        SLACK_APPROVAL_TEST_SOURCE, encoding="utf-8"
+    )
 
 
 def test_carried_change_targets_user_surfaces_and_forwarder(tmp_path: Path) -> None:
@@ -304,8 +581,184 @@ def test_carried_change_targets_user_surfaces_and_forwarder(tmp_path: Path) -> N
         "run_agent.py",
         "cli.py",
         "tui_gateway/server.py",
+        "ui-tui/src/gatewayTypes.ts",
+        "ui-tui/src/app/createGatewayEventHandler.ts",
+        "ui-tui/src/app/overlayStore.ts",
+        "ui-tui/src/components/prompts.tsx",
+        "ui-tui/src/components/appOverlays.tsx",
+        "apps/desktop/src/lib/chat-messages.ts",
+        "apps/desktop/src/store/prompts.ts",
+        "apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts",
+        "apps/desktop/src/components/prompt-overlays.tsx",
+        "plugins/platforms/slack/adapter.py",
         "gateway/run.py",
+        "ui-tui/src/__tests__/prompt.test.ts",
+        "apps/desktop/src/store/prompts.test.ts",
+        "tests/gateway/test_slack_approval_buttons.py",
     }
+
+
+def test_tui_chooser_payload_is_session_keyed_and_never_becomes_prompt_text() -> None:
+    changed_types = installer.change_tui_gateway_types_source(
+        TUI_GATEWAY_TYPES_SOURCE
+    )
+    changed_handler = installer.change_tui_event_handler_source(
+        TUI_EVENT_HANDLER_SOURCE
+    )
+    changed_store = installer.change_tui_overlay_store_source(
+        TUI_OVERLAY_STORE_SOURCE
+    )
+    changed_prompts = installer.change_tui_prompts_source(TUI_PROMPTS_SOURCE)
+    changed_overlays = installer.change_tui_app_overlays_source(
+        TUI_APP_OVERLAYS_SOURCE
+    )
+
+    assert "choice_prompt_id" in changed_types
+    assert "selected_choice_ids" in changed_types
+    assert "setChoicePrompt(ev.session_id" in changed_handler
+    assert changed_handler.index("setChoicePrompt") < changed_handler.index(
+        "ev.session_id !== sid"
+    )
+    assert "Record<string, GatewayChoicePrompt>" in changed_store
+    assert "choiceAction" in changed_prompts
+    assert "choice.submit" in changed_prompts
+    assert "prompt.submit" not in changed_prompts
+    assert "ChoicePrompt" in changed_overlays
+
+
+def test_desktop_chooser_has_separate_keyed_store_and_accessible_controls() -> None:
+    changed_payload = installer.change_desktop_chat_messages_source(
+        DESKTOP_CHAT_MESSAGES_SOURCE
+    )
+    changed_store = installer.change_desktop_prompts_store_source(
+        DESKTOP_PROMPTS_STORE_SOURCE
+    )
+    changed_handler = installer.change_desktop_gateway_event_source(
+        DESKTOP_GATEWAY_EVENT_SOURCE
+    )
+    changed_overlays = installer.change_desktop_prompt_overlays_source(
+        DESKTOP_PROMPT_OVERLAYS_SOURCE
+    )
+
+    assert "ChoicePromptPayload" in changed_payload
+    assert "keyedPromptStore<ChoiceRequest>" in changed_store
+    assert "choicePromptId" in changed_store
+    assert "setChoiceRequest" in changed_handler
+    assert "clearAllPrompts(sessionId)" in changed_handler
+    assert changed_handler.index("clearAllPrompts(sessionId)") < changed_handler.index(
+        "if (choiceRequest) setChoiceRequest"
+    )
+    assert 'role="radiogroup"' in changed_overlays
+    assert 'type="checkbox"' in changed_overlays
+    assert "aria-live" in changed_overlays
+    assert "choice.submit" in changed_overlays
+    assert "prompt.submit" not in changed_overlays
+
+
+def test_tui_gateway_claims_structured_choice_once_and_rejects_invalid_ids() -> None:
+    changed = installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE)
+
+    assert '@method("choice.submit")' in changed
+    assert '"choice_prompt_id": prompt_id' in changed
+    assert '"selected_choice_ids": selected_ids' in changed
+    assert 'session.pop("_choice_prompt", None)' in changed
+    assert 'agent.run_conversation(text, **run_kwargs)' in changed
+    assert 'params.get("text")' not in changed.split('@method("choice.submit")', 1)[1]
+
+
+def test_tui_gateway_rejects_cross_transport_claim_and_normal_turn_revokes_prompt() -> None:
+    owner_transport = object()
+    attacker_transport = object()
+    session = {
+        "_choice_prompt": {
+            **_valid_cli_prompt(),
+            "_owner_transport": owner_transport,
+        },
+        "history_lock": threading.RLock(),
+        "running": False,
+    }
+    namespace: dict[str, object] = {
+        "_err": lambda rid, code, message: {"error": {"code": code, "message": message}},
+        "_sess_nowait": lambda params, rid: (session, None),
+        "_stdio_transport": object(),
+        "current_transport": lambda: attacker_transport,
+        "evaluate_goal": lambda: None,
+        "maybe_auto_title": lambda: None,
+        "_get_usage": lambda agent: {},
+    }
+    exec(installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE), namespace)
+    params = {
+        "session_id": "session-1",
+        "choice_prompt_id": session["_choice_prompt"]["choice_prompt_id"],
+        "selected_choice_ids": ["chat"],
+    }
+
+    rejected = namespace["_METHODS"]["choice.submit"]("request-1", params)
+
+    assert rejected["error"]["code"] == 4008
+    assert session["_choice_prompt"]["_owner_transport"] is owner_transport
+
+    namespace["_METHODS"]["prompt.submit"](
+        "request-2", {"session_id": "session-1", "text": "new turn"}
+    )
+    assert "_choice_prompt" not in session
+
+
+def test_slack_chooser_uses_signed_action_context_and_exact_id_fallback() -> None:
+    changed = installer.change_slack_adapter_source(SLACK_ADAPTER_SOURCE)
+    changed_gateway = installer.change_gateway_source(GATEWAY_SOURCE)
+
+    assert "forge_choice_button" in changed
+    assert "forge_choice_select" in changed
+    assert "forge_choice_multi" in changed
+    assert "forge_choice_submit" in changed
+    assert "_is_interactive_user_authorized" in changed
+    assert "structured_user_message" in changed
+    assert "selected_choice_ids" in changed
+    assert "_choice_reply_prompts" in changed
+    assert "ID — Label" in changed_gateway
+    assert "structured_user_message" in changed_gateway
+
+
+def test_slack_expired_and_superseded_prompts_do_not_consume_normal_messages() -> None:
+    changed = installer.change_slack_adapter_source(SLACK_ADAPTER_SOURCE)
+    namespace: dict[str, object] = {
+        "Any": object,
+        "BasePlatformAdapter": type("BasePlatformAdapter", (), {}),
+        "Dict": dict,
+        "List": list,
+        "MessageEvent": type("MessageEvent", (), {}),
+        "MessageType": type("MessageType", (), {"TEXT": "text"}),
+        "Optional": typing.Optional,
+        "Platform": type("Platform", (), {"SLACK": "slack"}),
+        "PlatformConfig": object,
+        "SendResult": type("SendResult", (), {}),
+        "Tuple": tuple,
+        "datetime": __import__("datetime").datetime,
+        "logger": types.SimpleNamespace(error=lambda *args, **kwargs: None),
+    }
+    exec(changed, namespace)
+    adapter = namespace["SlackAdapter"].__new__(namespace["SlackAdapter"])
+    key = ("channel", "thread", "user")
+    expired = {
+        **_valid_cli_prompt(),
+        "expires_at": "2000-01-01T00:00:00Z",
+    }
+    state = {"context_key": key, "prompt": expired}
+    adapter._choice_prompts = {"old-message": state}
+    adapter._choice_reply_prompts = {key: "old-message"}
+
+    handled, envelope = adapter._consume_choice_reply(*key, "ordinary conversation")
+
+    assert (handled, envelope) == (False, None)
+    assert adapter._choice_prompts == {}
+    assert adapter._choice_reply_prompts == {}
+
+    adapter._choice_prompts = {"stale-message": state}
+    adapter._choice_reply_prompts = {key: "new-message"}
+    assert adapter._claim_choice_state("stale-message", ["chat"]) is None
+    assert "stale-message" not in adapter._choice_prompts
+    assert adapter._choice_reply_prompts[key] == "new-message"
 
 
 def test_user_surfaces_opt_in_and_handled_turns_skip_model_followups() -> None:
@@ -931,22 +1384,35 @@ def test_tui_transports_choice_objects_in_message_payload() -> None:
         "_get_usage": lambda agent: {},
     }
     exec(installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE), namespace)
-    choices = [
-        {"id": "build", "label": "Build"},
-        {"id": "build_review", "label": "Build + Review"},
-    ]
+    prompt = {
+        **_valid_cli_prompt(),
+        "choices": [
+            {"id": "build", "label": "Build", "description": "Build only."},
+            {
+                "id": "build_review",
+                "label": "Build + Review",
+                "description": "Build and review.",
+            },
+        ],
+    }
 
     class Agent:
         @staticmethod
         def run_conversation(text, **kwargs):
             assert kwargs["is_user_turn"] is True
-            return {"final_response": "Choose checks.", "choices": choices}
+            return prompt
 
     payload = namespace["process"](
-        Agent(), [], None, {}, "request", "Choose checks.", "handled"
+        Agent(),
+        [],
+        None,
+        {"history_lock": threading.RLock(), "transport": object()},
+        "request",
+        "Choose checks.",
+        "handled",
     )
 
-    assert payload["choices"] == choices
+    assert payload["choices"] == prompt["choices"]
 
 
 def test_gateway_displays_choice_labels_without_changing_stable_ids() -> None:
