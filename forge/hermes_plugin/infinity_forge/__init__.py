@@ -510,6 +510,17 @@ def before_user_turn(
 
             pending_prompt = None
             if not is_new_session and _is_confirmation_input(submission, text):
+                if submission is not None:
+                    invalid_submission = _task_setup.invalid_submission_result(
+                        session_id,
+                        user_id,
+                        submission,
+                        now,
+                        surface=surface,
+                    )
+                    if invalid_submission is not None:
+                        _failed_inputs.pop(key, None)
+                        return _hook_result(invalid_submission)
                 pending_prompt = _task_setup.pending_choice_prompt(
                     session_id,
                     user_id,

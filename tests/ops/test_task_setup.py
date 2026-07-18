@@ -263,6 +263,26 @@ def test_structured_submission_does_not_refresh_or_apply_an_expired_prompt() -> 
     assert expired.choice_prompt == mode.choice_prompt
 
 
+def test_pending_choice_prompt_peeks_expired_prompt_without_discarding_it() -> None:
+    setup = TaskSetup()
+    mode = setup.handle("s1", "u1", "first request", NOW)
+
+    assert mode.choice_prompt is not None
+    peeked = setup.pending_choice_prompt(
+        "s1", "u1", NOW + SETUP_TIMEOUT
+    )
+    expired = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("task",)),
+        NOW + SETUP_TIMEOUT,
+    )
+
+    assert peeked == mode.choice_prompt
+    assert expired.choice_prompt == mode.choice_prompt
+    assert "expired" in str(expired.text)
+
+
 def test_new_session_discards_stale_structured_submission_before_it_can_apply() -> None:
     setup = TaskSetup()
     mode = setup.handle("s1", "u1", "first request", NOW)

@@ -445,6 +445,38 @@ def test_capacity_rejection_replays_the_same_structured_confirmation_prompt(
     )
 
 
+def test_expired_structured_confirmation_beats_capacity_without_losing_prompt(
+    monkeypatch,
+) -> None:
+    preview = _complete_task_until_confirmation(monkeypatch)
+    prompt = plugin._task_setup.pending_choice_prompt(
+        "task-session", "u1", surface="tui"
+    )
+    assert prompt is not None
+    monkeypatch.setattr(plugin, "_MAX_PENDING_TASKS", 1)
+    plugin._pending_tasks[("tui", "other", "user")] = object()
+
+    rejected = plugin.before_user_turn(
+        session_id="task-session",
+        user_id="u1",
+        surface="tui",
+        is_new_session=False,
+        now=prompt.expires_at,
+        text="ignored",
+        choice_prompt_id=preview["choice_prompt_id"],
+        selected_choice_ids=["confirm"],
+    )
+    preserved = plugin._task_setup.pending_choice_prompt(
+        "task-session", "u1", prompt.expires_at, surface="tui"
+    )
+
+    assert rejected["action"] == "handled"
+    assert "choice prompt expired" in str(rejected["text"])
+    assert rejected["choice_prompt_id"] == preview["choice_prompt_id"]
+    assert rejected["expires_at"] == preview["expires_at"]
+    assert preserved == prompt
+
+
 def test_capacity_does_not_replay_a_previous_session_prompt(monkeypatch) -> None:
     plugin.set_task_service(lambda request: "created")
     preview = _complete_task_until_confirmation(monkeypatch)

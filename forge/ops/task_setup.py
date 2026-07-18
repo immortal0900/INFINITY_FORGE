@@ -269,14 +269,39 @@ class TaskSetup:
         *,
         surface: str = DEFAULT_SURFACE,
     ) -> ChoicePrompt | None:
-        """Return the current immutable prompt without refreshing its deadline."""
+        """Peek at the current immutable prompt without changing draft state."""
+
+        key = (surface, session_id, user_id)
+        with self._lock:
+            draft = self._drafts.get(key)
+            return None if draft is None else draft.choice_prompt
+
+    def invalid_submission_result(
+        self,
+        session_id: str,
+        user_id: str,
+        submission: ChoiceSubmission,
+        now: datetime | None = None,
+        *,
+        surface: str = DEFAULT_SURFACE,
+    ) -> TurnResult | None:
+        """Return the normal fail-closed result, or ``None`` for a valid submission.
+
+        This is a read-only preflight for callers that must make admission
+        decisions before applying a structured selection.
+        """
 
         current_time = now or self._clock()
         key = (surface, session_id, user_id)
         with self._lock:
-            self._sweep(current_time)
             draft = self._drafts.get(key)
-            return None if draft is None else draft.choice_prompt
+            if draft is None or draft.choice_prompt is None:
+                return TurnResult.handled("No pending chooser is available.")
+            try:
+                draft.choice_prompt.validate_submission(submission, current_time)
+            except ChoicePromptError as error:
+                return self._same_prompt_result(draft, str(error))
+            return None
 
     def _handle_locked(
         self,
