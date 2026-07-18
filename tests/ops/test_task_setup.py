@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from threading import Barrier, Event, Lock
 from time import sleep
@@ -1285,6 +1286,169 @@ def test_discovery_completion_after_expiry_is_not_applied(
     assert "stale" in (stale.text or "").lower()
     restarted = setup.handle("s1", "u1", "새 요청", context=context)
     assert restarted.next_step is SetupStep.MODE
+
+
+@pytest.mark.parametrize("callback_name", ["discovery", "probe", "bind", "validation"])
+def test_explicit_event_time_cannot_keep_a_late_callback_alive(
+    callback_name: str,
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / callback_name, f"owner/{callback_name}")
+    current_time = [NOW]
+    started = Event()
+    release = Event()
+    probe_value = ProjectPathProbe(
+        workspace=project.workspace,
+        remotes=(ProjectRemote("origin", project.repository, "main"),),
+    )
+
+    def wait_then(value):
+        started.set()
+        assert release.wait(timeout=2)
+        return value
+
+    context = _task_context(
+        () if callback_name in {"probe", "bind"} else (project,),
+        discover=(
+            (lambda _working: wait_then((project,)))
+            if callback_name == "discovery"
+            else None
+        ),
+        probe=(
+            (lambda _path: wait_then(probe_value))
+            if callback_name == "probe"
+            else (lambda _path: probe_value)
+        )
+        if callback_name in {"probe", "bind"}
+        else None,
+        bind=(
+            (lambda _probe, _remote, _branch: wait_then(project))
+            if callback_name == "bind"
+            else (lambda _probe, _remote, _branch: project)
+        )
+        if callback_name in {"probe", "bind"}
+        else None,
+        validate=(
+            (lambda selected: wait_then(selected))
+            if callback_name == "validation"
+            else None
+        ),
+    )
+    setup = TaskSetup(clock=lambda: current_time[0])
+    setup.handle("late", "u1", "요청", NOW, context=context)
+
+    if callback_name == "discovery":
+        operation = partial(
+            setup.handle,
+            "late",
+            "u1",
+            "task",
+            NOW + timedelta(seconds=1),
+            context=context,
+        )
+    else:
+        projects = setup.handle(
+            "late",
+            "u1",
+            "task",
+            NOW + timedelta(seconds=1),
+            context=context,
+        )
+        assert projects.choice_prompt is not None
+        if callback_name in {"probe", "bind"}:
+            setup.handle_submission(
+                "late",
+                "u1",
+                ChoiceSubmission(
+                    projects.choice_prompt.choice_prompt_id,
+                    ("add_project",),
+                ),
+                NOW + timedelta(seconds=2),
+                context=context,
+            )
+            if callback_name == "probe":
+                operation = partial(
+                    setup.handle,
+                    "late",
+                    "u1",
+                    project.workspace,
+                    NOW + timedelta(seconds=3),
+                    context=context,
+                )
+            else:
+                remotes = setup.handle(
+                    "late",
+                    "u1",
+                    project.workspace,
+                    NOW + timedelta(seconds=3),
+                    context=context,
+                )
+                assert remotes.choice_prompt is not None
+                branches = setup.handle_submission(
+                    "late",
+                    "u1",
+                    ChoiceSubmission(
+                        remotes.choice_prompt.choice_prompt_id,
+                        ("origin",),
+                    ),
+                    NOW + timedelta(seconds=4),
+                    context=context,
+                )
+                assert branches.choice_prompt is not None
+                operation = partial(
+                    setup.handle_submission,
+                    "late",
+                    "u1",
+                    ChoiceSubmission(
+                        branches.choice_prompt.choice_prompt_id,
+                        ("default_branch",),
+                    ),
+                    NOW + timedelta(seconds=5),
+                    context=context,
+                )
+        else:
+            setup.handle_submission(
+                "late",
+                "u1",
+                ChoiceSubmission(
+                    projects.choice_prompt.choice_prompt_id,
+                    (project.project_id,),
+                ),
+                NOW + timedelta(seconds=2),
+                context=context,
+            )
+            setup.handle(
+                "late",
+                "u1",
+                "build",
+                NOW + timedelta(seconds=3),
+                context=context,
+            )
+            setup.handle(
+                "late",
+                "u1",
+                "manual",
+                NOW + timedelta(seconds=4),
+                context=context,
+            )
+            operation = partial(
+                setup.handle,
+                "late",
+                "u1",
+                "confirm",
+                NOW + timedelta(seconds=5),
+                context=context,
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(operation)
+        assert started.wait(timeout=1)
+        current_time[0] = NOW + SETUP_TIMEOUT + timedelta(seconds=1)
+        release.set()
+        stale = pending.result(timeout=1)
+
+    assert stale.next_step is None
+    assert "stale" in (stale.text or "").lower()
 
 
 def test_duplicate_confirm_during_live_validation_runs_one_callback(

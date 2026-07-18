@@ -18,7 +18,7 @@ from forge.ops.project_discovery import ProjectPathProbe, ProjectRemote
 from forge.ops.task_options import MergeMode, TaskFlow
 from forge.ops.task_projects import TaskProject
 from forge.ops.task_service import TaskCreationRequest
-from forge.ops.task_setup import TaskSetupContext
+from forge.ops.task_setup import SETUP_TIMEOUT, TaskSetupContext
 from forge.ops.task_settings import TaskContent
 
 
@@ -1570,6 +1570,114 @@ def test_direct_project_path_turn_receives_fresh_trusted_context(
     assert [choice["id"] for choice in remotes["choices"]] == ["origin"]
     assert probe_calls == ["target"]
     assert context_calls == 3
+
+
+@pytest.mark.parametrize("cancel_kind", ["slash", "raw", "structured"])
+def test_project_cancel_does_not_construct_a_failing_context(
+    monkeypatch,
+    tmp_path: Path,
+    cancel_kind: str,
+) -> None:
+    context = _v2_context(str(tmp_path.resolve()), ())
+    calls = 0
+    fail = False
+
+    def factory(_working_directory: str | None) -> TaskSetupContext:
+        nonlocal calls
+        calls += 1
+        if fail:
+            raise RuntimeError("configuration unavailable")
+        return context
+
+    monkeypatch.setattr(plugin, "_task_context_factory", factory)
+    common = {
+        "session_id": "cancel-without-context",
+        "user_id": "u1",
+        "working_directory": str(tmp_path.resolve()),
+    }
+    mode = plugin.before_user_turn(text="요청", **common)
+    projects = plugin.before_user_turn(
+        text="ignored",
+        choice_prompt_id=mode["choice_prompt_id"],
+        selected_choice_ids=["task"],
+        **common,
+    )
+    assert [choice["id"] for choice in projects["choices"]] == [
+        "retry",
+        "add_project",
+        "cancel",
+    ]
+    calls = 0
+    fail = True
+
+    if cancel_kind == "structured":
+        cancelled = plugin.before_user_turn(
+            text="ignored",
+            choice_prompt_id=projects["choice_prompt_id"],
+            selected_choice_ids=["cancel"],
+            **common,
+        )
+    else:
+        cancelled = plugin.before_user_turn(
+            text="/cancel" if cancel_kind == "slash" else "cancel",
+            **common,
+        )
+
+    assert cancelled == {
+        "action": "handled",
+        "text": "Task setup cancelled. Continuing in Chat.",
+    }
+    assert calls == 0
+
+
+def test_expired_project_draft_is_cleaned_before_context_construction(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path / "project", "owner/project")
+    context = _v2_context(str(tmp_path.resolve()), (project,))
+    calls = 0
+    fail = False
+
+    def factory(_working_directory: str | None) -> TaskSetupContext:
+        nonlocal calls
+        calls += 1
+        if fail:
+            raise RuntimeError("configuration unavailable")
+        return context
+
+    monkeypatch.setattr(plugin, "_task_context_factory", factory)
+    now = datetime(2026, 7, 18, tzinfo=UTC)
+    common = {
+        "session_id": "expired-before-context",
+        "user_id": "u1",
+        "working_directory": str(tmp_path.resolve()),
+    }
+    mode = plugin.before_user_turn(text="첫 요청", now=now, **common)
+    plugin.before_user_turn(
+        text="ignored",
+        choice_prompt_id=mode["choice_prompt_id"],
+        selected_choice_ids=["task"],
+        now=now + timedelta(seconds=1),
+        **common,
+    )
+    calls = 0
+    fail = True
+
+    restarted = plugin.before_user_turn(
+        text="만료 후 일반 질문",
+        now=now + SETUP_TIMEOUT + timedelta(seconds=2),
+        **common,
+    )
+    replayed = plugin.before_user_turn(
+        text="chat",
+        now=now + SETUP_TIMEOUT + timedelta(seconds=3),
+        **common,
+    )
+
+    assert [choice["id"] for choice in restarted["choices"]] == ["chat", "task"]
+    assert replayed == {"action": "replace", "text": "만료 후 일반 질문"}
+    assert calls == 0
 
 
 def test_failed_task_entry_retry_keeps_first_trusted_working_directory(

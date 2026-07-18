@@ -2150,9 +2150,11 @@ def change_slack_adapter_source(source: str) -> str:
         if not required.issubset(prompt) or prompt.get("choice_mode") not in {"single", "multiple"}:
             return False
         choices = prompt.get("choices")
-        if not isinstance(choices, list) or not choices:
+        if not isinstance(choices, list) or not choices or len(choices) > 256:
             return False
         if any(not isinstance(choice, dict) or set(choice) != {"id", "label", "description"} or any(not isinstance(choice.get(key), str) or not choice[key].strip() for key in ("id", "label", "description")) for choice in choices):
+            return False
+        if any(len(choice["id"]) > 512 or len(choice["label"]) > 3000 or len(choice["description"]) > 3000 for choice in choices):
             return False
         ids = [choice["id"] for choice in choices]
         minimum, maximum = prompt.get("min_choices"), prompt.get("max_choices")
@@ -2167,6 +2169,47 @@ def change_slack_adapter_source(source: str) -> str:
         except (TypeError, ValueError, AttributeError):
             return False
         return expires.tzinfo is not None
+
+    @staticmethod
+    def _choice_fallback_pages(content: str, prompt: Dict[str, Any]) -> List[str]:
+        # Slack truncates very large text. Keep every stable ID reachable while
+        # reserving room for the prompt-bound reply syntax on the final page.
+        content_limit = 25000
+        lines = [f"{choice['id']} — {choice['label']}" for choice in prompt["choices"]]
+        chunks: List[List[str]] = []
+        current: List[str] = []
+        current_length = 0
+        for line in lines:
+            if len(line) > content_limit:
+                return []
+            separator = 1 if current else 0
+            if current and current_length + separator + len(line) > content_limit:
+                chunks.append(current)
+                current = []
+                current_length = 0
+                separator = 0
+            current.append(line)
+            current_length += separator + len(line)
+        if current:
+            chunks.append(current)
+        if not chunks:
+            return []
+        reply = f"Reply with: choose {prompt['choice_prompt_id']} <choice_id[,choice_id...]>"
+        heading = str(content or "Choose an option")[:3000]
+        pages: List[str] = []
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            parts = []
+            if index == 1:
+                parts.extend((heading, ""))
+            parts.extend((f"Choices page {index}/{total}", "\\n".join(chunk)))
+            if index == total:
+                parts.append(reply)
+            page = "\\n".join(parts)
+            if len(page) > 30000:
+                return []
+            pages.append(page)
+        return pages
 
     def _claim_choice_state(self, message_ts: str, selected_ids: List[str]) -> Optional[Dict[str, Any]]:
         state = self._choice_prompts.get(message_ts)
@@ -2260,14 +2303,22 @@ def change_slack_adapter_source(source: str) -> str:
                 if prompt["choice_mode"] == "multiple":
                     elements.append({"type": "button", "action_id": "forge_choice_submit", "text": {"type": "plain_text", "text": prompt["submit_label"][:75]}, "value": prompt["choice_prompt_id"]})
                 blocks.append({"type": "actions", "block_id": f"forge_choice:{prompt['choice_prompt_id']}", "elements": elements})
-            fallback = str(content or "Choose an option") + "\\n\\n" + "\\n".join(f"{choice['id']} — {choice['label']}" for choice in prompt["choices"]) + f"\\nReply with: choose {prompt['choice_prompt_id']} <choice_id[,choice_id...]>"
-            kwargs: Dict[str, Any] = {"channel": chat_id, "text": fallback, "blocks": blocks}
-            if thread_ts:
-                kwargs["thread_ts"] = thread_ts
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
-            message_ts = str(result.get("ts") or "")
-            if not message_ts:
-                return SendResult(success=False, error="Slack chooser message has no timestamp")
+            fallback_pages = self._choice_fallback_pages(str(content or "Choose an option"), prompt)
+            if not fallback_pages:
+                return SendResult(success=False, error="Slack chooser fallback is too large")
+            client = self._get_client(chat_id)
+            result: Dict[str, Any] = {}
+            message_ts = ""
+            for page_number, fallback in enumerate(fallback_pages, start=1):
+                kwargs: Dict[str, Any] = {"channel": chat_id, "text": fallback}
+                if page_number == len(fallback_pages):
+                    kwargs["blocks"] = blocks
+                if thread_ts:
+                    kwargs["thread_ts"] = thread_ts
+                result = await client.chat_postMessage(**kwargs)
+                message_ts = str(result.get("ts") or "")
+                if not message_ts:
+                    return SendResult(success=False, error="Slack chooser message has no timestamp")
             context_key = self._choice_context_key(chat_id, thread_ts, user_id)
             state = {"channel_id": chat_id, "chat_type": chat_type, "context_key": context_key, "prompt": prompt, "session_key": session_key, "thread_ts": thread_ts, "user_id": user_id, "user_name": user_name}
             previous_message_ts = self._choice_reply_prompts.get(context_key)

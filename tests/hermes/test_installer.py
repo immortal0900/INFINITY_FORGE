@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import queue
@@ -1044,6 +1045,84 @@ def test_slack_expired_and_superseded_prompts_do_not_consume_normal_messages() -
     assert adapter._claim_choice_state("stale-message", ["chat"]) is None
     assert "stale-message" not in adapter._choice_prompts
     assert adapter._choice_reply_prompts[key] == "new-message"
+
+
+def test_slack_paginates_256_project_fallback_without_losing_tail_ids() -> None:
+    changed = installer.change_slack_adapter_source(SLACK_ADAPTER_SOURCE)
+
+    class SendResult:
+        def __init__(self, **values: object) -> None:
+            self.__dict__.update(values)
+
+    namespace: dict[str, object] = {
+        "Any": object,
+        "BasePlatformAdapter": type("BasePlatformAdapter", (), {}),
+        "Dict": dict,
+        "List": list,
+        "MessageEvent": type("MessageEvent", (), {}),
+        "MessageType": type("MessageType", (), {"TEXT": "text"}),
+        "Optional": typing.Optional,
+        "Platform": type("Platform", (), {"SLACK": "slack"}),
+        "PlatformConfig": object,
+        "SendResult": SendResult,
+        "Tuple": tuple,
+        "datetime": __import__("datetime").datetime,
+        "logger": types.SimpleNamespace(error=lambda *args, **kwargs: None),
+    }
+    exec(changed, namespace)
+    messages: list[dict[str, object]] = []
+
+    class Client:
+        async def chat_postMessage(self, **kwargs: object) -> dict[str, str]:
+            messages.append(dict(kwargs))
+            return {"ts": str(len(messages))}
+
+    adapter = namespace["SlackAdapter"].__new__(namespace["SlackAdapter"])
+    adapter._app = object()
+    adapter._choice_prompts = {}
+    adapter._choice_reply_prompts = {}
+    adapter._resolve_thread_ts = lambda _event, _metadata: "root"
+    adapter._get_client = lambda _chat_id: Client()
+    prompt = {
+        **_valid_cli_prompt(),
+        "choice_mode": "multiple",
+        "max_choices": None,
+        "submit_label": "Choose Projects",
+        "choices": [
+            {
+                "id": f"{index:064x}",
+                "label": f"owner/project-{index}-" + "x" * 220,
+                "description": "Choose this Project.",
+            }
+            for index in range(256)
+        ],
+    }
+
+    result = asyncio.run(
+        adapter.send_choice_prompt(
+            "C1",
+            "Choose Projects.",
+            prompt,
+            "session-1",
+            "U1",
+        )
+    )
+
+    assert result.success is True
+    assert len(messages) > 1
+    assert all(len(str(message["text"])) <= 30_000 for message in messages)
+    assert all("blocks" not in message for message in messages[:-1])
+    assert "blocks" in messages[-1]
+    delivered = "\n".join(str(message["text"]) for message in messages)
+    assert all(choice["id"] in delivered for choice in prompt["choices"])
+    assert prompt["choices"][-1]["id"] in str(messages[-1]["text"])
+    assert (
+        f"choose {prompt['choice_prompt_id']} <choice_id[,choice_id...]>"
+        in str(messages[-1]["text"])
+    )
+    assert adapter._choice_reply_prompts[("C1", "root", "U1")] == str(
+        len(messages)
+    )
 
 
 def test_user_surfaces_opt_in_and_handled_turns_skip_model_followups() -> None:

@@ -460,20 +460,26 @@ class TaskSetup:
         self,
         session_id: str,
         user_id: str,
+        now: datetime | None = None,
         *,
         surface: str = DEFAULT_SURFACE,
     ) -> bool:
         """Return whether the pending step needs trusted Project callbacks."""
 
+        current_time = now or self._clock()
         with self._lock:
             draft = self._drafts.get((surface, session_id, user_id))
-            return draft is not None and draft.step in {
-                SetupStep.PROJECTS,
-                SetupStep.PROJECT_PATH,
-                SetupStep.PROJECT_REMOTE,
-                SetupStep.PROJECT_BRANCH,
-                SetupStep.PROJECT_BRANCH_NAME,
-            }
+            return (
+                draft is not None
+                and current_time < draft.expires_at
+                and draft.step in {
+                    SetupStep.PROJECTS,
+                    SetupStep.PROJECT_PATH,
+                    SetupStep.PROJECT_REMOTE,
+                    SetupStep.PROJECT_BRANCH,
+                    SetupStep.PROJECT_BRANCH_NAME,
+                }
+            )
 
     def invalid_submission_result(
         self,
@@ -507,6 +513,9 @@ class TaskSetup:
         outcome: TurnResult | _SetupWork,
         explicit_time: datetime | None,
     ) -> TurnResult:
+        if not isinstance(outcome, _SetupWork):
+            return outcome
+        callback_started_at = self._clock()
         if isinstance(outcome, _DiscoveryWork):
             try:
                 projects = outcome.context.discover_projects(
@@ -520,7 +529,10 @@ class TaskSetup:
             except Exception:
                 projects = ()
                 error = "Project discovery failed."
-            completion_time = explicit_time or self._clock()
+            completion_time = self._callback_completion_time(
+                explicit_time,
+                callback_started_at,
+            )
             with self._lock:
                 draft = self._matching_work_draft(outcome, completion_time)
                 if draft is None:
@@ -582,7 +594,10 @@ class TaskSetup:
             except Exception:
                 probe = None
                 error = "Project path could not be verified."
-            completion_time = explicit_time or self._clock()
+            completion_time = self._callback_completion_time(
+                explicit_time,
+                callback_started_at,
+            )
             with self._lock:
                 draft = self._matching_work_draft(outcome, completion_time)
                 if draft is None:
@@ -627,7 +642,10 @@ class TaskSetup:
             except Exception:
                 project = None
                 error = "Project remote and branch could not be verified."
-            completion_time = explicit_time or self._clock()
+            completion_time = self._callback_completion_time(
+                explicit_time,
+                callback_started_at,
+            )
             with self._lock:
                 draft = self._matching_work_draft(outcome, completion_time)
                 if draft is None:
@@ -708,7 +726,10 @@ class TaskSetup:
                 valid = validated == outcome.projects
             except Exception:
                 valid = False
-            completion_time = explicit_time or self._clock()
+            completion_time = self._callback_completion_time(
+                explicit_time,
+                callback_started_at,
+            )
             with self._lock:
                 draft = self._matching_work_draft(outcome, completion_time)
                 if draft is None:
@@ -743,6 +764,21 @@ class TaskSetup:
                 return self._prepared_v2_result(prepared)
 
         return outcome
+
+    def _callback_completion_time(
+        self,
+        explicit_time: datetime | None,
+        callback_started_at: datetime,
+    ) -> datetime:
+        """Use fresh clock elapsed time without changing an explicit event epoch."""
+
+        callback_finished_at = self._clock()
+        if explicit_time is None:
+            return callback_finished_at
+        elapsed = callback_finished_at - callback_started_at
+        if elapsed < timedelta(0):
+            elapsed = timedelta(0)
+        return explicit_time + elapsed
 
     def _matching_work_draft(
         self,

@@ -1015,15 +1015,32 @@ def before_user_turn(
         and context_required_reader(
             session_id,
             user_id,
+            now,
             surface=surface,
         )
     )
-    needs_task_context = pending_step_requires_context or context_choice == "/task" or bool(
-        {"task", "retry", "confirm"}
-        & (
-            set(selected_ids)
-            if submission is not None
-            else ({context_choice} if context_choice in pending_ids else set())
+    structured_cancel = (
+        submission is not None
+        and selected_ids == ("cancel",)
+        and pending_prompt is not None
+        and submission.choice_prompt_id == pending_prompt.choice_prompt_id
+        and "cancel" in pending_ids
+    )
+    raw_cancel = submission is None and (
+        context_choice == "/cancel"
+        or (context_choice == "cancel" and "cancel" in pending_ids)
+    )
+    deterministic_cancel = structured_cancel or raw_cancel
+    needs_task_context = not deterministic_cancel and (
+        pending_step_requires_context
+        or context_choice == "/task"
+        or bool(
+            {"task", "retry", "confirm"}
+            & (
+                set(selected_ids)
+                if submission is not None
+                else ({context_choice} if context_choice in pending_ids else set())
+            )
         )
     )
     context: TaskSetupContext | None = None
