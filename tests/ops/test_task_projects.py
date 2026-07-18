@@ -395,6 +395,9 @@ def test_direct_task_project_constructor_remains_live_strict(
         "COM7",
         "COM8",
         "COM9",
+        "COM¹",
+        "COM²",
+        "COM³",
         "LPT1",
         "LPT2",
         "LPT3",
@@ -404,6 +407,9 @@ def test_direct_task_project_constructor_remains_live_strict(
         "LPT7",
         "LPT8",
         "LPT9",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
         "CONIN$",
         "CONOUT$",
     ],
@@ -445,6 +451,23 @@ def test_stored_windows_workspace_allows_del_and_valid_replacement_scalar(
 ) -> None:
     binding = _binding(tmp_path)
     binding["workspace"] = str(tmp_path / "valid-\u007f-\ufffd-missing")
+
+    project = TaskProject.from_mapping(_stored_payload(binding))
+
+    assert project.workspace == binding["workspace"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lexical path contract")
+@pytest.mark.parametrize(
+    "component",
+    ["COM⁴", "LPT⁴", "COM10", "LPT0", "CONSOLE"],
+)
+def test_stored_windows_workspace_allows_non_reserved_names(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    binding = _binding(tmp_path)
+    binding["workspace"] = str(tmp_path / component / "missing-repository")
 
     project = TaskProject.from_mapping(_stored_payload(binding))
 

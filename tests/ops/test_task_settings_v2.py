@@ -6,6 +6,7 @@ import shutil
 import traceback
 from dataclasses import FrozenInstanceError, fields, replace
 from datetime import UTC, datetime, timedelta, timezone
+from inspect import Parameter, signature
 from pathlib import Path
 
 import pytest
@@ -319,14 +320,21 @@ def test_every_settings_constructor_requires_the_exact_request(
     constructor_fields = {
         field.name: getattr(settings, field.name) for field in fields(settings)
     }
+    constructor_parameters = signature(TaskSettingsV2).parameters
 
     assert "request" not in TaskSettingsV2.__slots__
     assert "request=" not in repr(settings)
+    assert tuple(constructor_parameters) == (*constructor_fields, "request")
+    assert all(
+        parameter.kind is Parameter.POSITIONAL_OR_KEYWORD
+        and parameter.default is Parameter.empty
+        for parameter in constructor_parameters.values()
+    )
     with pytest.raises(TypeError):
         TaskSettingsV2(**constructor_fields)  # type: ignore[arg-type]
     assert TaskSettingsV2(**constructor_fields, request=request) == settings
 
-    with pytest.raises(ValueError, match="request"):
+    with pytest.raises((TypeError, ValueError), match="request"):
         replace(settings)
     assert replace(settings, request=request) == settings
 
@@ -1091,6 +1099,28 @@ def test_settings_create_rejects_unrenderable_python_issue_number(
             request=request,
             parent_issue_number=huge_issue_number,
         )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert not _forge_traceback_contains_identity(
+        caught.value,
+        huge_issue_number,
+    )
+
+
+def test_settings_direct_constructor_scrubs_unrenderable_issue_number(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    settings = TaskSettingsV2.create(request=request, parent_issue_number=21)
+    constructor_fields = {
+        field.name: getattr(settings, field.name) for field in fields(settings)
+    }
+    huge_issue_number = 10**5000
+    constructor_fields["parent_issue_number"] = huge_issue_number
+
+    with pytest.raises(TaskSettingsV2Error, match="parent_issue_number") as caught:
+        TaskSettingsV2(**constructor_fields, request=request)  # type: ignore[arg-type]
 
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None

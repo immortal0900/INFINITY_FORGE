@@ -139,3 +139,54 @@ python -m pytest tests/ops/test_task_settings_v2.py tests/ops/test_task_projects
 python -m pytest tests/ops/test_plain_names.py tests/ops/test_task_settings.py tests/ops/test_task_service.py tests/ops/test_task_outbox.py -q
 92 passed, 3 skipped in 10.49s
 ```
+
+## 세 번째 독립 리뷰 수정
+
+- `TaskSettingsV2`의 generated dataclass initializer가 직접 constructor에 전달된
+  `10**5000` 값을 실패 traceback frame에 붙잡던 문제를 없앴다. 사용자 정의 initializer가
+  값을 어떤 field에도 저장하기 전에 JSON 표현 가능 여부를 확인하고, 실패 전에 frame local도
+  지운다.
+- initializer만 명시적으로 구현하고 dataclass의 정확한 17개 저장 field, `frozen`, `slots`,
+  repr/equality, mandatory `InitVar request`, JSON/hash preimage는 유지했다. 공개 constructor의
+  18개 positional-or-keyword parameter 순서와 `dataclasses.replace(..., request=request)`도
+  Python 3.11과 3.13에서 회귀 고정했다. `replace(settings)`의 버전별 예외 차이는
+  `(TypeError, ValueError)` 계약으로 표현한다.
+- Win32가 ASCII 숫자 장치명과 동일하게 예약하는 superscript 변형 `COM¹`~`COM³`,
+  `LPT¹`~`LPT³`을 기존 lexical validator에 추가했다. filesystem 조회나
+  `PureWindowsPath.is_reserved()`는 사용하지 않는다. `COM⁴`, `LPT⁴`, `COM10`, `LPT0`,
+  `CONSOLE`과 기존 U+007F/U+FFFD/POSIX 허용 계약도 보존한다.
+
+### 세 번째 리뷰 RED
+
+```text
+direct TaskSettingsV2 constructor traceback identity: 1 failed
+Windows superscript reserved-device attacks: 6 failed, 43 passed, 64 deselected
+```
+
+### 세 번째 리뷰 GREEN
+
+Python 3.13.14 (`uv run --python 3.13 --with pytest`):
+
+```text
+python -m pytest tests/ops/test_task_settings_v2.py tests/ops/test_task_projects.py tests/ops/test_project_discovery.py -q
+253 passed, 1 skipped in 3.16s
+```
+
+Python 3.11.15:
+
+```text
+python -m pytest tests/ops/test_task_settings_v2.py tests/ops/test_task_projects.py tests/ops/test_project_discovery.py -q
+253 passed, 1 skipped in 3.83s
+
+python -m pytest tests/ops/test_plain_names.py tests/ops/test_task_settings.py tests/ops/test_task_service.py tests/ops/test_task_outbox.py -q
+92 passed, 3 skipped in 10.73s
+```
+
+Python 3.13의 v1 gate는 PyYAML dependency를 포함하면 `91 passed, 3 skipped`이고,
+`TaskOutbox("bad\\0path")` 오류 문구 assertion 1개만 실패한다. detached parent worktree
+`3d61a8d`에서도 같은 test가 같은 `Task outbox lock directory could not be created safely`
+문구로 실패함을 재현했다. 이번 diff는 v1 outbox 코드/test를 수정하지 않으며, Task 6 범위 밖
+Python 3.13 `pathlib` 기준선 호환성 문제로 기록한다.
+
+최종 Python 3.13 Ruff, `py_compile`, `git diff --check`와 parent 대비 v1 outbox zero-diff
+검증도 통과했다.

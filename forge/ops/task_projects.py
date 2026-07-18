@@ -31,6 +31,12 @@ _WINDOWS_RESERVED_DEVICE_BASENAMES = frozenset(
         "conout$",
         *(f"com{number}" for number in range(1, 10)),
         *(f"lpt{number}" for number in range(1, 10)),
+        "com¹",
+        "com²",
+        "com³",
+        "lpt¹",
+        "lpt²",
+        "lpt³",
     }
 )
 _HTTPS_REMOTE_PATTERN = re.compile(

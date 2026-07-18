@@ -905,7 +905,7 @@ def _verify_settings_request(
 
 # RISK(breaking): These exact seventeen fields and their canonical hash are the
 # durable public forge-task-settings/v2 record. v1 storage remains independent.
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class TaskSettingsV2:
     format_version: str
     request_id: str
@@ -925,6 +925,55 @@ class TaskSettingsV2:
     task_settings_hash: str
     status: str
     request: InitVar[TaskRequestV2]
+
+    def __init__(
+        self,
+        format_version: str,
+        request_id: str,
+        request_hash: str,
+        management_repository: str,
+        parent_issue_number: int,
+        mode: Mode,
+        task_content_hash: str,
+        task_flow: TaskFlow,
+        merge_mode: MergeMode,
+        merge_order: tuple[str, ...] | None,
+        projects: tuple[TaskProject, ...],
+        task_owner_host: str,
+        confirmed_by: str,
+        confirmed_at: datetime,
+        auto_merge_expires_at: datetime | None,
+        task_settings_hash: str,
+        status: str,
+        request: TaskRequestV2,
+    ) -> None:
+        # Validate before retaining the value on ``self``.  A generated
+        # dataclass initializer keeps every argument alive in its traceback,
+        # which can pin an attacker-controlled, non-renderable integer.
+        if not _is_json_renderable_positive_integer(parent_issue_number):
+            parent_issue_number = None  # type: ignore[assignment]
+            raise TaskSettingsV2Error(
+                "parent_issue_number must be a positive integer"
+            )
+
+        object.__setattr__(self, "format_version", format_version)
+        object.__setattr__(self, "request_id", request_id)
+        object.__setattr__(self, "request_hash", request_hash)
+        object.__setattr__(self, "management_repository", management_repository)
+        object.__setattr__(self, "parent_issue_number", parent_issue_number)
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "task_content_hash", task_content_hash)
+        object.__setattr__(self, "task_flow", task_flow)
+        object.__setattr__(self, "merge_mode", merge_mode)
+        object.__setattr__(self, "merge_order", merge_order)
+        object.__setattr__(self, "projects", projects)
+        object.__setattr__(self, "task_owner_host", task_owner_host)
+        object.__setattr__(self, "confirmed_by", confirmed_by)
+        object.__setattr__(self, "confirmed_at", confirmed_at)
+        object.__setattr__(self, "auto_merge_expires_at", auto_merge_expires_at)
+        object.__setattr__(self, "task_settings_hash", task_settings_hash)
+        object.__setattr__(self, "status", status)
+        self.__post_init__(request)
 
     def __post_init__(self, request: TaskRequestV2) -> None:
         if self.format_version != TASK_SETTINGS_V2_FORMAT:
