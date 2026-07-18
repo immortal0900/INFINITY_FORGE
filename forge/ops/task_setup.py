@@ -10,6 +10,7 @@ from enum import Enum
 from threading import RLock
 from uuid import UUID, uuid4
 
+from .choice_prompt import Choice, ChoiceMode, ChoicePrompt, ChoicePromptError, ChoiceSubmission
 from .task_options import MergeMode, Mode, TaskFlow, TaskSelection
 from .task_service import TaskCreationRequest
 from .task_settings import TaskContent, TaskSettings
@@ -124,6 +125,7 @@ class SetupDraft:
     task_text: str | None
     task_request: TaskCreationRequest | None
     expires_at: datetime
+    choice_prompt: ChoicePrompt | None
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,7 @@ class TurnResult:
     action: str
     text: str | None = None
     choices: tuple[str, ...] = ()
+    choice_prompt: ChoicePrompt | None = None
     next_step: SetupStep | None = None
     selection: TaskSelection | None = None
     task_text: str | None = None
@@ -152,6 +155,7 @@ class TurnResult:
         text: str,
         *,
         choices: tuple[str, ...] = (),
+        choice_prompt: ChoicePrompt | None = None,
         next_step: SetupStep | None = None,
         selection: TaskSelection | None = None,
         task_text: str | None = None,
@@ -161,6 +165,7 @@ class TurnResult:
             action="handled",
             text=text,
             choices=choices,
+            choice_prompt=choice_prompt,
             next_step=next_step,
             selection=selection,
             task_text=task_text,
@@ -220,6 +225,32 @@ class TaskSetup:
                 self._discard(key)
             return self._handle_locked(key, text, current_time, repository)
 
+    def handle_submission(
+        self,
+        session_id: str,
+        user_id: str,
+        submission: ChoiceSubmission,
+        now: datetime | None = None,
+        *,
+        surface: str = DEFAULT_SURFACE,
+        repository: str | None = None,
+    ) -> TurnResult:
+        """Apply a structured chooser submission only to its pending prompt."""
+
+        current_time = now or self._clock()
+        key = (surface, session_id, user_id)
+        with self._lock:
+            draft = self._drafts.get(key)
+            if draft is None or draft.choice_prompt is None:
+                return TurnResult.handled("No pending chooser is available.")
+            try:
+                selected = draft.choice_prompt.validate_submission(submission, current_time)
+            except ChoicePromptError as error:
+                return self._same_prompt_result(draft, str(error))
+            return self._handle_selected_choice(
+                key, draft, selected[0], current_time, repository
+            )
+
     def _handle_locked(
         self,
         key: SessionKey,
@@ -247,20 +278,9 @@ class TaskSetup:
                 draft = self._new_task_draft(current_time)
                 self._store_draft(key, draft, current_time)
             else:
-                self._store_draft(
-                    key,
-                    SetupDraft(
-                        step=SetupStep.MODE,
-                        first_input=text,
-                        task_flow=None,
-                        merge_mode=None,
-                        task_text=None,
-                        task_request=None,
-                        expires_at=self._deadline(current_time),
-                    ),
-                    current_time,
-                )
-                return self._mode_prompt()
+                draft = self._new_mode_draft(text, current_time)
+                self._store_draft(key, draft, current_time)
+                return self._mode_prompt(draft)
 
         if draft.step is SetupStep.MODE:
             return self._handle_mode(key, draft, choice, current_time)
@@ -299,10 +319,12 @@ class TaskSetup:
 
     def _start_task(self, key: SessionKey, now: datetime) -> TurnResult:
         self._chat_sessions.discard(key)
-        self._store_draft(key, self._new_task_draft(now), now)
-        return self._task_flow_prompt()
+        draft = self._new_task_draft(now)
+        self._store_draft(key, draft, now)
+        return self._task_flow_prompt(draft)
 
     def _new_task_draft(self, now: datetime) -> SetupDraft:
+        expires_at = self._deadline(now)
         return SetupDraft(
             step=SetupStep.TASK_FLOW,
             first_input=None,
@@ -310,7 +332,21 @@ class TaskSetup:
             merge_mode=None,
             task_text=None,
             task_request=None,
-            expires_at=self._deadline(now),
+            expires_at=expires_at,
+            choice_prompt=self._choice_prompt(SetupStep.TASK_FLOW, expires_at),
+        )
+
+    def _new_mode_draft(self, first_input: str, now: datetime) -> SetupDraft:
+        expires_at = self._deadline(now)
+        return SetupDraft(
+            step=SetupStep.MODE,
+            first_input=first_input,
+            task_flow=None,
+            merge_mode=None,
+            task_text=None,
+            task_request=None,
+            expires_at=expires_at,
+            choice_prompt=self._choice_prompt(SetupStep.MODE, expires_at),
         )
 
     @staticmethod
@@ -318,7 +354,19 @@ class TaskSetup:
         return now + SETUP_TIMEOUT
 
     def _refresh(self, draft: SetupDraft, now: datetime, **changes: object) -> SetupDraft:
-        return update(draft, expires_at=self._deadline(now), **changes)
+        expires_at = self._deadline(now)
+        step = changes.get("step", draft.step)
+        choice_prompt = (
+            self._choice_prompt(step, expires_at)
+            if isinstance(step, SetupStep) and self._step_has_choices(step)
+            else None
+        )
+        return update(
+            draft,
+            expires_at=expires_at,
+            choice_prompt=choice_prompt,
+            **changes,
+        )
 
     def _sweep(self, now: datetime) -> None:
         expired = [
@@ -382,10 +430,11 @@ class TaskSetup:
                 task_request=None,
             )
             self._store_draft(key, task_draft, now)
-            return self._task_flow_prompt()
+            return self._task_flow_prompt(task_draft)
 
-        self._store_draft(key, self._refresh(draft, now), now)
-        return self._mode_prompt("Choose either chat or task.")
+        refreshed = self._refresh(draft, now)
+        self._store_draft(key, refreshed, now)
+        return self._mode_prompt(refreshed, "Choose either chat or task.")
 
     def _handle_task_flow(
         self,
@@ -396,8 +445,9 @@ class TaskSetup:
     ) -> TurnResult:
         task_flow = self._selected_value(choice, _FLOW_LABELS)
         if task_flow is None:
-            self._store_draft(key, self._refresh(draft, now), now)
-            return self._task_flow_prompt("Choose one listed Task flow.")
+            refreshed = self._refresh(draft, now)
+            self._store_draft(key, refreshed, now)
+            return self._task_flow_prompt(refreshed, "Choose one listed Task flow.")
 
         selected = self._refresh(
             draft,
@@ -409,7 +459,7 @@ class TaskSetup:
             task_request=None,
         )
         self._store_draft(key, selected, now)
-        return self._merge_mode_prompt()
+        return self._merge_mode_prompt(selected)
 
     def _handle_merge_mode(
         self,
@@ -421,8 +471,9 @@ class TaskSetup:
     ) -> TurnResult:
         merge_mode = self._selected_value(choice, _MERGE_LABELS)
         if merge_mode is None:
-            self._store_draft(key, self._refresh(draft, now), now)
-            return self._merge_mode_prompt("Choose one listed merge mode.")
+            refreshed = self._refresh(draft, now)
+            self._store_draft(key, refreshed, now)
+            return self._merge_mode_prompt(refreshed, "Choose one listed merge mode.")
 
         selected = self._refresh(
             draft,
@@ -433,7 +484,7 @@ class TaskSetup:
         if selected.first_input is None:
             self._store_draft(
                 key,
-                update(selected, step=SetupStep.TASK_CONTENT),
+                update(selected, step=SetupStep.TASK_CONTENT, choice_prompt=None),
                 now,
             )
             return self._task_content_prompt()
@@ -563,6 +614,83 @@ class TaskSetup:
                 return value
         return None
 
+    def _handle_selected_choice(
+        self,
+        key: SessionKey,
+        draft: SetupDraft,
+        choice_id: str,
+        now: datetime,
+        repository: str | None,
+    ) -> TurnResult:
+        if draft.step is SetupStep.MODE:
+            return self._handle_mode(key, draft, choice_id, now)
+        if draft.step is SetupStep.TASK_FLOW:
+            return self._handle_task_flow(key, draft, choice_id, now)
+        if draft.step is SetupStep.MERGE_MODE:
+            return self._handle_merge_mode(key, draft, choice_id, now, repository)
+        if draft.step is SetupStep.CONFIRM:
+            return self._handle_confirm(key, draft, choice_id, now)
+        return TurnResult.handled("This Task step requires text input.")
+
+    def _same_prompt_result(self, draft: SetupDraft, error: str) -> TurnResult:
+        prefix = f"Choice was not applied: {error}."
+        if draft.step is SetupStep.MODE:
+            return self._mode_prompt(draft, prefix)
+        if draft.step is SetupStep.TASK_FLOW:
+            return self._task_flow_prompt(draft, prefix)
+        if draft.step is SetupStep.MERGE_MODE:
+            return self._merge_mode_prompt(draft, prefix)
+        if draft.step is SetupStep.CONFIRM:
+            return self._preview_prompt(draft, prefix)
+        return TurnResult.handled(prefix)
+
+    @staticmethod
+    def _step_has_choices(step: SetupStep) -> bool:
+        return step in {
+            SetupStep.MODE,
+            SetupStep.TASK_FLOW,
+            SetupStep.MERGE_MODE,
+            SetupStep.CONFIRM,
+        }
+
+    @staticmethod
+    def _choice_prompt(step: SetupStep, expires_at: datetime) -> ChoicePrompt:
+        if step is SetupStep.MODE:
+            choices = tuple(
+                Choice(value.value, _MODE_LABELS[value], _MODE_DETAILS[value])
+                for value in Mode
+            )
+            submit_label = "Choose mode"
+        elif step is SetupStep.TASK_FLOW:
+            choices = tuple(
+                Choice(value.value, _FLOW_LABELS[value], _FLOW_DETAILS[value])
+                for value in TaskFlow
+            )
+            submit_label = "Choose checks"
+        elif step is SetupStep.MERGE_MODE:
+            choices = tuple(
+                Choice(value.value, _MERGE_LABELS[value], _MERGE_DETAILS[value])
+                for value in MergeMode
+            )
+            submit_label = "Choose merge mode"
+        elif step is SetupStep.CONFIRM:
+            choices = (
+                Choice("confirm", "Confirm Task", "Create the reviewed Task"),
+                Choice("cancel", "Cancel", "Discard the reviewed Task"),
+            )
+            submit_label = "Confirm Task"
+        else:
+            raise RuntimeError("Task step does not have choices")
+        return ChoicePrompt(
+            choice_prompt_id=str(uuid4()),
+            choice_mode=ChoiceMode.SINGLE,
+            min_choices=1,
+            max_choices=1,
+            submit_label=submit_label,
+            expires_at=expires_at,
+            choices=choices,
+        )
+
     @staticmethod
     def _normalized_utc(value: datetime) -> datetime:
         if not isinstance(value, datetime) or value.tzinfo is None:
@@ -589,7 +717,7 @@ class TaskSetup:
         )
 
     @staticmethod
-    def _mode_prompt(prefix: str | None = None) -> TurnResult:
+    def _mode_prompt(draft: SetupDraft, prefix: str | None = None) -> TurnResult:
         text = TaskSetup._prompt_text(
             prefix or "Choose Chat for a normal conversation or Task for implementation.",
             _MODE_LABELS,
@@ -597,12 +725,13 @@ class TaskSetup:
         )
         return TurnResult.handled(
             text,
-            choices=tuple(mode.value for mode in Mode),
+            choices=TaskSetup._prompt_choice_ids(draft),
+            choice_prompt=draft.choice_prompt,
             next_step=SetupStep.MODE,
         )
 
     @staticmethod
-    def _task_flow_prompt(prefix: str | None = None) -> TurnResult:
+    def _task_flow_prompt(draft: SetupDraft, prefix: str | None = None) -> TurnResult:
         text = TaskSetup._prompt_text(
             prefix or "Choose the checks for this Task.",
             _FLOW_LABELS,
@@ -610,12 +739,13 @@ class TaskSetup:
         )
         return TurnResult.handled(
             text,
-            choices=tuple(flow.value for flow in TaskFlow),
+            choices=TaskSetup._prompt_choice_ids(draft),
+            choice_prompt=draft.choice_prompt,
             next_step=SetupStep.TASK_FLOW,
         )
 
     @staticmethod
-    def _merge_mode_prompt(prefix: str | None = None) -> TurnResult:
+    def _merge_mode_prompt(draft: SetupDraft, prefix: str | None = None) -> TurnResult:
         text = TaskSetup._prompt_text(
             prefix or "Choose how a validated pull request may be merged.",
             _MERGE_LABELS,
@@ -623,7 +753,8 @@ class TaskSetup:
         )
         return TurnResult.handled(
             text,
-            choices=tuple(mode.value for mode in MergeMode),
+            choices=TaskSetup._prompt_choice_ids(draft),
+            choice_prompt=draft.choice_prompt,
             next_step=SetupStep.MERGE_MODE,
         )
 
@@ -687,10 +818,17 @@ class TaskSetup:
         text = f"{prefix}\n\n{details}" if prefix else details
         return TurnResult.handled(
             text,
-            choices=("confirm", "cancel"),
+            choices=TaskSetup._prompt_choice_ids(draft),
+            choice_prompt=draft.choice_prompt,
             next_step=SetupStep.CONFIRM,
             task_request=request,
         )
+
+    @staticmethod
+    def _prompt_choice_ids(draft: SetupDraft) -> tuple[str, ...]:
+        if draft.choice_prompt is None:
+            raise RuntimeError("Task choice prompt is missing")
+        return tuple(choice.id for choice in draft.choice_prompt.choices)
 
     @staticmethod
     def _format_timestamp(value: datetime) -> str:

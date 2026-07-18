@@ -77,6 +77,7 @@ from forge.ops.task_service import (
     TaskService as LocalTaskService,
 )
 from forge.ops.task_settings import TaskSettingsStore
+from forge.ops.choice_prompt import ChoicePromptError, ChoiceSubmission
 from forge.ops.task_setup import (
     DEFAULT_SURFACE,
     SETUP_TIMEOUT,
@@ -178,12 +179,33 @@ def _hook_result(result: TurnResult) -> dict[str, object]:
     payload: dict[str, object] = {"action": result.action}
     if result.text is not None:
         payload["text"] = result.text
-    if result.choices:
+    if result.choice_prompt is not None:
+        # RISK(breaking): surfaces must receive one validated chooser envelope.
+        payload.update(result.choice_prompt.metadata())
+    elif result.choices:
         payload["choices"] = [
             {"id": choice, "label": _CHOICE_LABELS[choice]}
             for choice in result.choices
         ]
     return payload
+
+
+def _read_choice_submission(
+    combined: Mapping[str, object],
+) -> ChoiceSubmission | None:
+    has_prompt_id = "choice_prompt_id" in combined
+    has_selected_ids = "selected_choice_ids" in combined
+    if not has_prompt_id and not has_selected_ids:
+        return None
+    if not has_prompt_id or not has_selected_ids:
+        raise ChoicePromptError(
+            "choice_prompt_id and selected_choice_ids must be provided together"
+        )
+    prompt_id = combined["choice_prompt_id"]
+    selected_ids = combined["selected_choice_ids"]
+    if not isinstance(selected_ids, (list, tuple)):
+        raise ChoicePromptError("selected_choice_ids must be an array")
+    return ChoiceSubmission(prompt_id, tuple(selected_ids))
 
 
 def _error_result(error: Exception) -> dict[str, object]:
@@ -426,6 +448,11 @@ def before_user_turn(
                 _store_failed_input(key, preserved_text, combined, cleanup_time)
                 return _error_result(error)
 
+            try:
+                submission = _read_choice_submission(combined)
+            except ChoicePromptError as error:
+                return _error_result(error)
+
             parsed_choice = text.strip().lower()
             if (
                 parsed_choice == "confirm"
@@ -440,15 +467,25 @@ def before_user_turn(
                 )
 
             try:
-                result = _task_setup.handle(
-                    session_id,
-                    user_id,
-                    text,
-                    now,
-                    surface=surface,
-                    is_new_session=is_new_session,
-                    repository=os.environ.get(_REPOSITORY_ENV),
-                )
+                if submission is None:
+                    result = _task_setup.handle(
+                        session_id,
+                        user_id,
+                        text,
+                        now,
+                        surface=surface,
+                        is_new_session=is_new_session,
+                        repository=os.environ.get(_REPOSITORY_ENV),
+                    )
+                else:
+                    result = _task_setup.handle_submission(
+                        session_id,
+                        user_id,
+                        submission,
+                        now,
+                        surface=surface,
+                        repository=os.environ.get(_REPOSITORY_ENV),
+                    )
             except Exception as error:
                 _store_failed_input(key, preserved_text, combined, cleanup_time)
                 return _error_result(error)

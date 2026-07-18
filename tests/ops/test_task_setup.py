@@ -8,7 +8,14 @@ from time import sleep
 import pytest
 
 from forge.ops.task_options import MergeMode, Mode, TaskFlow
-from forge.ops.task_setup import SetupStep, TaskSetup, TurnResult, begin_task_setup
+from forge.ops.choice_prompt import ChoiceSubmission
+from forge.ops.task_setup import (
+    SETUP_TIMEOUT,
+    SetupStep,
+    TaskSetup,
+    TurnResult,
+    begin_task_setup,
+)
 
 
 NOW = datetime(2026, 7, 16, 9, 0, tzinfo=timezone.utc)
@@ -202,6 +209,58 @@ def test_invalid_choice_stays_on_the_same_required_step() -> None:
     assert result.action == "handled"
     assert result.next_step is SetupStep.TASK_FLOW
     assert result.choices == tuple(flow.value for flow in TaskFlow)
+
+
+def test_structured_submission_applies_only_the_current_prompt_and_keeps_invalid_prompt_unchanged() -> None:
+    setup = TaskSetup()
+    mode = setup.handle("s1", "u1", "first request", NOW)
+
+    assert mode.choice_prompt is not None
+    assert mode.choice_prompt.expires_at == NOW + SETUP_TIMEOUT
+    invalid = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("missing",)),
+        NOW + timedelta(seconds=1),
+    )
+    assert invalid.action == "handled"
+    assert invalid.choice_prompt == mode.choice_prompt
+
+    flow = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("task",)),
+        NOW + timedelta(seconds=2),
+    )
+    assert flow.action == "handled"
+    assert flow.next_step is SetupStep.TASK_FLOW
+    assert flow.choice_prompt is not None
+    assert flow.choice_prompt.choice_prompt_id != mode.choice_prompt.choice_prompt_id
+
+    stale = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("chat",)),
+        NOW + timedelta(seconds=3),
+    )
+    assert stale.action == "handled"
+    assert stale.choice_prompt == flow.choice_prompt
+
+
+def test_structured_submission_does_not_refresh_or_apply_an_expired_prompt() -> None:
+    setup = TaskSetup()
+    mode = setup.handle("s1", "u1", "first request", NOW)
+
+    assert mode.choice_prompt is not None
+    expired = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("task",)),
+        NOW + timedelta(minutes=30),
+    )
+
+    assert expired.action == "handled"
+    assert expired.choice_prompt == mode.choice_prompt
 
 
 def test_inactive_task_draft_expires_after_thirty_minutes() -> None:

@@ -86,6 +86,44 @@ def test_hook_serializes_handled_replace_and_continue_results(monkeypatch) -> No
     assert continued == {"action": "continue"}
 
 
+def test_hook_emits_and_fail_closed_validates_structured_chooser_metadata(monkeypatch) -> None:
+    calls: list[object] = []
+    plugin.set_task_service(lambda request: calls.append(request) or "created")
+
+    shown = plugin.before_user_turn(
+        session_id="s1", user_id="u1", text="original request"
+    )
+
+    assert shown["choice_mode"] == "single"
+    assert shown["min_choices"] == 1
+    assert shown["max_choices"] == 1
+    assert isinstance(shown["choice_prompt_id"], str)
+    assert isinstance(shown["expires_at"], str)
+    assert [choice["id"] for choice in shown["choices"]] == ["chat", "task"]
+
+    malformed = plugin.before_user_turn(
+        session_id="s1",
+        user_id="u1",
+        text="ignored label",
+        choice_prompt_id=shown["choice_prompt_id"],
+        selected_choice_ids=["task", "task"],
+    )
+    assert malformed["action"] == "handled"
+    assert malformed["choice_prompt_id"] == shown["choice_prompt_id"]
+    assert calls == []
+
+    selected = plugin.before_user_turn(
+        session_id="s1",
+        user_id="u1",
+        text="not authoritative",
+        choice_prompt_id=shown["choice_prompt_id"],
+        selected_choice_ids=["task"],
+    )
+    assert selected["action"] == "handled"
+    assert selected["choice_mode"] == "single"
+    assert calls == []
+
+
 def test_plugin_error_offers_retry_or_explicit_chat_without_silent_task(
     monkeypatch,
 ) -> None:
