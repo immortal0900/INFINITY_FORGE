@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import stat
 import subprocess
@@ -479,7 +478,7 @@ class TaskDatabaseError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class _RestorePreimage:
+class _DatabaseArtifact:
     artifact: Path
     file_hash: str
     content_hash: str
@@ -487,6 +486,21 @@ class _RestorePreimage:
     @property
     def rollback_artifact(self) -> Path:
         return self.artifact
+
+
+@dataclass(slots=True)
+class _OfflineRestoreGate:
+    write_connection: sqlite3.Connection
+    snapshot_connection: sqlite3.Connection | None
+
+    def close_snapshot(self) -> None:
+        if self.snapshot_connection is None:
+            return
+        try:
+            self.snapshot_connection.rollback()
+        finally:
+            self.snapshot_connection.close()
+            self.snapshot_connection = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -605,29 +619,32 @@ class TaskDatabase:
             return self._backup_locked(destination)
 
     def _backup_locked(self, destination: Path) -> Path:
-        temporary = _new_secure_temporary_file(destination.parent, "backup")
+        artifact: _DatabaseArtifact | None = None
         try:
-            with (
-                closing(self.connect()) as source,
-                closing(_connect_database_file(temporary, mode="rw")) as target,
+            with closing(self.connect()) as source:
+                source.execute("BEGIN")
+                source.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
+                artifact = _capture_database_artifact(
+                    source,
+                    destination.parent,
+                    purpose="backup",
+                )
+            destination_lock = _prepare_operation_lock_path(destination)
+            with _database_operation_lock(
+                destination_lock,
+                exclusive=True,
+                timeout_seconds=0.0,
+                busy_message="Task database backup destination requires offline access",
             ):
-                source.backup(target)
-                target.commit()
-                _quick_check(target)
-                _validate_supported_schema(target)
-            _sync_file(temporary)
-            _assert_safe_file(destination, required=False)
-            os.replace(temporary, destination)
-            _apply_owner_only_permissions(destination)
-            if not _verify_owner_only_permissions(destination):
-                raise TaskDatabaseError("Task database backup permissions are unsafe")
+                _publish_database_artifact(artifact, destination)
             return destination
         except TaskDatabaseError:
             raise
         except (OSError, sqlite3.Error) as error:
             raise TaskDatabaseError("Task database backup failed") from error
         finally:
-            _remove_temporary_file(temporary)
+            if artifact is not None:
+                _remove_database_artifact(artifact)
 
     def restore(self, backup_path: str | Path) -> None:
         """Validate a staged backup before atomically replacing the live file."""
@@ -644,8 +661,9 @@ class TaskDatabase:
 
     def _restore_locked(self, backup: Path) -> None:
         temporary = _new_secure_temporary_file(self.database_path.parent, "restore")
-        preimage: _RestorePreimage | None = None
-        published = False
+        preimage: _DatabaseArtifact | None = None
+        expected_content_hash: str | None = None
+        committed = False
         keep_rollback_artifact = False
         try:
             with (
@@ -654,51 +672,61 @@ class TaskDatabase:
             ):
                 source.backup(target)
                 target.commit()
-                _quick_check(target)
                 _validate_supported_schema(target)
                 _initialize_database_connection(target)
-                _quick_check(target)
-                _validate_exact_schema(
-                    target,
-                    _EXPECTED_SCHEMA,
-                    TASK_DATABASE_SCHEMA_VERSION,
-                )
-            _sync_file(temporary)
-            with _offline_database_gate(self.database_path) as live:
-                _quick_check(live)
-                _validate_supported_schema(live)
+                _require_standalone_journal(target, "restore staging database")
+                expected_content_hash = _validate_exact_database(target)
+            _finalize_database_file(
+                temporary,
+                expected_content_hash=expected_content_hash,
+                description="restore staging database",
+            )
+            with _offline_database_gate(self.database_path) as gate:
+                if gate.snapshot_connection is None:
+                    raise TaskDatabaseError("restore snapshot connection is missing")
                 preimage = _capture_restore_preimage(
-                    live,
+                    gate.snapshot_connection,
                     self.database_path,
                 )
-
-            # RISK(data-loss): restore is an explicit offline replacement boundary.
-            # A checked standalone SQLite preimage remains beside the live file until
-            # every post-publish check succeeds or its logical data is restored.
-            _remove_sqlite_sidecars(self.database_path)
-            os.replace(temporary, self.database_path)
-            published = True
-            _apply_owner_only_permissions(self.database_path)
-            self._initialize(_operation_locked=True)
-            self.quick_check(_operation_locked=True)
-            if not self.verify_owner_only_permissions():
-                raise TaskDatabaseError(
-                    "restored Task database permissions are unsafe"
+                gate.close_snapshot()
+                _replace_database_content(
+                    gate.write_connection,
+                    temporary,
                 )
+                _validate_restore_candidate(
+                    gate.write_connection,
+                    expected_content_hash=expected_content_hash,
+                )
+                _apply_owner_only_permissions(self.database_path)
+                if not self.verify_owner_only_permissions():
+                    raise TaskDatabaseError(
+                        "restored Task database permissions are unsafe"
+                    )
+                gate.write_connection.commit()
+                committed = True
         except BaseException as error:
-            if published and preimage is not None:
+            if preimage is not None and not committed:
                 try:
-                    _restore_preimage(self.database_path, preimage)
+                    _assert_database_matches_artifact(
+                        self.database_path,
+                        preimage,
+                    )
                 except BaseException as rollback_error:
                     keep_rollback_artifact = True
                     raise TaskDatabaseError(
                         "Task database restore failed and rollback failed; "
                         f"rollback artifact: {preimage.rollback_artifact}"
                     ) from rollback_error
+            elif preimage is not None and committed:
+                keep_rollback_artifact = True
+                raise TaskDatabaseError(
+                    "Task database restore committed but finalization failed; "
+                    f"preimage artifact: {preimage.rollback_artifact}"
+                ) from error
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             if (
-                not published
+                not committed
                 and isinstance(error, TaskDatabaseError)
                 and str(error) == _RESTORE_OFFLINE_MESSAGE
             ):
@@ -707,9 +735,9 @@ class TaskDatabase:
                 "Task database backup could not be restored safely"
             ) from error
         finally:
-            _remove_temporary_file(temporary)
+            _remove_restore_artifact(temporary)
             if preimage is not None and not keep_rollback_artifact:
-                _remove_restore_preimage(preimage)
+                _remove_database_artifact(preimage)
 
     def _initialize(self, *, _operation_locked: bool = False) -> None:
         if not _operation_locked:
@@ -1309,9 +1337,10 @@ def _connect_database_file(path: Path, *, mode: str) -> sqlite3.Connection:
 
 
 @contextmanager
-def _offline_database_gate(path: Path) -> Iterator[sqlite3.Connection]:
+def _offline_database_gate(path: Path) -> Iterator[_OfflineRestoreGate]:
     write_gate = _connect_database_file(path, mode="rw")
     source: sqlite3.Connection | None = None
+    gate: _OfflineRestoreGate | None = None
     try:
         write_gate.execute("PRAGMA busy_timeout = 0")
         try:
@@ -1322,10 +1351,13 @@ def _offline_database_gate(path: Path) -> Iterator[sqlite3.Connection]:
         source.execute("PRAGMA busy_timeout = 0")
         source.execute("BEGIN")
         source.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
-        yield source
+        gate = _OfflineRestoreGate(write_gate, source)
+        yield gate
     finally:
         try:
-            if source is not None:
+            if gate is not None:
+                gate.close_snapshot()
+            elif source is not None:
                 source.rollback()
                 source.close()
         finally:
@@ -1401,58 +1433,111 @@ def _encode_sqlite_value(value: object) -> tuple[str, str]:
     raise TaskDatabaseError("Task database contains an unsupported SQLite value")
 
 
-def _capture_restore_preimage(
-    source: sqlite3.Connection,
-    database_path: Path,
-) -> _RestorePreimage:
-    artifact = _new_secure_temporary_file(
-        database_path.parent,
-        "rollback-preimage",
+def _validate_exact_database(
+    connection: sqlite3.Connection,
+    *,
+    expected_content_hash: str | None = None,
+) -> str:
+    _quick_check(connection)
+    _validate_exact_schema(
+        connection,
+        _EXPECTED_SCHEMA,
+        TASK_DATABASE_SCHEMA_VERSION,
     )
+    foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_key_errors:
+        raise TaskDatabaseError(
+            "Task database foreign key check failed: "
+            f"{len(foreign_key_errors)} error(s)"
+        )
+    content_hash = _database_content_hash(connection)
+    if expected_content_hash is not None and content_hash != expected_content_hash:
+        raise TaskDatabaseError("Task database content hash does not match")
+    return content_hash
+
+
+def _validate_restore_candidate(
+    connection: sqlite3.Connection,
+    *,
+    expected_content_hash: str,
+) -> str:
+    return _validate_exact_database(
+        connection,
+        expected_content_hash=expected_content_hash,
+    )
+
+
+def _require_standalone_journal(
+    connection: sqlite3.Connection,
+    description: str,
+) -> None:
+    journal_mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()
+    if journal_mode is None or str(journal_mode[0]).casefold() != "delete":
+        raise TaskDatabaseError(f"{description} is not a standalone SQLite database")
+
+
+def _assert_safe_sqlite_sidecars(database_path: Path) -> None:
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        sidecar = Path(f"{database_path}{suffix}")
+        if sidecar.exists():
+            _assert_safe_file(sidecar, required=True)
+
+
+def _assert_no_sqlite_sidecars(database_path: Path) -> None:
+    _assert_safe_sqlite_sidecars(database_path)
+    if any(Path(f"{database_path}{suffix}").exists() for suffix in _SQLITE_SIDECAR_SUFFIXES):
+        raise TaskDatabaseError("standalone Task database has SQLite sidecars")
+
+
+def _finalize_database_file(
+    database_path: Path,
+    *,
+    expected_content_hash: str,
+    description: str,
+) -> str:
+    _apply_owner_only_permissions(database_path)
+    _sync_file(database_path)
+    if not _verify_owner_only_permissions(database_path):
+        raise TaskDatabaseError(f"{description} permissions are unsafe")
+    _assert_no_sqlite_sidecars(database_path)
+    file_hash = _file_sha256(database_path)
+    with closing(_connect_database_file(database_path, mode="ro")) as readback:
+        journal_mode = readback.execute("PRAGMA journal_mode").fetchone()
+        if journal_mode is None or str(journal_mode[0]).casefold() != "delete":
+            raise TaskDatabaseError(f"{description} journal is not standalone")
+        _validate_exact_database(
+            readback,
+            expected_content_hash=expected_content_hash,
+        )
+    if _file_sha256(database_path) != file_hash:
+        raise TaskDatabaseError(f"{description} changed during readback")
+    _assert_no_sqlite_sidecars(database_path)
+    return file_hash
+
+
+def _capture_database_artifact(
+    source: sqlite3.Connection,
+    directory: Path,
+    *,
+    purpose: str,
+) -> _DatabaseArtifact:
+    source_content_hash = _validate_exact_database(source)
+    artifact = _new_secure_temporary_file(directory, purpose)
     try:
-        source_content_hash = _database_content_hash(source)
         with closing(_connect_database_file(artifact, mode="rw")) as target:
             source.backup(target)
             target.commit()
-            journal_mode = target.execute("PRAGMA journal_mode = DELETE").fetchone()
-            if journal_mode is None or str(journal_mode[0]).casefold() != "delete":
-                raise TaskDatabaseError(
-                    "rollback artifact is not a standalone SQLite database"
-                )
-            _quick_check(target)
-            _validate_exact_schema(
+            _require_standalone_journal(target, f"{purpose} artifact")
+            _validate_exact_database(
                 target,
-                _EXPECTED_SCHEMA,
-                TASK_DATABASE_SCHEMA_VERSION,
+                expected_content_hash=source_content_hash,
             )
-            if connection_errors := target.execute(
-                "PRAGMA foreign_key_check"
-            ).fetchall():
-                raise TaskDatabaseError(
-                    "rollback artifact foreign key check failed: "
-                    f"{len(connection_errors)} error(s)"
-                )
-            if _database_content_hash(target) != source_content_hash:
-                raise TaskDatabaseError(
-                    "rollback artifact does not match live database data"
-                )
-        _apply_owner_only_permissions(artifact)
-        _sync_file(artifact)
-        if not _verify_owner_only_permissions(artifact):
-            raise TaskDatabaseError("rollback artifact permissions are unsafe")
-        file_hash = _file_sha256(artifact)
-        with closing(_connect_database_file(artifact, mode="ro")) as readback:
-            _quick_check(readback)
-            _validate_exact_schema(
-                readback,
-                _EXPECTED_SCHEMA,
-                TASK_DATABASE_SCHEMA_VERSION,
-            )
-            if _database_content_hash(readback) != source_content_hash:
-                raise TaskDatabaseError("rollback artifact readback does not match")
-        if _file_sha256(artifact) != file_hash:
-            raise TaskDatabaseError("rollback artifact changed during readback")
-        return _RestorePreimage(
+        file_hash = _finalize_database_file(
+            artifact,
+            expected_content_hash=source_content_hash,
+            description=f"{purpose} artifact",
+        )
+        return _DatabaseArtifact(
             artifact=artifact,
             file_hash=file_hash,
             content_hash=source_content_hash,
@@ -1462,42 +1547,117 @@ def _capture_restore_preimage(
         raise
 
 
-def _publish_preimage_file(source: Path, destination: Path) -> None:
-    temporary = _new_secure_temporary_file(destination.parent, "rollback-publish")
-    try:
-        shutil.copyfile(source, temporary)
-        _apply_owner_only_permissions(temporary)
-        _sync_file(temporary)
-        if _file_sha256(temporary) != _file_sha256(source):
-            raise TaskDatabaseError("rollback publish copy is not exact")
-        os.replace(temporary, destination)
-    finally:
-        _remove_temporary_file(temporary)
-
-
-def _restore_preimage(
+def _capture_restore_preimage(
+    source: sqlite3.Connection,
     database_path: Path,
-    preimage: _RestorePreimage,
+) -> _DatabaseArtifact:
+    return _capture_database_artifact(
+        source,
+        database_path.parent,
+        purpose="rollback-preimage",
+    )
+
+
+def _publish_database_artifact(
+    artifact: _DatabaseArtifact,
+    destination: Path,
 ) -> None:
-    _remove_sqlite_sidecars(database_path)
-    _publish_preimage_file(preimage.artifact, database_path)
-    if _file_sha256(database_path) != preimage.file_hash:
-        raise TaskDatabaseError("rolled back Task database file is not exact")
+    if _file_sha256(artifact.artifact) != artifact.file_hash:
+        raise TaskDatabaseError("Task database artifact changed before publish")
+    _assert_safe_sqlite_sidecars(destination)
+    _ensure_secure_database_file(destination)
+    _apply_owner_only_permissions(destination)
+    with (
+        closing(_connect_database_file(artifact.artifact, mode="ro")) as source,
+        closing(_connect_database_file(destination, mode="rw")) as target,
+    ):
+        target.execute("PRAGMA busy_timeout = 0")
+        _require_standalone_journal(target, "backup destination")
+        source.backup(target, pages=-1, sleep=0)
+        target.commit()
+        _require_standalone_journal(target, "backup destination")
+        try:
+            target.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as error:
+            raise TaskDatabaseError(
+                "Task database backup destination requires offline access"
+            ) from error
+        _validate_exact_database(
+            target,
+            expected_content_hash=artifact.content_hash,
+        )
+        _apply_owner_only_permissions(destination)
+        if not _verify_owner_only_permissions(destination):
+            raise TaskDatabaseError("Task database backup permissions are unsafe")
+        _assert_no_sqlite_sidecars(destination)
+        _sync_file(destination)
+        file_hash = _file_sha256(destination)
+        with closing(_connect_database_file(destination, mode="ro")) as readback:
+            _validate_exact_database(
+                readback,
+                expected_content_hash=artifact.content_hash,
+            )
+        if _file_sha256(destination) != file_hash:
+            raise TaskDatabaseError("Task database backup changed during readback")
+        target.rollback()
+
+
+def _replace_database_content(
+    connection: sqlite3.Connection,
+    source_path: Path,
+) -> None:
+    connection.execute("ATTACH DATABASE ? AS restore_source", (str(source_path),))
+    connection.execute("PRAGMA defer_foreign_keys = ON")
+    table_columns: dict[str, tuple[str, ...]] = {}
+    for table_name in sorted(TASK_DATABASE_TABLES):
+        quoted_table = _quote_sqlite_identifier(table_name)
+        main_columns = tuple(
+            str(row[1])
+            for row in connection.execute(
+                f"PRAGMA main.table_info({quoted_table})"
+            )
+        )
+        source_columns = tuple(
+            str(row[1])
+            for row in connection.execute(
+                f"PRAGMA restore_source.table_info({quoted_table})"
+            )
+        )
+        if not main_columns or source_columns != main_columns:
+            raise TaskDatabaseError("restore source table columns do not match")
+        table_columns[table_name] = main_columns
+        connection.execute(f"DELETE FROM main.{quoted_table}")
+
+    for table_name, columns in table_columns.items():
+        quoted_table = _quote_sqlite_identifier(table_name)
+        column_list = ", ".join(_quote_sqlite_identifier(name) for name in columns)
+        connection.execute(
+            f"INSERT INTO main.{quoted_table} ({column_list}) "
+            f"SELECT {column_list} FROM restore_source.{quoted_table}"
+        )
+
+    connection.execute("DELETE FROM main.sqlite_sequence")
+    connection.execute(
+        "INSERT INTO main.sqlite_sequence(name, seq) "
+        "SELECT name, seq FROM restore_source.sqlite_sequence"
+    )
+
+
+def _assert_database_matches_artifact(
+    database_path: Path,
+    artifact: _DatabaseArtifact,
+) -> None:
     if not _verify_owner_only_permissions(database_path):
         raise TaskDatabaseError("rolled back Task database permissions are unsafe")
     with closing(_connect_database_file(database_path, mode="rw")) as connection:
-        _quick_check(connection)
-        _validate_exact_schema(
+        _validate_exact_database(
             connection,
-            _EXPECTED_SCHEMA,
-            TASK_DATABASE_SCHEMA_VERSION,
+            expected_content_hash=artifact.content_hash,
         )
-        if _database_content_hash(connection) != preimage.content_hash:
-            raise TaskDatabaseError("rolled back Task database data does not match")
 
 
-def _remove_restore_preimage(preimage: _RestorePreimage) -> None:
-    _remove_restore_artifact(preimage.artifact)
+def _remove_database_artifact(artifact: _DatabaseArtifact) -> None:
+    _remove_restore_artifact(artifact.artifact)
 
 
 def _remove_restore_artifact(artifact: Path) -> None:

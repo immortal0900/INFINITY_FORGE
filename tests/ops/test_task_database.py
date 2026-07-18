@@ -548,6 +548,50 @@ def test_backup_restore_is_checked_and_does_not_replace_live_db_on_failure(
     assert count_after_failure == 1
 
 
+def test_repeated_backup_does_not_replay_existing_destination_wal(
+    tmp_path: Path,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "first-source-event")
+    destination = database.backup(tmp_path / "backup.db")
+    _leave_committed_wal(destination, "stale-destination-event")
+    _replace_surface_events(database, "second-source-event")
+
+    database.backup(destination)
+
+    assert not Path(f"{destination}-wal").exists()
+    assert not Path(f"{destination}-shm").exists()
+    assert not Path(f"{destination}-journal").exists()
+    destination_database = TaskDatabase(destination)
+    assert _surface_event_ids(destination_database) == ["second-source-event"]
+    with destination_database.read() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_backup_rejects_foreign_key_invalid_live_database(tmp_path: Path) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    destination = tmp_path / "backup.db"
+    with sqlite3.connect(database.database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            """
+            INSERT INTO task_events (
+                request_id,
+                event_type,
+                event_key,
+                event_json,
+                occurred_at
+            ) VALUES ('missing-request', 'active', 'orphan', '{}', 'now')
+            """
+        )
+
+    with pytest.raises(TaskDatabaseError, match="foreign key"):
+        database.backup(destination)
+
+    assert not destination.exists()
+
+
 def _database_with_different_live_and_backup(
     tmp_path: Path,
 ) -> tuple[TaskDatabase, Path]:
@@ -626,17 +670,21 @@ def test_restore_rolls_back_live_database_when_post_publish_acl_fails(
     assert database.quick_check() == "ok"
 
 
-def test_restore_rolls_back_live_database_when_post_publish_initialize_fails(
+def test_restore_preserves_live_database_when_staged_initialize_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database, backup_path = _database_with_different_live_and_backup(tmp_path)
 
-    def fail_initialize(*, _operation_locked: bool = False) -> None:
-        del _operation_locked
+    def fail_initialize(connection: sqlite3.Connection) -> None:
+        del connection
         raise TaskDatabaseError("forced initialize failure")
 
-    monkeypatch.setattr(database, "_initialize", fail_initialize)
+    monkeypatch.setattr(
+        task_database_module,
+        "_initialize_database_connection",
+        fail_initialize,
+    )
 
     with pytest.raises(TaskDatabaseError, match="could not be restored safely"):
         database.restore(backup_path)
@@ -645,16 +693,25 @@ def test_restore_rolls_back_live_database_when_post_publish_initialize_fails(
     assert database.verify_owner_only_permissions()
 
 
-def test_restore_rolls_back_live_database_when_final_quick_check_fails(
+def test_restore_rolls_back_live_database_when_candidate_quick_check_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database, backup_path = _database_with_different_live_and_backup(tmp_path)
-    def fail_final_quick_check(*, _operation_locked: bool = False) -> str:
-        del _operation_locked
+
+    def fail_candidate_quick_check(
+        connection: sqlite3.Connection,
+        *,
+        expected_content_hash: str,
+    ) -> str:
+        del connection, expected_content_hash
         raise TaskDatabaseError("forced final quick_check failure")
 
-    monkeypatch.setattr(database, "quick_check", fail_final_quick_check)
+    monkeypatch.setattr(
+        task_database_module,
+        "_validate_restore_candidate",
+        fail_candidate_quick_check,
+    )
 
     with pytest.raises(TaskDatabaseError, match="could not be restored safely"):
         database.restore(backup_path)
@@ -695,6 +752,83 @@ def test_restore_rejects_an_unmanaged_active_writer(tmp_path: Path) -> None:
             database.restore(backup_path)
 
     assert _surface_event_ids(database) == ["live-event"]
+
+
+def test_restore_rejects_unmanaged_writer_that_begins_after_preimage_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+    preimage_ready = threading.Event()
+    allow_restore = threading.Event()
+    writer_finished = threading.Event()
+    original_capture = task_database_module._capture_restore_preimage
+    original_remove_sidecars = task_database_module._remove_sqlite_sidecars
+
+    def pause_after_preimage(
+        source: sqlite3.Connection,
+        database_path: Path,
+    ) -> object:
+        preimage = original_capture(source, database_path)
+        preimage_ready.set()
+        assert allow_restore.wait(timeout=5)
+        return preimage
+
+    def wait_for_writer_before_file_publish(path: Path) -> None:
+        if path == database.database_path:
+            assert writer_finished.wait(timeout=5)
+        original_remove_sidecars(path)
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_capture_restore_preimage",
+        pause_after_preimage,
+    )
+    monkeypatch.setattr(
+        task_database_module,
+        "_remove_sqlite_sidecars",
+        wait_for_writer_before_file_publish,
+    )
+
+    def restore_outcome() -> BaseException | None:
+        try:
+            database.restore(backup_path)
+        except BaseException as error:  # noqa: BLE001 - assert the race outcome.
+            return error
+        return None
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        restore_future = pool.submit(restore_outcome)
+        assert preimage_ready.wait(timeout=5)
+        allow_restore.set()
+        try:
+            with sqlite3.connect(database.database_path, timeout=5) as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute("DELETE FROM surface_events")
+                writer.execute(
+                    """
+                    INSERT INTO surface_events (
+                        source_event_id,
+                        subject_id,
+                        session_id,
+                        surface,
+                        payload_hash,
+                        state,
+                        received_at,
+                        retention_until
+                    ) VALUES (
+                        'concurrent-event', 'user-1', 'session-1', 'cli', ?,
+                        'received', 'now', 'later'
+                    )
+                    """,
+                    ("c" * 64,),
+                )
+        finally:
+            writer_finished.set()
+        restore_error = restore_future.result(timeout=10)
+
+    assert restore_error is None
+    assert _surface_event_ids(database) == ["concurrent-event"]
 
 
 def test_restore_is_excluded_by_a_restore_in_another_process(tmp_path: Path) -> None:
