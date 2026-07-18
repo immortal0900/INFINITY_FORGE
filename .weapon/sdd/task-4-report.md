@@ -19,6 +19,10 @@
   선택 후보를 유지한다. 다른 workspace의 clone과 linked worktree 중복은 계속 거부한다.
 - credential-bearing remote 원문과 정규화 예외를 격리 helper 안에서 소거하여 외부 오류의
   cause/context와 라이브러리 traceback frame locals에 token이 남지 않게 했다.
+- public `normalize_github_remote()` 직접 호출도 raw 인자를 지운 뒤 generic 오류를 만들며,
+  private parser frame과 credential이 외부 traceback에 남지 않는다.
+- custom Git runner가 `None`을 반환해도 assertion이 아니라 제어된 invalid-result 오류로
+  닫힌 실패한다.
 - Git 특수 이름 `HEAD`는 branch로 거부하고 일반 소문자 `head`는 허용한다.
 
 ## TDD 증거
@@ -49,12 +53,12 @@ host UUID에도 각각 failing regression test를 먼저 확인한 뒤 구현을
 
 ```text
 uv run --with pytest python -m pytest tests/ops/test_task_projects.py tests/ops/test_project_discovery.py -q
-113 passed in 4.76s
+115 passed in 4.62s
 ```
 
 ```text
 uv run --with pytest python -m pytest tests/ops/test_task_setup.py tests/ops/test_task_settings.py tests/ops/test_safe_files.py tests/ops/test_task_options.py -q
-168 passed in 8.69s
+168 passed in 8.59s
 ```
 
 ### 독립 리뷰 수정 RED → GREEN
@@ -78,6 +82,29 @@ encoding kwargs 누락, 실제 Windows CP949 decode 실패였다. 수정 후 같
 
 ```text
 25 passed in 2.40s
+```
+
+### 독립 리뷰 2차 수정 RED → GREEN
+
+public remote parser의 credential traceback-local 비노출과 custom runner `None` 반환의 제어
+오류 회귀를 먼저 추가했다. 수정 전에는 각각 token이 `forge.ops.task_projects` frame local에
+남고 `AssertionError`가 발생했다.
+
+```text
+2 failed in 0.55s
+```
+
+private non-throwing parser와 public error boundary를 분리하고 `_run_git`의 assert를
+invalid-result 검사로 대체한 뒤 같은 회귀가 통과했다.
+
+```text
+2 passed in 0.20s
+```
+
+실제 한글 경로 Git 저장소 검증도 별도로 다시 실행했다.
+
+```text
+1 passed in 3.05s
 ```
 
 ## 공격적 음수 경계

@@ -867,6 +867,21 @@ def test_git_runner_requests_strict_utf8_decoding(tmp_path: Path) -> None:
     )
 
 
+def test_git_runner_none_result_is_a_controlled_invalid_result(
+    tmp_path: Path,
+) -> None:
+    fixture = _make_repo(tmp_path, "repo", "owner/repo")
+
+    def none_runner(command: list[str], **kwargs: Any) -> None:
+        return None
+
+    with pytest.raises(ProjectDiscoveryError, match="invalid result") as caught:
+        _discover(tmp_path, (tmp_path,), [fixture], runner=none_runner)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="Git executable is required")
 def test_actual_git_discovers_workspace_with_korean_path(tmp_path: Path) -> None:
     workspace = tmp_path / "한글 저장소"

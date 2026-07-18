@@ -323,7 +323,6 @@ def _run_git(
         raise ProjectDiscoveryError("project discovery timed out")
     if failure == "git":
         raise ProjectDiscoveryError("Git probe failed")
-    assert result is not None
     _remaining(deadline, monotonic)
     result_is_invalid = (
         not isinstance(result, subprocess.CompletedProcess)

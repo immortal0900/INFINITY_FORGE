@@ -79,23 +79,34 @@ def _validate_repository(repository: object) -> str:
     return repository
 
 
-def normalize_github_remote(remote: object) -> str:
-    """Return canonical ``OWNER/REPO`` for one exact, credential-free URL."""
-
+def _try_normalize_github_remote(remote: object) -> str | None:
     if type(remote) is not str or not remote or not remote.isascii():
-        raise TaskProjectError("GitHub remote is not canonical") from None
+        return None
     if any(character.isspace() or ord(character) < 32 for character in remote):
-        raise TaskProjectError("GitHub remote is not canonical") from None
+        return None
     if "%" in remote or "?" in remote or "#" in remote:
-        raise TaskProjectError("GitHub remote is not canonical") from None
+        return None
     match = (
         _HTTPS_REMOTE_PATTERN.fullmatch(remote)
         or _SCP_REMOTE_PATTERN.fullmatch(remote)
         or _SSH_REMOTE_PATTERN.fullmatch(remote)
     )
     if match is None:
+        return None
+    try:
+        return _canonical_repository(match.group("owner"), match.group("name"))
+    except TaskProjectError:
+        return None
+
+
+def normalize_github_remote(remote: object) -> str:
+    """Return canonical ``OWNER/REPO`` for one exact, credential-free URL."""
+
+    repository = _try_normalize_github_remote(remote)
+    remote = None
+    if repository is None:
         raise TaskProjectError("GitHub remote is not canonical") from None
-    return _canonical_repository(match.group("owner"), match.group("name"))
+    return repository
 
 
 def _validate_workspace(workspace: object) -> str:

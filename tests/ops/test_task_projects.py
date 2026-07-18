@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 from uuid import uuid4
@@ -13,6 +14,52 @@ from forge.ops.task_projects import (
     TaskProjectError,
     normalize_github_remote,
 )
+
+
+def _exception_graph(error: BaseException) -> tuple[BaseException, ...]:
+    pending = [error]
+    seen: set[int] = set()
+    found: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return tuple(found)
+
+
+def _contained_text(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, bytes):
+        return (value.decode("utf-8", errors="replace"),)
+    if isinstance(value, dict):
+        return tuple(
+            text
+            for item in value.items()
+            for part in item
+            for text in _contained_text(part)
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(text for item in value for text in _contained_text(item))
+    return ()
+
+
+def _task_project_traceback_local_text(error: BaseException) -> tuple[str, ...]:
+    texts: list[str] = []
+    for current in _exception_graph(error):
+        trace = current.__traceback__
+        while trace is not None:
+            if trace.tb_frame.f_globals.get("__name__") == "forge.ops.task_projects":
+                for value in trace.tb_frame.f_locals.values():
+                    texts.extend(_contained_text(value))
+            trace = trace.tb_next
+    return tuple(texts)
 
 
 def _binding(workspace: Path) -> dict[str, str]:
@@ -121,6 +168,33 @@ def test_github_remote_rejects_ambiguous_or_non_github_locations(remote: str) ->
     assert "private" not in str(caught.value)
     assert remote not in str(caught.value)
     assert caught.value.__cause__ is None
+
+
+def test_direct_remote_rejection_does_not_retain_credential_in_traceback() -> None:
+    token = "direct-secret-token"
+    remote = f"https://{token}@github.com/owner/repo.git"
+
+    with pytest.raises(TaskProjectError) as caught:
+        normalize_github_remote(remote)
+
+    exceptions = _exception_graph(caught.value)
+    assert all(
+        error.__cause__ is None and error.__context__ is None
+        for error in exceptions
+    )
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert token not in rendered
+    assert not any(
+        token in text
+        for text in _task_project_traceback_local_text(caught.value)
+    )
+    forge_frames: list[str] = []
+    trace = caught.value.__traceback__
+    while trace is not None:
+        if trace.tb_frame.f_globals.get("__name__") == "forge.ops.task_projects":
+            forge_frames.append(trace.tb_frame.f_code.co_name)
+        trace = trace.tb_next
+    assert forge_frames == ["normalize_github_remote"]
 
 
 @pytest.mark.parametrize(
