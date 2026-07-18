@@ -138,6 +138,7 @@ def test_github_remote_rejects_ambiguous_or_non_github_locations(remote: str) ->
         ("remote_name", "--upload-pack=evil"),
         ("base_branch", "../escape"),
         ("base_branch", "refs/heads/main"),
+        ("base_branch", "HEAD"),
         ("base_branch", "@"),
         ("base_branch", ".hidden"),
         ("base_branch", "feature/.hidden"),
@@ -167,6 +168,15 @@ def test_task_project_rejects_noncanonical_workspace(tmp_path: Path) -> None:
 
     with pytest.raises(TaskProjectError, match="workspace"):
         TaskProject.create(**binding)
+
+
+def test_task_project_allows_lowercase_head_as_an_ordinary_branch(
+    tmp_path: Path,
+) -> None:
+    binding = _binding(tmp_path)
+    binding["base_branch"] = "head"
+
+    assert TaskProject.create(**binding).base_branch == "head"
 
 
 def test_task_project_workspace_must_be_a_directory(tmp_path: Path) -> None:

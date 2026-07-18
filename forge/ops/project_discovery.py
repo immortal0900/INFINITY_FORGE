@@ -308,6 +308,8 @@ def _run_git(
             command,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="strict",
             timeout=timeout,
             check=False,
             stdin=subprocess.DEVNULL,
@@ -323,13 +325,16 @@ def _run_git(
         raise ProjectDiscoveryError("Git probe failed")
     assert result is not None
     _remaining(deadline, monotonic)
-    if (
+    result_is_invalid = (
         not isinstance(result, subprocess.CompletedProcess)
         or type(result.returncode) is not int
         or not isinstance(result.stdout, str)
-    ):
+    )
+    if result_is_invalid:
+        result = None
         raise ProjectDiscoveryError("Git probe returned an invalid result")
     if result.returncode != 0:
+        result = None
         if allow_not_repository:
             return None
         raise ProjectDiscoveryError("Git probe failed")
@@ -497,31 +502,27 @@ def _remote_bindings(
             remote_name = _validate_remote_name(raw_remote_name)
         except TaskProjectError:
             raise ProjectDiscoveryError("project remote binding is invalid") from None
-        fetch_result = _run_git(
+        fetch_repository = _remote_repository_from_git(
             evidence.workspace,
             ("remote", "get-url", "--all", remote_name),
+            "fetch remote",
             deadline=deadline,
             runner=runner,
             monotonic=monotonic,
         )
-        push_result = _run_git(
+        push_repository = _remote_repository_from_git(
             evidence.workspace,
             ("remote", "get-url", "--push", "--all", remote_name),
+            "push remote",
             deadline=deadline,
             runner=runner,
             monotonic=monotonic,
         )
-        assert fetch_result is not None and push_result is not None
-        try:
-            fetch_repository = normalize_github_remote(
-                _one_line(fetch_result.stdout, "fetch remote")
-            )
-            push_repository = normalize_github_remote(
-                _one_line(push_result.stdout, "push remote")
-            )
-        except (TaskProjectError, ProjectDiscoveryError):
-            raise ProjectDiscoveryError("project remote binding is invalid") from None
-        if fetch_repository.casefold() != push_repository.casefold():
+        if (
+            fetch_repository is None
+            or push_repository is None
+            or fetch_repository.casefold() != push_repository.casefold()
+        ):
             raise ProjectDiscoveryError("project remote binding is invalid")
         bindings.append(
             _RemoteEvidence(
@@ -531,6 +532,36 @@ def _remote_bindings(
             )
         )
     return tuple(bindings)
+
+
+def _remote_repository_from_git(
+    workspace: Path,
+    arguments: Sequence[str],
+    label: str,
+    *,
+    deadline: float,
+    runner: GitRunner,
+    monotonic: Monotonic,
+) -> str | None:
+    """Normalize one remote without retaining its credential-bearing raw output."""
+
+    result = _run_git(
+        workspace,
+        arguments,
+        deadline=deadline,
+        runner=runner,
+        monotonic=monotonic,
+    )
+    assert result is not None
+    raw_output: str | None = result.stdout
+    result = None
+    repository: str | None = None
+    try:
+        repository = normalize_github_remote(_one_line(raw_output, label))
+    except (TaskProjectError, ProjectDiscoveryError):
+        repository = None
+    raw_output = None
+    return repository
 
 
 def _git_evidence(
@@ -817,7 +848,7 @@ def discover_projects(
         raise ProjectDiscoveryError("project count limit exceeded")
     projects: list[TaskProject] = []
     common_dirs: set[str] = set()
-    repositories: set[str] = set()
+    repository_workspaces: dict[str, str] = {}
     workspaces: set[str] = set()
     for workspace in ordered_paths:
         evidence = _git_evidence(
@@ -856,9 +887,10 @@ def discover_projects(
                 github_metadata_reader=github_metadata_reader,
             )
             repository_key = repository.casefold()
-            if repository_key in repositories:
+            bound_workspace = repository_workspaces.get(repository_key)
+            if bound_workspace is not None and bound_workspace != workspace_key:
                 raise ProjectDiscoveryError("duplicate project binding detected")
-            repositories.add(repository_key)
+            repository_workspaces.setdefault(repository_key, workspace_key)
             _recheck_git_evidence(evidence, roots)
             try:
                 projects.append(

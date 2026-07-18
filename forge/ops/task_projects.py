@@ -133,7 +133,7 @@ def _validate_branch(base_branch: object) -> str:
         raise TaskProjectError("base_branch must be a canonical branch name")
     components = base_branch.split("/")
     if (
-        base_branch == "@"
+        base_branch in {"@", "HEAD"}
         or ".." in base_branch
         or "//" in base_branch
         or "@{" in base_branch

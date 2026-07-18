@@ -13,6 +13,13 @@
 - GitHub `full_name`의 casing-only canonicalization은 허용하지만 rename/redirect는 거부한다.
 - Git root, Git dir, common dir, remote, branch, local remote-tracking commit, GitHub commit을
   probe 전후에 다시 결합 검증한다.
+- Windows locale과 무관하게 Git stdout을 UTF-8 strict로 읽어 한글 workspace를 실제 Git으로
+  발견하며, decode 또는 형식 실패는 원문을 남기지 않고 닫힌 실패로 처리한다.
+- 같은 workspace의 여러 remote가 같은 canonical repository를 가리켜도 `remote_name`별
+  선택 후보를 유지한다. 다른 workspace의 clone과 linked worktree 중복은 계속 거부한다.
+- credential-bearing remote 원문과 정규화 예외를 격리 helper 안에서 소거하여 외부 오류의
+  cause/context와 라이브러리 traceback frame locals에 token이 남지 않게 했다.
+- Git 특수 이름 `HEAD`는 branch로 거부하고 일반 소문자 `head`는 허용한다.
 
 ## TDD 증거
 
@@ -42,12 +49,35 @@ host UUID에도 각각 failing regression test를 먼저 확인한 뒤 구현을
 
 ```text
 uv run --with pytest python -m pytest tests/ops/test_task_projects.py tests/ops/test_project_discovery.py -q
-109 passed in 1.29s
+113 passed in 4.76s
 ```
 
 ```text
 uv run --with pytest python -m pytest tests/ops/test_task_setup.py tests/ops/test_task_settings.py tests/ops/test_safe_files.py tests/ops/test_task_options.py -q
-168 passed in 8.03s
+168 passed in 8.69s
+```
+
+### 독립 리뷰 수정 RED → GREEN
+
+다음 회귀를 제품 코드보다 먼저 추가했다.
+
+- `HEAD` 거부와 소문자 `head` 허용
+- 같은 workspace의 `origin`·`upstream` same-repository 후보 유지
+- subprocess `encoding="utf-8", errors="strict"` 계약과 실제 한글 경로 Git 저장소 발견
+- credential remote 실패의 cause/context와 traceback frame locals token 비노출
+
+수정 전 선택 회귀 실행 결과:
+
+```text
+5 failed, 20 passed, 1 warning in 2.96s
+```
+
+실패 원인은 각각 `HEAD` 허용, same-workspace alias duplicate 거부, 예외 context/token 보존,
+encoding kwargs 누락, 실제 Windows CP949 decode 실패였다. 수정 후 같은 선택 회귀는 다음처럼
+통과했다.
+
+```text
+25 passed in 2.40s
 ```
 
 ## 공격적 음수 경계
@@ -68,7 +98,7 @@ uv run --with pytest python -m pytest tests/ops/test_task_setup.py tests/ops/tes
 
 ## 전체 ops 회귀의 범위 밖 실패
 
-전체 `tests/ops -q` 결과는 `598 passed, 3 skipped, 4 failed`였다. 다음 네 건은 Task 4
+수정 후 전체 `tests/ops -q` 결과는 `605 passed, 3 skipped, 4 failed`였다. 다음 네 건은 Task 4
 변경 파일과 무관하며 범위 밖 파일을 수정하지 않았다.
 
 - `test_linux_deploy_lock.py::test_second_deploy_is_blocked_before_git_or_systemd` — WSL

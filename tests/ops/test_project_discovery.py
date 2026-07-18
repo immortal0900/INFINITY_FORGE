@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import traceback
 from dataclasses import dataclass
@@ -18,6 +19,59 @@ from forge.ops.project_discovery import (
     validate_task_project,
 )
 from forge.ops.task_projects import TaskProject
+
+
+def _exception_graph(error: BaseException) -> tuple[BaseException, ...]:
+    pending = [error]
+    seen: set[int] = set()
+    found: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return tuple(found)
+
+
+def _contained_text(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, bytes):
+        return (value.decode("utf-8", errors="replace"),)
+    if isinstance(value, subprocess.CompletedProcess):
+        return (
+            *_contained_text(value.args),
+            *_contained_text(value.stdout),
+            *_contained_text(value.stderr),
+        )
+    if isinstance(value, dict):
+        return tuple(
+            text
+            for item in value.items()
+            for part in item
+            for text in _contained_text(part)
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(text for item in value for text in _contained_text(item))
+    return ()
+
+
+def _library_traceback_local_text(error: BaseException) -> tuple[str, ...]:
+    texts: list[str] = []
+    for current in _exception_graph(error):
+        trace = current.__traceback__
+        while trace is not None:
+            module_name = trace.tb_frame.f_globals.get("__name__", "")
+            if isinstance(module_name, str) and module_name.startswith("forge.ops"):
+                for value in trace.tb_frame.f_locals.values():
+                    texts.extend(_contained_text(value))
+            trace = trace.tb_next
+    return tuple(texts)
 
 
 @dataclass(frozen=True)
@@ -623,7 +677,9 @@ def test_multiple_valid_remotes_become_deterministic_candidates(tmp_path: Path) 
     ]
 
 
-def test_multiple_remote_aliases_for_same_repository_are_rejected(tmp_path: Path) -> None:
+def test_multiple_remote_aliases_for_same_repository_remain_distinct_choices(
+    tmp_path: Path,
+) -> None:
     fixture = _make_repo(tmp_path, "repo", "owner/repo")
     fixture = RepoFixture(
         **{
@@ -645,13 +701,20 @@ def test_multiple_remote_aliases_for_same_repository_are_rejected(tmp_path: Path
         commit_sha=fixture.commit,
     )
 
-    with pytest.raises(ProjectDiscoveryError, match="duplicate"):
-        _discover(
-            tmp_path,
-            (tmp_path,),
-            [fixture],
-            github_metadata_reader=reader,
-        )
+    projects = _discover(
+        tmp_path,
+        (tmp_path,),
+        [fixture],
+        github_metadata_reader=reader,
+    )
+
+    assert [
+        (project.remote_name, project.repository) for project in projects
+    ] == [
+        ("origin", "owner/repo"),
+        ("upstream", "owner/repo"),
+    ]
+    assert len({project.project_id for project in projects}) == 2
 
 
 def test_fetch_and_push_casing_forms_share_api_canonical_repository(
@@ -778,8 +841,76 @@ def test_git_runner_uses_argv_without_shell_and_sanitizes_secret_traceback(
     assert "secret-token" not in str(caught.value)
     assert "secret-token" not in rendered
     assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert all(
+        error.__cause__ is None and error.__context__ is None
+        for error in _exception_graph(caught.value)
+    )
+    assert not any(
+        "secret-token" in text
+        for text in _library_traceback_local_text(caught.value)
+    )
     assert all(isinstance(command, list) for command in runner.commands)
     assert all("shell" not in kwargs for kwargs in runner.keyword_arguments)
+
+
+def test_git_runner_requests_strict_utf8_decoding(tmp_path: Path) -> None:
+    fixture = _make_repo(tmp_path, "repo", "owner/repo")
+    runner = FakeGitRunner([fixture])
+
+    _discover(tmp_path, (tmp_path,), [fixture], runner=runner)
+
+    assert runner.keyword_arguments
+    assert all(
+        kwargs["encoding"] == "utf-8" and kwargs["errors"] == "strict"
+        for kwargs in runner.keyword_arguments
+    )
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="Git executable is required")
+def test_actual_git_discovers_workspace_with_korean_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "한글 저장소"
+    workspace.mkdir()
+    environment = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Forge Test",
+        "GIT_AUTHOR_EMAIL": "forge@example.invalid",
+        "GIT_COMMITTER_NAME": "Forge Test",
+        "GIT_COMMITTER_EMAIL": "forge@example.invalid",
+    }
+
+    def run_git(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", "-C", str(workspace), *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            env=environment,
+        )
+
+    run_git("init", "--initial-branch=main")
+    (workspace / "README.md").write_text("테스트\n", encoding="utf-8")
+    run_git("add", "README.md")
+    run_git("commit", "-m", "initial")
+    run_git("remote", "add", "origin", "https://github.com/owner/korean-path.git")
+    run_git("update-ref", "refs/remotes/origin/main", "HEAD")
+    commit = run_git("rev-parse", "HEAD").stdout.decode("ascii").strip()
+    fixture = RepoFixture(
+        root=workspace,
+        repository="owner/korean-path",
+        remote="https://github.com/owner/korean-path.git",
+        commit=commit,
+    )
+
+    projects = discover_projects(
+        workspace,
+        (tmp_path,),
+        host_id=str(uuid4()),
+        github_metadata_reader=FakeGitHubReader([fixture]),
+    )
+
+    assert [project.workspace for project in projects] == [str(workspace.resolve())]
 
 
 def test_git_runner_removes_environment_overrides_that_can_escape_workspace(
