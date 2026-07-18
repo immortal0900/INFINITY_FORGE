@@ -236,6 +236,7 @@ _CONVERSATION_HOOK = fr'''
                     "max_choices",
                     "submit_label",
                     "expires_at",
+                    "choice_prompt_paused",
                 ):
                     if _prompt_field in _prompt:
                         _handled_payload[_prompt_field] = _prompt[_prompt_field]
@@ -397,10 +398,15 @@ _CONVERSATION_HOOK = fr'''
                 not _has_choice_prompt
                 or _valid_pre_user_turn_choice_prompt(_handled_result)
             )
+            _choice_prompt_paused = _handled_result.get(
+                "choice_prompt_paused", False
+            )
             if (
                 not isinstance(_response, str)
                 or not _valid_choices
                 or not _valid_choice_prompt
+                or not isinstance(_choice_prompt_paused, bool)
+                or (_choice_prompt_paused and not _has_choice_prompt)
                 or len(set(_choice_ids)) != len(_choice_ids)
                 or len(set(_choice_labels)) != len(_choice_labels)
             ):
@@ -835,6 +841,8 @@ def _continue_choice_modal_result(
     # by one final Confirm submission that must be allowed to leave the chooser.
     _max_consecutive_chooser_turns = 261
     for _choice_turn in range(_max_consecutive_chooser_turns):
+        if isinstance(result, dict) and result.get("choice_prompt_paused") is True:
+            return result
         if (
             not isinstance(result, dict)
             or not result.get("handled")
@@ -854,6 +862,8 @@ def _continue_choice_modal_result(
             persist_user_message=None,
             moa_config=moa_config,
         )
+    if isinstance(result, dict) and result.get("choice_prompt_paused") is True:
+        return result
     if (
         not isinstance(result, dict)
         or not result.get("handled")

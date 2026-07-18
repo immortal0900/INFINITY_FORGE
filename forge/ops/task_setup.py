@@ -258,6 +258,7 @@ class TurnResult:
     task_text: str | None = None
     task_request: TaskCreationRequest | None = None
     task_request_v2: TaskRequestV2 | None = None
+    choice_prompt_paused: bool = False
 
     @classmethod
     def continue_original(cls) -> "TurnResult":
@@ -279,6 +280,7 @@ class TurnResult:
         task_text: str | None = None,
         task_request: TaskCreationRequest | None = None,
         task_request_v2: TaskRequestV2 | None = None,
+        choice_prompt_paused: bool = False,
     ) -> "TurnResult":
         return cls(
             action="handled",
@@ -290,6 +292,7 @@ class TurnResult:
             task_text=task_text,
             task_request=task_request,
             task_request_v2=task_request_v2,
+            choice_prompt_paused=choice_prompt_paused,
         )
 
 
@@ -655,6 +658,35 @@ class TaskSetup:
         with self._lock:
             self._sweep(current_time)
             return self._enter_chat(key, current_time)
+
+    def recover_in_chat(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        fallback_text: str,
+        surface: str = DEFAULT_SURFACE,
+        now: datetime | None = None,
+    ) -> TurnResult:
+        """Enter Chat and replay the stashed first input exactly once."""
+
+        if not isinstance(fallback_text, str):
+            raise ValueError("fallback_text must be a string")
+        current_time = now or self._clock()
+        key = (surface, session_id, user_id)
+        with self._lock:
+            self._sweep(current_time)
+            draft = self._drafts.get(key)
+            had_draft = draft is not None
+            stashed_input = None if draft is None else draft.first_input
+            self._store_chat(key, current_time)
+            if stashed_input is not None:
+                return TurnResult.replace(stashed_input)
+            if not had_draft:
+                return TurnResult.replace(fallback_text)
+            return TurnResult.handled(
+                "Task setup cancelled. Continuing in Chat."
+            )
 
     def _enter_chat(self, key: SessionKey, now: datetime) -> TurnResult:
         self._drafts.pop(key, None)
@@ -1202,6 +1234,7 @@ class TaskSetup:
             selection=selection,
             task_text=draft.task_text,
             task_request_v2=draft.task_request_v2,
+            choice_prompt_paused=True,
         )
 
     def _finish_task(

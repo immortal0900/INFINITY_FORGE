@@ -136,6 +136,27 @@ def test_chat_replays_first_message_exactly_once_without_external_writes() -> No
     assert following_turn == TurnResult.continue_original()
 
 
+def test_chat_recovery_uses_stashed_first_input_not_failed_choice_text() -> None:
+    setup = TaskSetup()
+    setup.handle("recover", "u1", "원래 구현 요청", NOW)
+
+    recovered = setup.recover_in_chat(
+        "recover",
+        "u1",
+        fallback_text="ignored selection text",
+        now=NOW + timedelta(seconds=1),
+    )
+    next_turn = setup.handle(
+        "recover",
+        "u1",
+        "다음 질문",
+        NOW + timedelta(seconds=2),
+    )
+
+    assert recovered == TurnResult.replace("원래 구현 요청")
+    assert next_turn.action == "continue"
+
+
 def test_task_requires_flow_then_merge_mode_and_uses_stashed_input() -> None:
     setup = TaskSetup()
 
@@ -711,6 +732,7 @@ def test_v2_task_selects_projects_and_builds_exact_repeated_merge_order(
     assert prepared.task_request is None
     assert validated == [alpha, beta]
     assert setup.pending_choice_prompt("s1", "alice") == preview.choice_prompt
+    assert prepared.choice_prompt_paused is True
 
 
 def test_project_aliases_for_same_repository_cannot_be_selected_together(

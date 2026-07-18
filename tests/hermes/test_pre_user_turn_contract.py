@@ -98,7 +98,7 @@ def test_handled_preserves_valid_structured_choices(monkeypatch) -> None:
 
 
 def test_handled_preserves_the_complete_choice_prompt_envelope(monkeypatch) -> None:
-    prompt = _choice_prompt()
+    prompt = {**_choice_prompt(), "choice_prompt_paused": True}
 
     result = _run_changed_source(
         monkeypatch,
@@ -267,6 +267,10 @@ def test_structured_chat_replace_calls_model_once_with_stashed_text(monkeypatch)
         pytest.param({"min_choices": 0}, id="multiple-min-below-one"),
         pytest.param({"min_choices": 2, "max_choices": 1}, id="multiple-max-below-min"),
         pytest.param({"max_choices": 3}, id="multiple-max-above-choices"),
+        pytest.param(
+            {"choice_prompt_paused": "yes"},
+            id="paused-flag-not-bool",
+        ),
     ],
 )
 def test_conversation_and_modal_reject_the_same_malformed_prompts(

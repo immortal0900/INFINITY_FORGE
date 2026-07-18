@@ -1124,6 +1124,7 @@ def test_v2_confirmation_is_gated_without_any_v1_write(
     assert gated["action"] == "handled"
     assert "not enabled" in str(gated["text"]).lower()
     assert gated["choice_prompt_id"] == preview["choice_prompt_id"]
+    assert gated["choice_prompt_paused"] is True
     assert calls == []
     assert plugin._pending_tasks == {}
 
@@ -1359,6 +1360,41 @@ def test_chat_choice_never_loads_v2_configuration(monkeypatch) -> None:
 
     assert replay == {"action": "replace", "text": "일반 질문"}
     assert calls == 0
+
+
+def test_context_failure_continue_chat_recovers_stashed_first_input(
+    monkeypatch,
+) -> None:
+    def unavailable(_working_directory):
+        raise RuntimeError("Task config unavailable")
+
+    monkeypatch.setattr(plugin, "_task_context_factory", unavailable)
+    shown = plugin.before_user_turn(
+        session_id="recover-context",
+        user_id="u1",
+        text="원래 구현 요청",
+    )
+    failed = plugin.before_user_turn(
+        session_id="recover-context",
+        user_id="u1",
+        text="ignored selection text",
+        choice_prompt_id=shown["choice_prompt_id"],
+        selected_choice_ids=["task"],
+    )
+    recovered = plugin.before_user_turn(
+        session_id="recover-context",
+        user_id="u1",
+        text="continue_chat",
+    )
+    next_turn = plugin.before_user_turn(
+        session_id="recover-context",
+        user_id="u1",
+        text="다음 질문",
+    )
+
+    assert "Task config unavailable" in str(failed["text"])
+    assert recovered == {"action": "replace", "text": "원래 구현 요청"}
+    assert next_turn == {"action": "continue"}
 
 
 def test_invalid_task_submission_is_rejected_before_loading_config(

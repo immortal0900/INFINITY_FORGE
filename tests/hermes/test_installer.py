@@ -1679,6 +1679,48 @@ def test_two_hundred_sixty_second_prompt_stops_after_261_reentries() -> None:
     assert "too many consecutive prompts" in result["final_response"]
 
 
+def test_two_hundred_sixty_first_reentry_may_pause_the_confirm_chooser() -> None:
+    namespace: dict[str, object] = {"queue": queue}
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    prompt = _valid_cli_prompt()
+    paused = {
+        **prompt,
+        "final_response": "Task validated, but v2 Task creation is not enabled yet.",
+        "messages": [{"role": "assistant", "content": "validated"}],
+        "api_calls": 0,
+        "completed": True,
+        "handled": True,
+        "choice_prompt_paused": True,
+    }
+    calls = 0
+
+    class Agent:
+        @staticmethod
+        def run_conversation(**kwargs):
+            nonlocal calls
+            calls += 1
+            return paused if calls == 261 else dict(prompt)
+
+    cli = namespace["ModalShell"]()
+    cli.agent = Agent()
+    cli._prompt_choice_modal = lambda _prompt: {
+        "choice_prompt_id": prompt["choice_prompt_id"],
+        "selected_choice_ids": ["chat"],
+    }
+
+    result = cli._continue_choice_modal_result(
+        dict(prompt),
+        conversation_history=[{"role": "assistant", "content": "base"}],
+        stream_callback=None,
+        task_id="session-1",
+        moa_config=None,
+    )
+
+    assert calls == 261
+    assert result is paused
+    assert result["choice_prompt_paused"] is True
+
+
 def test_cli_reentries_keep_only_base_history_until_chat_reaches_the_model(
     monkeypatch,
 ) -> None:

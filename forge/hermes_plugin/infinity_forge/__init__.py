@@ -472,6 +472,8 @@ def _hook_result(result: TurnResult) -> dict[str, object]:
     if result.choice_prompt is not None:
         # RISK(breaking): surfaces must receive one validated chooser envelope.
         payload.update(result.choice_prompt.metadata())
+        if result.choice_prompt_paused:
+            payload["choice_prompt_paused"] = True
     elif result.choices:
         payload["choices"] = [
             {"id": choice, "label": _CHOICE_LABELS[choice]}
@@ -734,6 +736,29 @@ def _finish_task_service_call(
     return _hook_result(TurnResult.handled(message))
 
 
+def _recover_failed_input_in_chat(
+    failed: _FailedInput,
+    key: StateKey,
+    now: datetime,
+) -> TurnResult:
+    recover = getattr(_task_setup, "recover_in_chat", None)
+    if callable(recover):
+        return recover(
+            key[1],
+            key[2],
+            surface=key[0],
+            fallback_text=failed.text,
+            now=now,
+        )
+    _task_setup.enter_chat(
+        key[1],
+        key[2],
+        surface=key[0],
+        now=now,
+    )
+    return TurnResult.replace(failed.text)
+
+
 def before_user_turn(
     event: Mapping[str, object] | None = None,
     **values: object,
@@ -773,18 +798,16 @@ def before_user_turn(
                 failed = _failed_inputs.get(key)
                 if failed is not None and choice == "continue_chat":
                     _failed_inputs.pop(key, None)
-                    surface, session_id, user_id = key
                     try:
-                        _task_setup.enter_chat(
-                            session_id,
-                            user_id,
-                            surface=surface,
-                            now=cleanup_time,
+                        recovered = _recover_failed_input_in_chat(
+                            failed,
+                            key,
+                            cleanup_time,
                         )
                     except Exception as setup_error:
                         _failed_inputs[key] = failed
                         return _error_result(setup_error)
-                    return _hook_result(TurnResult.replace(failed.text))
+                    return _hook_result(recovered)
                 if failed is not None and choice == "retry":
                     _store_failed_input(
                         key,
@@ -822,18 +845,16 @@ def before_user_turn(
                 if failed is not None:
                     if choice == "continue_chat":
                         _failed_inputs.pop(key, None)
-                        surface, session_id, user_id = key
                         try:
-                            _task_setup.enter_chat(
-                                session_id,
-                                user_id,
-                                surface=surface,
-                                now=cleanup_time,
+                            recovered = _recover_failed_input_in_chat(
+                                failed,
+                                key,
+                                cleanup_time,
                             )
                         except Exception as error:
                             _failed_inputs[key] = failed
                             return _error_result(error)
-                        return _hook_result(TurnResult.replace(failed.text))
+                        return _hook_result(recovered)
                     if choice == "retry":
                         _failed_inputs.pop(key, None)
                         preserved_text = failed.text
