@@ -163,22 +163,22 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 - Desktop: button·checkbox with keyboard/ARIA
 - Slack: Block Kit button or multi-select; exact-ID fallback
 
-- [ ] **Step 1: message.complete chooser payload가 현재 각 UI에서 무시되는 RED fixture 작성**
+- [x] **Step 1: message.complete chooser payload가 현재 각 UI에서 무시되는 RED fixture 작성**
 
   chooser가 session별로 격리되고 stale click, duplicate click, unknown ID를 제출하지 않는 test를
   포함한다.
 
-- [ ] **Step 2: TUI overlay와 Desktop chooser store/component source transforms 구현**
+- [x] **Step 2: TUI overlay와 Desktop chooser store/component source transforms 구현**
 
   normal `prompt.submit`에 label을 넣지 않고 chooser submission envelope를 보낸다. 일반 clarify
   request ID와 Forge chooser prompt ID를 섞지 않는다.
 
-- [ ] **Step 3: Slack structured control과 fallback 구현**
+- [x] **Step 3: Slack structured control과 fallback 구현**
 
   방향키를 사용할 수 없는 Slack은 button/static select를 사용한다. action 검증이 불가능한
   client는 `ID — Label` 표시와 exact-ID 답장만 제공한다.
 
-- [ ] **Step 4: staged Hermes checkout에서 TypeScript test 실행**
+- [x] **Step 4: staged Hermes checkout에서 TypeScript test 실행**
 
   Run: `npm --prefix ui-tui test -- --runInBand`
 
@@ -186,7 +186,7 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 
   Expected: chooser component와 기존 clarify test PASS
 
-- [ ] **Step 5: Forge carried-change test 후 commit**
+- [x] **Step 5: Forge carried-change test 후 commit**
 
   Run: `python -m pytest tests/hermes/ tests/ops/test_workflow_contract.py -q`
 
