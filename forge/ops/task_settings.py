@@ -7,7 +7,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Iterator, Mapping
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -488,12 +488,6 @@ class TaskSettingsStore:
             raise TaskSettingsError(str(error)) from error
         self.database_path = self._database.database_path
 
-    def _connect(self) -> sqlite3.Connection:
-        try:
-            return self._database.connect()
-        except TaskDatabaseError as error:
-            raise TaskSettingsError(str(error)) from error
-
     def prepare(self, settings: TaskSettings) -> TaskSettings:
         if not isinstance(settings, TaskSettings):
             raise TaskSettingsError("settings must be a TaskSettings")
@@ -668,8 +662,7 @@ class TaskSettingsStore:
     def get_active(self, request_id: str) -> TaskSettings | None:
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.read() as connection,
         ):
             exists = connection.execute(
                 "SELECT 1 FROM task_settings WHERE request_id = ?",
@@ -702,8 +695,7 @@ class TaskSettingsStore:
     def list_events(self, request_id: str) -> tuple[TaskSettingsEvent, ...]:
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.read() as connection,
         ):
             self._load_settings(connection, request_id)
             return self._load_events(connection, request_id)
@@ -790,8 +782,7 @@ class TaskSettingsStore:
             raise TaskSettingsError("applied branch refresh count is invalid")
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.read() as connection,
         ):
             settings = self._load_settings(connection, request_id)
             if settings.status is not TaskSettingsStatus.ACTIVE:

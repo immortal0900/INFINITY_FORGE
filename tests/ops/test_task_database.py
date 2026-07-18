@@ -4,7 +4,9 @@ import json
 import os
 import sqlite3
 import stat
+import threading
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -42,9 +44,13 @@ EXPECTED_TABLES = {
 }
 
 
-def _create_seeded_v1_database(path: Path) -> None:
+def _create_seeded_v1_database(
+    path: Path,
+    *,
+    stored_format_version: str = "forge-task-settings/v1",
+) -> None:
     with sqlite3.connect(path) as connection:
-        connection.executescript(
+        schema = (
             """
             CREATE TABLE task_settings (
                 request_id TEXT PRIMARY KEY,
@@ -138,13 +144,18 @@ def _create_seeded_v1_database(path: Path) -> None:
             PRAGMA user_version = 1;
             """
         )
+        schema = schema.replace(
+            "'forge-task-settings/v1'",
+            f"'{stored_format_version}'",
+        )
+        connection.executescript(schema)
         connection.execute(
             """
             INSERT INTO task_settings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 REQUEST_ID,
-                "forge-task-settings/v1",
+                stored_format_version,
                 "openai/infinity-forge",
                 "task",
                 CONTENT_HASH,
@@ -214,6 +225,41 @@ def _schema_objects(path: Path) -> set[tuple[str, str]]:
         }
 
 
+def _save_surface_event(database: TaskDatabase, event_id: str) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO surface_events (
+                source_event_id,
+                subject_id,
+                session_id,
+                surface,
+                payload_hash,
+                state,
+                received_at,
+                retention_until
+            ) VALUES (?, 'user-1', 'session-1', 'cli', ?, 'received', 'now', 'later')
+            """,
+            (event_id, "a" * 64),
+        )
+
+
+def _replace_surface_events(database: TaskDatabase, event_id: str) -> None:
+    with database.transaction() as connection:
+        connection.execute("DELETE FROM surface_events")
+    _save_surface_event(database, event_id)
+
+
+def _surface_event_ids(database: TaskDatabase) -> list[str]:
+    with closing(database.connect()) as connection:
+        return [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT source_event_id FROM surface_events ORDER BY source_event_id"
+            )
+        ]
+
+
 def test_seeded_v1_migration_preserves_rows_events_and_public_readback(
     tmp_path: Path,
 ) -> None:
@@ -253,6 +299,20 @@ def test_migration_installs_the_exact_v2_object_set(tmp_path: Path) -> None:
     }
     assert foreign_key_errors == []
     assert database.quick_check() == "ok"
+
+
+def test_migration_rejects_literal_case_drift_in_the_v1_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "task-settings.db"
+    _create_seeded_v1_database(
+        database_path,
+        stored_format_version="FORGE-TASK-SETTINGS/V1",
+    )
+
+    with pytest.raises(TaskDatabaseError, match="schema does not match"):
+        TaskDatabase(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
 
 
 def test_mid_ddl_failure_rolls_back_and_retry_migrates_once(
@@ -411,6 +471,105 @@ def test_backup_restore_is_checked_and_does_not_replace_live_db_on_failure(
             "SELECT COUNT(*) FROM surface_events"
         ).fetchone()[0]
     assert count_after_failure == 1
+
+
+def _database_with_different_live_and_backup(
+    tmp_path: Path,
+) -> tuple[TaskDatabase, Path]:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "archived-event")
+    backup_path = database.backup(tmp_path / "backup.db")
+    _replace_surface_events(database, "live-event")
+    return database, backup_path
+
+
+def test_restore_rolls_back_live_database_when_post_publish_acl_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+    real_apply = task_database_module._apply_owner_only_permissions
+    failed = False
+
+    def fail_first_live_acl(path: Path) -> None:
+        nonlocal failed
+        if path == database.database_path and not failed:
+            failed = True
+            raise TaskDatabaseError("forced ACL failure")
+        real_apply(path)
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_apply_owner_only_permissions",
+        fail_first_live_acl,
+    )
+
+    with pytest.raises(TaskDatabaseError, match="could not be restored safely"):
+        database.restore(backup_path)
+
+    assert _surface_event_ids(database) == ["live-event"]
+    assert database.verify_owner_only_permissions()
+    assert database.quick_check() == "ok"
+
+
+def test_restore_rolls_back_live_database_when_post_publish_initialize_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+
+    def fail_initialize(*, _operation_locked: bool = False) -> None:
+        del _operation_locked
+        raise TaskDatabaseError("forced initialize failure")
+
+    monkeypatch.setattr(database, "_initialize", fail_initialize)
+
+    with pytest.raises(TaskDatabaseError, match="could not be restored safely"):
+        database.restore(backup_path)
+
+    assert _surface_event_ids(database) == ["live-event"]
+    assert database.verify_owner_only_permissions()
+
+
+def test_restore_rolls_back_live_database_when_final_quick_check_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+    def fail_final_quick_check(*, _operation_locked: bool = False) -> str:
+        del _operation_locked
+        raise TaskDatabaseError("forced final quick_check failure")
+
+    monkeypatch.setattr(database, "quick_check", fail_final_quick_check)
+
+    with pytest.raises(TaskDatabaseError, match="could not be restored safely"):
+        database.restore(backup_path)
+
+    assert _surface_event_ids(database) == ["live-event"]
+    assert database.verify_owner_only_permissions()
+
+
+def test_restore_rejects_a_concurrent_write_before_publish(tmp_path: Path) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+
+    def hold_writer() -> None:
+        with database.transaction():
+            writer_started.set()
+            assert release_writer.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(hold_writer)
+        assert writer_started.wait(timeout=5)
+        try:
+            with pytest.raises(TaskDatabaseError, match="offline"):
+                database.restore(backup_path)
+        finally:
+            release_writer.set()
+        future.result(timeout=5)
+
+    assert _surface_event_ids(database) == ["live-event"]
 
 
 def test_backup_cannot_overwrite_the_live_database(tmp_path: Path) -> None:

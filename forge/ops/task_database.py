@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
 import re
+import shutil
 import sqlite3
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 
 TASK_DATABASE_SCHEMA_VERSION = 2
+_OPERATION_LOCK_TIMEOUT_SECONDS = 5.0
+_OPERATION_LOCK_RETRY_SECONDS = 0.01
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 _V1_TASK_SETTINGS_SQL = """
 CREATE TABLE task_settings (
@@ -467,12 +474,23 @@ class TaskDatabaseError(RuntimeError):
     """Raised when the shared Task database cannot be trusted."""
 
 
+@dataclass(frozen=True, slots=True)
+class _RestorePreimage:
+    files: dict[str, Path]
+    digests: dict[str, str]
+
+    @property
+    def rollback_artifact(self) -> Path:
+        return self.files[""]
+
+
 class TaskDatabase:
     """Open, migrate, validate, back up, and restore one Task SQLite file."""
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = _prepare_database_path(database_path)
         _ensure_secure_database_file(self.database_path)
+        self._operation_lock_path = _prepare_operation_lock_path(self.database_path)
         self._initialize()
         _apply_owner_only_permissions(self.database_path)
         if not self.verify_owner_only_permissions():
@@ -502,10 +520,23 @@ class TaskDatabase:
         return connection
 
     @contextmanager
+    def read(self) -> Iterator[sqlite3.Connection]:
+        """Keep restore excluded for the lifetime of one read connection."""
+
+        with (
+            _database_operation_lock(self._operation_lock_path),
+            closing(self.connect()) as connection,
+        ):
+            yield connection
+
+    @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """Serialize a mutable operation with the shared BEGIN IMMEDIATE lock."""
 
-        with closing(self.connect()) as connection:
+        with (
+            _database_operation_lock(self._operation_lock_path),
+            closing(self.connect()) as connection,
+        ):
             try:
                 _begin_immediate(connection)
                 yield connection
@@ -523,9 +554,12 @@ class TaskDatabase:
                     ) from error
                 raise
 
-    def quick_check(self) -> str:
+    def quick_check(self, *, _operation_locked: bool = False) -> str:
         """Return ``ok`` only when SQLite verifies every database page."""
 
+        if not _operation_locked:
+            with _database_operation_lock(self._operation_lock_path):
+                return self.quick_check(_operation_locked=True)
         with closing(self.connect()) as connection:
             return _quick_check(connection)
 
@@ -539,6 +573,10 @@ class TaskDatabase:
 
         destination = _prepare_output_path(destination_path)
         _require_distinct_paths(self.database_path, destination)
+        with _database_operation_lock(self._operation_lock_path):
+            return self._backup_locked(destination)
+
+    def _backup_locked(self, destination: Path) -> Path:
         temporary = _new_secure_temporary_file(destination.parent, "backup")
         try:
             with (
@@ -568,7 +606,18 @@ class TaskDatabase:
 
         backup = _prepare_existing_input_path(backup_path)
         _require_distinct_paths(self.database_path, backup)
+        with _database_operation_lock(
+            self._operation_lock_path,
+            timeout_seconds=0.0,
+            busy_message="Task database restore requires offline access",
+        ):
+            self._restore_locked(backup)
+
+    def _restore_locked(self, backup: Path) -> None:
         temporary = _new_secure_temporary_file(self.database_path.parent, "restore")
+        preimage: _RestorePreimage | None = None
+        published = False
+        keep_rollback_artifact = False
         try:
             with (
                 closing(_connect_database_file(backup, mode="ro")) as source,
@@ -578,92 +627,116 @@ class TaskDatabase:
                 target.commit()
                 _quick_check(target)
                 _validate_supported_schema(target)
-
-            # A v1 backup is migrated while still staged. A migration failure cannot
-            # replace the live database.
-            TaskDatabase(temporary)
+                _initialize_database_connection(target)
+                _quick_check(target)
+                _validate_exact_schema(
+                    target,
+                    _EXPECTED_SCHEMA,
+                    TASK_DATABASE_SCHEMA_VERSION,
+                )
             _sync_file(temporary)
-            self.quick_check()
-            _assert_safe_file(self.database_path, required=True)
+            with _offline_database_gate(self.database_path) as live:
+                _quick_check(live)
+                _validate_supported_schema(live)
+                preimage = _capture_restore_preimage(self.database_path)
+            _assert_live_matches_preimage(self.database_path, preimage)
 
             # RISK(data-loss): restore is an explicit offline replacement boundary.
-            # The staged copy is fully checked before this single filesystem write.
+            # A verified owner-only preimage remains beside the live file until every
+            # post-publish check succeeds or the exact original files are restored.
             os.replace(temporary, self.database_path)
+            published = True
             _remove_sqlite_sidecars(self.database_path)
             _apply_owner_only_permissions(self.database_path)
-            self._initialize()
-            self.quick_check()
-        except TaskDatabaseError as error:
-            raise TaskDatabaseError(
-                "Task database backup could not be restored safely"
-            ) from error
-        except (OSError, sqlite3.Error) as error:
+            self._initialize(_operation_locked=True)
+            self.quick_check(_operation_locked=True)
+            if not self.verify_owner_only_permissions():
+                raise TaskDatabaseError(
+                    "restored Task database permissions are unsafe"
+                )
+        except BaseException as error:
+            if published and preimage is not None:
+                try:
+                    _restore_preimage(self.database_path, preimage)
+                except BaseException as rollback_error:
+                    keep_rollback_artifact = True
+                    raise TaskDatabaseError(
+                        "Task database restore failed and rollback failed; "
+                        f"rollback artifact: {preimage.rollback_artifact}"
+                    ) from rollback_error
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
             raise TaskDatabaseError(
                 "Task database backup could not be restored safely"
             ) from error
         finally:
             _remove_temporary_file(temporary)
+            if preimage is not None and not keep_rollback_artifact:
+                _remove_restore_preimage(preimage)
 
-    def _initialize(self) -> None:
+    def _initialize(self, *, _operation_locked: bool = False) -> None:
+        if not _operation_locked:
+            with _database_operation_lock(self._operation_lock_path):
+                self._initialize(_operation_locked=True)
+            return
         with closing(self.connect()) as connection:
-            try:
-                _begin_immediate(connection)
-                version = _user_version(connection)
-                objects = _load_schema_objects(connection)
-                if not objects:
-                    if version != 0:
-                        raise TaskDatabaseError(
-                            "Task database schema version "
-                            f"{version} is not supported"
-                        )
-                    for statement in _V1_SCHEMA_STATEMENTS:
-                        connection.execute(statement)
-                    for statement in _V2_SCHEMA_STATEMENTS:
-                        connection.execute(statement)
-                    connection.execute(
-                        f"PRAGMA user_version = {TASK_DATABASE_SCHEMA_VERSION}"
-                    )
-                elif version == 1:
-                    _validate_exact_schema(connection, _V1_EXPECTED_SCHEMA, 1)
-                    # RISK(breaking): v1 objects and rows are immutable. Every v2
-                    # object and the version marker are added in this transaction.
-                    for statement in _V2_SCHEMA_STATEMENTS:
-                        connection.execute(statement)
-                    connection.execute(
-                        f"PRAGMA user_version = {TASK_DATABASE_SCHEMA_VERSION}"
-                    )
-                elif version != TASK_DATABASE_SCHEMA_VERSION:
-                    raise TaskDatabaseError(
-                        "Task database schema version "
-                        f"{version} is not supported; expected "
-                        f"{TASK_DATABASE_SCHEMA_VERSION}"
-                    )
+            _initialize_database_connection(connection)
 
-                _validate_exact_schema(
-                    connection,
-                    _EXPECTED_SCHEMA,
-                    TASK_DATABASE_SCHEMA_VERSION,
+
+def _initialize_database_connection(connection: sqlite3.Connection) -> None:
+    try:
+        _begin_immediate(connection)
+        version = _user_version(connection)
+        objects = _load_schema_objects(connection)
+        if not objects:
+            if version != 0:
+                raise TaskDatabaseError(
+                    f"Task database schema version {version} is not supported"
                 )
-                _quick_check(connection)
-                if connection.execute("PRAGMA foreign_key_check").fetchall():
-                    raise TaskDatabaseError(
-                        "Task database foreign key check failed"
-                    )
-                connection.commit()
-            except BaseException as error:
-                try:
-                    connection.rollback()
-                except sqlite3.Error as rollback_error:
-                    raise TaskDatabaseError(
-                        "Task database operation failed during rollback"
-                    ) from rollback_error
-                if isinstance(error, TaskDatabaseError):
-                    raise
-                if isinstance(error, sqlite3.Error):
-                    raise TaskDatabaseError(
-                        "Task database operation failed"
-                    ) from error
-                raise
+            for statement in _V1_SCHEMA_STATEMENTS:
+                connection.execute(statement)
+            for statement in _V2_SCHEMA_STATEMENTS:
+                connection.execute(statement)
+            connection.execute(
+                f"PRAGMA user_version = {TASK_DATABASE_SCHEMA_VERSION}"
+            )
+        elif version == 1:
+            _validate_exact_schema(connection, _V1_EXPECTED_SCHEMA, 1)
+            # RISK(breaking): v1 objects and rows are immutable. Every v2 object
+            # and the version marker are added in this one transaction.
+            for statement in _V2_SCHEMA_STATEMENTS:
+                connection.execute(statement)
+            connection.execute(
+                f"PRAGMA user_version = {TASK_DATABASE_SCHEMA_VERSION}"
+            )
+        elif version != TASK_DATABASE_SCHEMA_VERSION:
+            raise TaskDatabaseError(
+                "Task database schema version "
+                f"{version} is not supported; expected "
+                f"{TASK_DATABASE_SCHEMA_VERSION}"
+            )
+
+        _validate_exact_schema(
+            connection,
+            _EXPECTED_SCHEMA,
+            TASK_DATABASE_SCHEMA_VERSION,
+        )
+        _quick_check(connection)
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise TaskDatabaseError("Task database foreign key check failed")
+        connection.commit()
+    except BaseException as error:
+        try:
+            connection.rollback()
+        except sqlite3.Error as rollback_error:
+            raise TaskDatabaseError(
+                "Task database operation failed during rollback"
+            ) from rollback_error
+        if isinstance(error, TaskDatabaseError):
+            raise
+        if isinstance(error, sqlite3.Error):
+            raise TaskDatabaseError("Task database operation failed") from error
+        raise
 
 
 def _begin_immediate(connection: sqlite3.Connection) -> None:
@@ -687,7 +760,49 @@ def _quick_check(connection: sqlite3.Connection) -> str:
 
 
 def _normalize_schema_sql(value: str) -> str:
-    return " ".join(value.strip().rstrip(";").split()).casefold()
+    normalized: list[str] = []
+    pending_space = False
+    quote: str | None = None
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote is not None:
+            normalized.append(character)
+            closing_quote = "]" if quote == "[" else quote
+            if character == closing_quote:
+                if index + 1 < len(value) and value[index + 1] == closing_quote:
+                    normalized.append(value[index + 1])
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+
+        if character.isspace():
+            pending_space = bool(normalized)
+            index += 1
+            continue
+        if character in {"'", '"', "`", "["}:
+            if pending_space:
+                normalized.append(" ")
+                pending_space = False
+            quote = character
+            normalized.append(character)
+            index += 1
+            continue
+        if character == ";" and not value[index + 1 :].strip():
+            break
+        if pending_space:
+            normalized.append(" ")
+            pending_space = False
+        normalized.append(
+            chr(ord(character) + 32) if "A" <= character <= "Z" else character
+        )
+        index += 1
+
+    if quote is not None:
+        raise TaskDatabaseError("Task database schema SQL contains an open quote")
+    return "".join(normalized).strip()
 
 
 def _load_schema_objects(
@@ -777,6 +892,100 @@ def _prepare_database_path(database_path: str | Path) -> Path:
         raise TaskDatabaseError("database parent directory must be a directory")
     _assert_safe_file(resolved, required=False)
     return resolved
+
+
+def _prepare_operation_lock_path(database_path: Path) -> Path:
+    lock_path = database_path.with_name(f"{database_path.name}.operation.lock")
+    _assert_no_symlink_components(lock_path)
+    _ensure_secure_database_file(lock_path)
+    return lock_path
+
+
+@contextmanager
+def _database_operation_lock(
+    lock_path: Path,
+    *,
+    timeout_seconds: float = _OPERATION_LOCK_TIMEOUT_SECONDS,
+    busy_message: str = "Task database operation lock timed out",
+) -> Iterator[None]:
+    _assert_safe_file(lock_path, required=True)
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOINHERIT", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags)
+    except OSError as error:
+        raise TaskDatabaseError("Task database operation lock is unsafe") from error
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = os.lstat(lock_path)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise TaskDatabaseError("Task database operation lock is not a file")
+        if stat.S_ISLNK(path_stat.st_mode) or (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        ) != (path_stat.st_dev, path_stat.st_ino):
+            raise TaskDatabaseError("Task database operation lock path changed")
+        if descriptor_stat.st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        _acquire_operation_lock(
+            descriptor,
+            timeout_seconds=timeout_seconds,
+            busy_message=busy_message,
+        )
+        try:
+            yield
+        finally:
+            _release_operation_lock(descriptor)
+    except TaskDatabaseError:
+        raise
+    except OSError as error:
+        raise TaskDatabaseError("Task database operation lock failed") from error
+    finally:
+        os.close(descriptor)
+
+
+def _acquire_operation_lock(
+    descriptor: int,
+    *,
+    timeout_seconds: float,
+    busy_message: str,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as error:
+            if time.monotonic() >= deadline:
+                raise TaskDatabaseError(busy_message) from error
+            time.sleep(_OPERATION_LOCK_RETRY_SECONDS)
+
+
+def _release_operation_lock(descriptor: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError as error:
+        raise TaskDatabaseError(
+            "Task database operation lock could not be released"
+        ) from error
 
 
 def _prepare_output_path(path: str | Path) -> Path:
@@ -881,6 +1090,126 @@ def _connect_database_file(path: Path, *, mode: str) -> sqlite3.Connection:
     return connection
 
 
+@contextmanager
+def _offline_database_gate(path: Path) -> Iterator[sqlite3.Connection]:
+    connection = _connect_database_file(path, mode="rw")
+    try:
+        connection.execute("PRAGMA busy_timeout = 0")
+        try:
+            connection.execute("BEGIN EXCLUSIVE")
+        except sqlite3.Error as error:
+            raise TaskDatabaseError(
+                "Task database restore requires offline access"
+            ) from error
+        yield connection
+    finally:
+        try:
+            connection.rollback()
+        finally:
+            connection.close()
+
+
+def _database_file_paths(database_path: Path) -> dict[str, Path]:
+    paths = {"": database_path}
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        sidecar = Path(f"{database_path}{suffix}")
+        if sidecar.exists():
+            _assert_safe_file(sidecar, required=True)
+            paths[suffix] = sidecar
+    return paths
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as error:
+        raise TaskDatabaseError("Task database file could not be hashed") from error
+    return digest.hexdigest()
+
+
+def _database_file_digests(database_path: Path) -> dict[str, str]:
+    return {
+        suffix: _file_sha256(path)
+        for suffix, path in _database_file_paths(database_path).items()
+    }
+
+
+def _capture_restore_preimage(database_path: Path) -> _RestorePreimage:
+    source_paths = _database_file_paths(database_path)
+    source_digests = {
+        suffix: _file_sha256(path) for suffix, path in source_paths.items()
+    }
+    captured: dict[str, Path] = {}
+    try:
+        for suffix, source in source_paths.items():
+            artifact = _new_secure_temporary_file(
+                database_path.parent,
+                "rollback-preimage",
+            )
+            captured[suffix] = artifact
+            shutil.copyfile(source, artifact)
+            _apply_owner_only_permissions(artifact)
+            _sync_file(artifact)
+            if not _verify_owner_only_permissions(artifact):
+                raise TaskDatabaseError("rollback artifact permissions are unsafe")
+            if _file_sha256(artifact) != source_digests[suffix]:
+                raise TaskDatabaseError("rollback artifact does not match live data")
+        preimage = _RestorePreimage(files=captured, digests=source_digests)
+        _assert_live_matches_preimage(database_path, preimage)
+        return preimage
+    except BaseException:
+        for artifact in captured.values():
+            _remove_temporary_file(artifact)
+        raise
+
+
+def _assert_live_matches_preimage(
+    database_path: Path,
+    preimage: _RestorePreimage,
+) -> None:
+    if _database_file_digests(database_path) != preimage.digests:
+        raise TaskDatabaseError("live Task database changed during offline restore")
+
+
+def _publish_preimage_file(source: Path, destination: Path) -> None:
+    temporary = _new_secure_temporary_file(destination.parent, "rollback-publish")
+    try:
+        shutil.copyfile(source, temporary)
+        _apply_owner_only_permissions(temporary)
+        _sync_file(temporary)
+        if _file_sha256(temporary) != _file_sha256(source):
+            raise TaskDatabaseError("rollback publish copy is not exact")
+        os.replace(temporary, destination)
+    finally:
+        _remove_temporary_file(temporary)
+
+
+def _restore_preimage(
+    database_path: Path,
+    preimage: _RestorePreimage,
+) -> None:
+    _remove_sqlite_sidecars(database_path)
+    _publish_preimage_file(preimage.files[""], database_path)
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        artifact = preimage.files.get(suffix)
+        if artifact is not None:
+            _publish_preimage_file(artifact, Path(f"{database_path}{suffix}"))
+    _assert_live_matches_preimage(database_path, preimage)
+    if not _verify_owner_only_permissions(database_path):
+        raise TaskDatabaseError("rolled back Task database permissions are unsafe")
+    with closing(_connect_database_file(database_path, mode="rw")) as connection:
+        _quick_check(connection)
+        _validate_supported_schema(connection)
+
+
+def _remove_restore_preimage(preimage: _RestorePreimage) -> None:
+    for artifact in preimage.files.values():
+        _remove_temporary_file(artifact)
+
+
 def _new_secure_temporary_file(directory: Path, purpose: str) -> Path:
     try:
         descriptor, raw_path = tempfile.mkstemp(
@@ -909,7 +1238,7 @@ def _remove_temporary_file(path: Path) -> None:
 
 
 def _remove_sqlite_sidecars(database_path: Path) -> None:
-    for suffix in ("-wal", "-shm"):
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
         sidecar = Path(f"{database_path}{suffix}")
         try:
             if sidecar.exists():
