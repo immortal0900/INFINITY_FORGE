@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -14,6 +14,7 @@ from .task_options import MergeMode, Mode, TaskFlow
 from .task_projects import (
     TaskProject,
     TaskProjectError,
+    _validate_task_project_live,
     _validate_repository,
 )
 from .task_settings import (
@@ -83,23 +84,46 @@ class TaskSettingsV2Error(ValueError):
     """Raised when a v2 request or settings record is not exact and canonical."""
 
 
+@dataclass(frozen=True, slots=True)
+class _ParseFailure:
+    message: str
+
+
+def _try_utf8_encode(value: str) -> bytes | None:
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+
+
 def _canonical_hash(payload: Mapping[str, object]) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _canonical_json(payload: Mapping[str, object]) -> str:
-    return json.dumps(
+    rendered = json.dumps(
         payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+    encoded = _try_utf8_encode(rendered)
+    if encoded is None:
+        payload = {}
+        rendered = ""
+        raise TaskSettingsV2Error("record text must be valid UTF-8") from None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_json(payload: Mapping[str, object]) -> str:
+    rendered = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    encoded = _try_utf8_encode(rendered)
+    if encoded is None:
+        payload = {}
+        rendered = ""
+        raise TaskSettingsV2Error("record text must be valid UTF-8") from None
+    return encoded.decode("utf-8")
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -127,7 +151,7 @@ def _load_json_object(raw: object, label: str) -> dict[str, object]:
         )
     except TaskSettingsV2Error:
         raise
-    except (json.JSONDecodeError, RecursionError, ValueError):
+    except (json.JSONDecodeError, RecursionError):
         raise TaskSettingsV2Error(f"{label} JSON is invalid") from None
     if type(value) is not dict:
         raise TaskSettingsV2Error(f"{label} JSON must be an object")
@@ -148,7 +172,7 @@ def _validate_uuid(value: object, field_name: str) -> str:
         raise TaskSettingsV2Error(f"{field_name} must be a canonical UUID")
     try:
         parsed = UUID(value)
-    except (AttributeError, TypeError, ValueError):
+    except ValueError:
         raise TaskSettingsV2Error(
             f"{field_name} must be a canonical UUID"
         ) from None
@@ -171,13 +195,29 @@ def _validate_hash(value: object, field_name: str) -> str:
     return value
 
 
+def _validate_utf8_text(value: object, field_name: str) -> str:
+    if type(value) is not str:
+        raise TaskSettingsV2Error(f"{field_name} must be valid UTF-8 text")
+    if _try_utf8_encode(value) is None:
+        value = None
+        raise TaskSettingsV2Error(
+            f"{field_name} must be valid UTF-8 text"
+        ) from None
+    return value
+
+
 def _validate_repository_field(value: object, field_name: str) -> str:
+    repository: str | None = None
     try:
-        return _validate_repository(value)
+        repository = _validate_repository(value)
     except TaskProjectError:
+        pass
+    if repository is None:
+        value = None
         raise TaskSettingsV2Error(
             f"{field_name} must use canonical OWNER/REPO format"
         ) from None
+    return repository
 
 
 def _normalize_datetime(value: object, field_name: str) -> datetime:
@@ -216,7 +256,8 @@ def _parse_timestamp(value: object, field_name: str) -> datetime:
 
 
 def _validate_confirmed_by(value: object) -> str:
-    if type(value) is not str or not value.strip():
+    value = _validate_utf8_text(value, "confirmed_by")
+    if not value.strip():
         raise TaskSettingsV2Error("confirmed_by must be non-empty text")
     return value
 
@@ -271,6 +312,16 @@ def _task_content_payload(content: TaskContent) -> dict[str, object]:
     }
 
 
+def _validate_task_content(content: object) -> TaskContent:
+    if not isinstance(content, TaskContent):
+        raise TaskSettingsV2Error("task_content must be TaskContent")
+    _validate_utf8_text(content.title, "task_content.title")
+    _validate_utf8_text(content.description, "task_content.description")
+    for criterion in content.acceptance_criteria:
+        _validate_utf8_text(criterion, "task_content.acceptance_criteria")
+    return content
+
+
 def _parse_task_content(value: object) -> TaskContent:
     if type(value) is not dict:
         raise TaskSettingsV2Error("task_content must be an object")
@@ -278,14 +329,20 @@ def _parse_task_content(value: object) -> TaskContent:
     criteria = value["acceptance_criteria"]
     if type(criteria) is not list:
         raise TaskSettingsV2Error("acceptance_criteria must be an array")
+    content: TaskContent | None = None
     try:
-        return TaskContent(
+        content = TaskContent(
             title=value["title"],
             description=value["description"],
             acceptance_criteria=tuple(criteria),
         )
-    except (TaskSettingsError, TypeError):
+    except TaskSettingsError:
+        pass
+    if content is None:
+        value = None
+        criteria = None
         raise TaskSettingsV2Error("task_content is invalid") from None
+    return _validate_task_content(content)
 
 
 def _project_payload(project: TaskProject) -> dict[str, str]:
@@ -309,7 +366,7 @@ def _parse_projects(value: object) -> tuple[TaskProject, ...]:
             raise TaskSettingsV2Error("each project must be an object")
         try:
             projects.append(TaskProject.from_mapping(item))
-        except (TaskProjectError, TypeError):
+        except TaskProjectError:
             raise TaskSettingsV2Error("project binding is invalid") from None
     return tuple(projects)
 
@@ -323,6 +380,7 @@ def _validate_projects(
     task_owner_host: str,
     *,
     require_canonical_order: bool,
+    require_live_workspace: bool = False,
 ) -> tuple[TaskProject, ...]:
     if type(projects) is not tuple or not projects:
         raise TaskSettingsV2Error("projects must contain at least one TaskProject")
@@ -334,6 +392,17 @@ def _validate_projects(
         raise TaskSettingsV2Error("projects are not in canonical order")
     repositories: set[str] = set()
     for project in canonical:
+        if require_live_workspace:
+            project_is_live = True
+            try:
+                _validate_task_project_live(project)
+            except TaskProjectError:
+                project_is_live = False
+            if not project_is_live:
+                project = None
+                raise TaskSettingsV2Error(
+                    "project binding workspace is not live"
+                ) from None
         repository_key = project.repository.casefold()
         if repository_key in repositories:
             raise TaskSettingsV2Error("projects contain duplicate repositories")
@@ -461,6 +530,9 @@ class TaskRequestV2:
     status: str
 
     def __post_init__(self) -> None:
+        self._validate_record(require_live_projects=True)
+
+    def _validate_record(self, *, require_live_projects: bool) -> None:
         if self.format_version != TASK_REQUEST_V2_FORMAT:
             raise TaskSettingsV2Error(
                 f"format_version must be {TASK_REQUEST_V2_FORMAT}"
@@ -471,8 +543,7 @@ class TaskRequestV2:
             "management_repository",
         )
         _validate_mode(self.mode)
-        if not isinstance(self.task_content, TaskContent):
-            raise TaskSettingsV2Error("task_content must be TaskContent")
+        _validate_task_content(self.task_content)
         _validate_hash(self.task_content_hash, "task_content_hash")
         try:
             expected_content_hash = task_content_hash(self.task_content)
@@ -487,6 +558,7 @@ class TaskRequestV2:
             self.projects,
             owner_host,
             require_canonical_order=True,
+            require_live_workspace=require_live_projects,
         )
         _validate_merge_order(self.merge_order, projects, merge_mode)
         _validate_confirmed_by(self.confirmed_by)
@@ -539,6 +611,7 @@ class TaskRequestV2:
             projects,
             canonical_host,
             require_canonical_order=False,
+            require_live_workspace=True,
         )
         canonical_order = _validate_merge_order(
             merge_order,
@@ -564,13 +637,17 @@ class TaskRequestV2:
             replaces_request_id,
             "replaces_request_id",
         )
-        content_hash = task_content_hash(task_content)
+        canonical_content = _validate_task_content(task_content)
+        try:
+            content_hash = task_content_hash(canonical_content)
+        except (TaskSettingsError, UnicodeEncodeError):
+            raise TaskSettingsV2Error("task_content is invalid") from None
         payload: dict[str, object] = {
             "format_version": TASK_REQUEST_V2_FORMAT,
             "request_id": canonical_request_id,
             "management_repository": canonical_repository,
             "mode": Mode.TASK.value,
-            "task_content": _task_content_payload(task_content),
+            "task_content": _task_content_payload(canonical_content),
             "task_content_hash": content_hash,
             "task_flow": canonical_flow.value,
             "merge_mode": canonical_mode.value,
@@ -595,7 +672,7 @@ class TaskRequestV2:
             request_id=canonical_request_id,
             management_repository=canonical_repository,
             mode=Mode.TASK,
-            task_content=task_content,
+            task_content=canonical_content,
             task_content_hash=content_hash,
             task_flow=canonical_flow,
             merge_mode=canonical_mode,
@@ -614,39 +691,75 @@ class TaskRequestV2:
     def from_json(cls, raw: object) -> TaskRequestV2:
         """Parse one exact request without aliases, defaults, or unknown fields."""
 
-        payload = _load_json_object(raw, "Task request")
-        _require_fields(payload, _REQUEST_FIELDS, "Task request")
-        return cls(
-            format_version=payload["format_version"],
-            request_id=payload["request_id"],
-            management_repository=payload["management_repository"],
-            mode=_parse_mode(payload["mode"]),
-            task_content=_parse_task_content(payload["task_content"]),
-            task_content_hash=payload["task_content_hash"],
-            task_flow=_parse_task_flow(payload["task_flow"]),
-            merge_mode=_parse_merge_mode(payload["merge_mode"]),
-            merge_order=_parse_merge_order(payload["merge_order"]),
-            projects=_parse_projects(payload["projects"]),
-            task_owner_host=payload["task_owner_host"],
-            confirmed_by=payload["confirmed_by"],
-            confirmed_at=_parse_timestamp(payload["confirmed_at"], "confirmed_at"),
-            auto_merge_expires_at=(
-                None
-                if payload["auto_merge_expires_at"] is None
-                else _parse_timestamp(
-                    payload["auto_merge_expires_at"],
-                    "auto_merge_expires_at",
-                )
-            ),
-            replaces_request_id=payload["replaces_request_id"],
-            request_hash=payload["request_hash"],
-            status=payload["status"],
-        )
+        outcome = _parse_task_request_result(cls, raw)
+        raw = None
+        return _unwrap_task_request_result(outcome)
 
     def to_json(self) -> str:
         """Return the one compact key-sorted UTF-8 JSON representation."""
 
         return _canonical_json(_request_payload(self))
+
+
+def _stored_task_request(
+    cls: type[TaskRequestV2],
+    payload: Mapping[str, object],
+) -> TaskRequestV2:
+    request = object.__new__(cls)
+    values: dict[str, object] = {
+        "format_version": payload["format_version"],
+        "request_id": payload["request_id"],
+        "management_repository": payload["management_repository"],
+        "mode": _parse_mode(payload["mode"]),
+        "task_content": _parse_task_content(payload["task_content"]),
+        "task_content_hash": payload["task_content_hash"],
+        "task_flow": _parse_task_flow(payload["task_flow"]),
+        "merge_mode": _parse_merge_mode(payload["merge_mode"]),
+        "merge_order": _parse_merge_order(payload["merge_order"]),
+        "projects": _parse_projects(payload["projects"]),
+        "task_owner_host": payload["task_owner_host"],
+        "confirmed_by": payload["confirmed_by"],
+        "confirmed_at": _parse_timestamp(payload["confirmed_at"], "confirmed_at"),
+        "auto_merge_expires_at": (
+            None
+            if payload["auto_merge_expires_at"] is None
+            else _parse_timestamp(
+                payload["auto_merge_expires_at"],
+                "auto_merge_expires_at",
+            )
+        ),
+        "replaces_request_id": payload["replaces_request_id"],
+        "request_hash": payload["request_hash"],
+        "status": payload["status"],
+    }
+    for field_name, value in values.items():
+        object.__setattr__(request, field_name, value)
+    request._validate_record(require_live_projects=False)
+    return request
+
+
+def _parse_task_request_result(
+    cls: type[TaskRequestV2],
+    raw: object,
+) -> TaskRequestV2 | _ParseFailure:
+    payload: dict[str, object] | None = None
+    try:
+        payload = _load_json_object(raw, "Task request")
+        _require_fields(payload, _REQUEST_FIELDS, "Task request")
+        return _stored_task_request(cls, payload)
+    except TaskSettingsV2Error as error:
+        message = str(error)
+    raw = None
+    payload = None
+    return _ParseFailure(message)
+
+
+def _unwrap_task_request_result(
+    outcome: TaskRequestV2 | _ParseFailure,
+) -> TaskRequestV2:
+    if isinstance(outcome, _ParseFailure):
+        raise TaskSettingsV2Error(outcome.message) from None
+    return outcome
 
 
 def task_request_v2_hash(request: TaskRequestV2) -> str:
@@ -660,7 +773,9 @@ def task_request_v2_hash(request: TaskRequestV2) -> str:
 def parse_task_request_v2(raw: object) -> TaskRequestV2:
     """Compatibility function for the strict TaskRequestV2 parser."""
 
-    return TaskRequestV2.from_json(raw)
+    outcome = _parse_task_request_result(TaskRequestV2, raw)
+    raw = None
+    return _unwrap_task_request_result(outcome)
 
 
 def _settings_payload(settings: TaskSettingsV2) -> dict[str, object]:
@@ -768,8 +883,9 @@ class TaskSettingsV2:
     auto_merge_expires_at: datetime | None
     task_settings_hash: str
     status: str
+    request: InitVar[TaskRequestV2]
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, request: TaskRequestV2) -> None:
         if self.format_version != TASK_SETTINGS_V2_FORMAT:
             raise TaskSettingsV2Error(
                 f"format_version must be {TASK_SETTINGS_V2_FORMAT}"
@@ -810,6 +926,7 @@ class TaskSettingsV2:
             raise TaskSettingsV2Error(
                 "task_settings_hash does not match settings fields"
             )
+        _verify_settings_request(self, request)
 
     @classmethod
     def create(
@@ -867,8 +984,8 @@ class TaskSettingsV2:
             auto_merge_expires_at=request.auto_merge_expires_at,
             task_settings_hash=_canonical_hash(payload),
             status=_SETTINGS_STATUS,
+            request=request,
         )
-        _verify_settings_request(settings, request)
         return settings
 
     @classmethod
@@ -880,9 +997,27 @@ class TaskSettingsV2:
     ) -> TaskSettingsV2:
         """Parse settings and verify every shared field against its request."""
 
+        outcome = _parse_task_settings_result(cls, raw, request)
+        raw = None
+        request = None  # type: ignore[assignment]
+        return _unwrap_task_settings_result(outcome)
+
+    def to_json(self) -> str:
+        """Return the one compact key-sorted UTF-8 JSON representation."""
+
+        return _canonical_json(_settings_payload(self))
+
+
+def _parse_task_settings_result(
+    cls: type[TaskSettingsV2],
+    raw: object,
+    request: object,
+) -> TaskSettingsV2 | _ParseFailure:
+    payload: dict[str, object] | None = None
+    try:
         payload = _load_json_object(raw, "Task settings")
         _require_fields(payload, _SETTINGS_FIELDS, "Task settings")
-        settings = cls(
+        return cls(
             format_version=payload["format_version"],
             request_id=payload["request_id"],
             request_hash=payload["request_hash"],
@@ -907,14 +1042,22 @@ class TaskSettingsV2:
             ),
             task_settings_hash=payload["task_settings_hash"],
             status=payload["status"],
+            request=request,
         )
-        _verify_settings_request(settings, request)
-        return settings
+    except TaskSettingsV2Error as error:
+        message = str(error)
+    raw = None
+    request = None
+    payload = None
+    return _ParseFailure(message)
 
-    def to_json(self) -> str:
-        """Return the one compact key-sorted UTF-8 JSON representation."""
 
-        return _canonical_json(_settings_payload(self))
+def _unwrap_task_settings_result(
+    outcome: TaskSettingsV2 | _ParseFailure,
+) -> TaskSettingsV2:
+    if isinstance(outcome, _ParseFailure):
+        raise TaskSettingsV2Error(outcome.message) from None
+    return outcome
 
 
 def task_settings_v2_hash(settings: TaskSettingsV2) -> str:
@@ -932,4 +1075,7 @@ def parse_task_settings_v2(
 ) -> TaskSettingsV2:
     """Compatibility function for the strict TaskSettingsV2 parser."""
 
-    return TaskSettingsV2.from_json(raw, request=request)
+    outcome = _parse_task_settings_result(TaskSettingsV2, raw, request)
+    raw = None
+    request = None  # type: ignore[assignment]
+    return _unwrap_task_settings_result(outcome)

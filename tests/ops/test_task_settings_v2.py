@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import FrozenInstanceError, fields
+import shutil
+import traceback
+from dataclasses import FrozenInstanceError, fields, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -87,6 +89,8 @@ def _request(
     confirmed_at: datetime = CONFIRMED_AT,
     auto_merge_expires_at: datetime | None | object = ...,
     replaces_request_id: str | None = None,
+    task_content: TaskContent | None = None,
+    confirmed_by: str = "local-user",
 ) -> TaskRequestV2:
     selected = projects if projects is not None else _projects(tmp_path)
     if merge_order is ...:
@@ -108,16 +112,85 @@ def _request(
     return TaskRequestV2.create(
         request_id=request_id,
         management_repository="immortal0900/INFINITY_FORGE",
-        task_content=_content(),
+        task_content=_content() if task_content is None else task_content,
         task_flow=TaskFlow.BUILD_REVIEW,
         merge_mode=merge_mode,
         merge_order=order,  # type: ignore[arg-type]
         projects=selected,
         task_owner_host=task_owner_host,
-        confirmed_by="local-user",
+        confirmed_by=confirmed_by,
         confirmed_at=confirmed_at,
         auto_merge_expires_at=expires_at,  # type: ignore[arg-type]
         replaces_request_id=replaces_request_id,
+    )
+
+
+def _exception_graph(error: BaseException) -> tuple[BaseException, ...]:
+    pending = [error]
+    seen: set[int] = set()
+    found: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return tuple(found)
+
+
+def _contained_text(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, bytes):
+        return (value.decode("utf-8", errors="replace"),)
+    if isinstance(value, dict):
+        return tuple(
+            text
+            for item in value.items()
+            for part in item
+            for text in _contained_text(part)
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(
+            text for item in value for text in _contained_text(item)
+        )
+    try:
+        return (repr(value),)
+    except Exception:
+        return ()
+
+
+def _forge_traceback_local_text(error: BaseException) -> tuple[str, ...]:
+    texts: list[str] = []
+    for current in _exception_graph(error):
+        trace = current.__traceback__
+        while trace is not None:
+            module_name = trace.tb_frame.f_globals.get("__name__", "")
+            if module_name.startswith("forge.ops"):
+                for value in trace.tb_frame.f_locals.values():
+                    texts.extend(_contained_text(value))
+            trace = trace.tb_next
+    return tuple(texts)
+
+
+def _assert_sanitized_v2_error(
+    operation: object,
+    secret: str,
+) -> None:
+    with pytest.raises(TaskSettingsV2Error) as caught:
+        operation()  # type: ignore[operator]
+    assert all(
+        error.__cause__ is None and error.__context__ is None
+        for error in _exception_graph(caught.value)
+    )
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert secret not in rendered
+    assert not any(
+        secret in text for text in _forge_traceback_local_text(caught.value)
     )
 
 
@@ -220,6 +293,37 @@ def test_v2_records_have_exact_frozen_fields_and_canonical_roundtrip(
     assert TaskSettingsV2.from_json(settings.to_json(), request=request) == settings
     with pytest.raises(FrozenInstanceError):
         request.status = "bound"  # type: ignore[misc]
+
+
+def test_every_settings_constructor_requires_the_exact_request(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    settings = TaskSettingsV2.create(request=request, parent_issue_number=21)
+    constructor_fields = {
+        field.name: getattr(settings, field.name) for field in fields(settings)
+    }
+
+    assert "request" not in TaskSettingsV2.__slots__
+    assert "request=" not in repr(settings)
+    with pytest.raises(TypeError):
+        TaskSettingsV2(**constructor_fields)  # type: ignore[arg-type]
+    assert TaskSettingsV2(**constructor_fields, request=request) == settings
+
+    with pytest.raises(ValueError, match="request"):
+        replace(settings)
+    assert replace(settings, request=request) == settings
+
+    changed_payload = json.loads(settings.to_json())
+    changed_payload["confirmed_by"] = "different-user"
+    changed_hash = _settings_hash(changed_payload)
+    with pytest.raises(TaskSettingsV2Error, match="does not match request"):
+        replace(
+            settings,
+            confirmed_by="different-user",
+            task_settings_hash=changed_hash,
+            request=request,
+        )
 
 
 def test_v2_hashes_use_compact_key_sorted_utf8_and_exclude_hash_and_status(
@@ -385,6 +489,97 @@ def test_request_parser_rejects_non_string_non_object_and_invalid_json(
 ) -> None:
     with pytest.raises(TaskSettingsV2Error, match="JSON|object|text"):
         TaskRequestV2.from_json(raw)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        TaskContent(
+            title="bad\ud800title",
+            description="description",
+            acceptance_criteria=("criterion",),
+        ),
+        TaskContent(
+            title="title",
+            description="bad\ud800description",
+            acceptance_criteria=("criterion",),
+        ),
+        TaskContent(
+            title="title",
+            description="description",
+            acceptance_criteria=("bad\ud800criterion",),
+        ),
+    ],
+)
+def test_request_create_rejects_unencodable_task_content(
+    tmp_path: Path,
+    content: TaskContent,
+) -> None:
+    with pytest.raises(TaskSettingsV2Error) as caught:
+        _request(tmp_path, task_content=content)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_request_create_rejects_unencodable_confirmed_by(tmp_path: Path) -> None:
+    with pytest.raises(TaskSettingsV2Error) as caught:
+        _request(tmp_path, confirmed_by="bad\ud800subject")
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("field_path", "bad_value"),
+    [
+        (("task_content", "title"), "bad\ud800title"),
+        (("task_content", "description"), "bad\ud800description"),
+        (("task_content", "acceptance_criteria", 0), "bad\ud800criterion"),
+        (("confirmed_by",), "bad\ud800subject"),
+    ],
+)
+def test_request_parser_rejects_unencodable_text(
+    tmp_path: Path,
+    field_path: tuple[object, ...],
+    bad_value: str,
+) -> None:
+    payload = json.loads(_request(tmp_path).to_json())
+    target: object = payload
+    for part in field_path[:-1]:
+        target = target[part]  # type: ignore[index]
+    target[field_path[-1]] = bad_value  # type: ignore[index]
+    payload["request_hash"] = "0" * 64
+    raw = json.dumps(payload, ensure_ascii=True)
+
+    with pytest.raises(TaskSettingsV2Error) as caught:
+        TaskRequestV2.from_json(raw)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_canonical_json_is_always_utf8_encodable(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    settings = TaskSettingsV2.create(request=request, parent_issue_number=21)
+
+    assert request.to_json().encode("utf-8").decode("utf-8") == request.to_json()
+    assert settings.to_json().encode("utf-8").decode("utf-8") == settings.to_json()
+
+
+def test_valid_unicode_scalars_roundtrip_without_replacement(tmp_path: Path) -> None:
+    content = TaskContent(
+        title="한글 😀 \ufffd",
+        description="NFC é / NFD e\u0301",
+        acceptance_criteria=("원문 😀 \ufffd e\u0301 유지",),
+    )
+    request = _request(
+        tmp_path,
+        task_content=content,
+        confirmed_by="사용자-😀-\ufffd-e\u0301",
+    )
+    raw = request.to_json()
+
+    assert TaskRequestV2.from_json(raw) == request
+    assert json.loads(raw)["task_content"]["description"] == content.description
+    assert json.loads(raw)["confirmed_by"] == request.confirmed_by
 
 
 @pytest.mark.parametrize(
@@ -607,3 +802,215 @@ def test_settings_rejects_bool_parent_issue_number(tmp_path: Path) -> None:
 
     with pytest.raises(TaskSettingsV2Error, match="positive integer"):
         TaskSettingsV2.create(request=request, parent_issue_number=True)
+
+
+def test_stored_v2_records_survive_deleted_workspace(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    settings = TaskSettingsV2.create(request=request, parent_issue_number=21)
+    request_raw = request.to_json()
+    settings_raw = settings.to_json()
+    shutil.rmtree(tmp_path)
+
+    recovered_request = TaskRequestV2.from_json(request_raw)
+    recovered_settings = TaskSettingsV2.from_json(
+        settings_raw,
+        request=recovered_request,
+    )
+
+    assert recovered_request == request
+    assert recovered_settings == settings
+
+
+def test_request_create_revalidates_stored_project_workspace_live(
+    tmp_path: Path,
+) -> None:
+    project = _projects(tmp_path)[0]
+    request = _request(
+        tmp_path,
+        projects=(project,),
+        merge_mode=MergeMode.MANUAL,
+        merge_order=None,
+    )
+    project_payload = _project_payload(request.projects[0])
+    shutil.rmtree(Path(request.projects[0].workspace))
+    stored_project = TaskProject.from_mapping(project_payload)
+
+    with pytest.raises(TaskSettingsV2Error, match="project binding"):
+        TaskRequestV2.create(
+            request_id=REQUEST_ID,
+            management_repository="immortal0900/INFINITY_FORGE",
+            task_content=_content(),
+            task_flow=TaskFlow.BUILD_REVIEW,
+            merge_mode=MergeMode.MANUAL,
+            merge_order=None,
+            projects=(stored_project,),
+            task_owner_host=OWNER_HOST,
+            confirmed_by="local-user",
+            confirmed_at=CONFIRMED_AT,
+            auto_merge_expires_at=None,
+        )
+
+    direct_fields = {
+        field.name: getattr(request, field.name) for field in fields(request)
+    }
+    direct_fields["projects"] = (stored_project,)
+    with pytest.raises(TaskSettingsV2Error, match="project binding"):
+        TaskRequestV2(**direct_fields)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "compatibility"])
+def test_invalid_request_json_does_not_leak_raw_text_in_traceback(
+    entrypoint: str,
+) -> None:
+    secret = "request-json-secret-token"
+    raw = '{"broken":"' + secret
+    parser = (
+        TaskRequestV2.from_json
+        if entrypoint == "direct"
+        else parse_task_request_v2
+    )
+
+    _assert_sanitized_v2_error(lambda: parser(raw), secret)
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "compatibility"])
+def test_settings_parser_does_not_leak_raw_text_in_traceback(
+    tmp_path: Path,
+    entrypoint: str,
+) -> None:
+    request = _request(tmp_path)
+    secret = "settings-json-secret-token"
+    raw = '{"broken":"' + secret
+    parser = (
+        TaskSettingsV2.from_json
+        if entrypoint == "direct"
+        else parse_task_settings_v2
+    )
+
+    _assert_sanitized_v2_error(
+        lambda: parser(raw, request=request),
+        secret,
+    )
+
+
+def test_settings_parser_rejects_invalid_utf8_text(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    settings = TaskSettingsV2.create(request=request, parent_issue_number=21)
+    payload = json.loads(settings.to_json())
+    payload["confirmed_by"] = "bad\ud800subject"
+    payload["task_settings_hash"] = "0" * 64
+    raw = json.dumps(payload, ensure_ascii=True)
+
+    with pytest.raises(TaskSettingsV2Error) as caught:
+        TaskSettingsV2.from_json(raw, request=request)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ["duplicate", "management_repository", "content", "project_path"],
+)
+def test_expected_invalid_request_paths_do_not_leak_values_in_traceback(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    request = _request(tmp_path)
+    secret = f"{attack}-secret-token"
+    if attack == "duplicate":
+        raw = request.to_json().replace(
+            '"confirmed_by":"local-user"',
+            f'"confirmed_by":"{secret}","confirmed_by":"local-user"',
+            1,
+        )
+    else:
+        payload = json.loads(request.to_json())
+        if attack == "management_repository":
+            payload["management_repository"] = (
+                f"https://{secret}@github.com/owner/repo.git"
+            )
+        elif attack == "content":
+            payload["task_content"]["description"] = [secret]  # type: ignore[index]
+        else:
+            project_payload = payload["projects"][0]  # type: ignore[index]
+            project_payload["workspace"] = str(  # type: ignore[index]
+                Path(project_payload["workspace"]) / ".." / secret  # type: ignore[arg-type,index]
+            )
+            project_binding = {
+                key: project_payload[key]  # type: ignore[index]
+                for key in (
+                    "repository",
+                    "workspace",
+                    "remote_name",
+                    "base_branch",
+                    "base_commit",
+                    "host_id",
+                )
+            }
+            project_payload["project_id"] = hashlib.sha256(  # type: ignore[index]
+                json.dumps(
+                    project_binding,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        payload["request_hash"] = _request_hash(payload)
+        raw = json.dumps(payload, ensure_ascii=False)
+
+    _assert_sanitized_v2_error(lambda: TaskRequestV2.from_json(raw), secret)
+
+
+def test_invalid_settings_repository_does_not_leak_credentials(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    settings = TaskSettingsV2.create(request=request, parent_issue_number=21)
+    secret = "settings-repository-secret-token"
+    payload = json.loads(settings.to_json())
+    payload["management_repository"] = (
+        f"https://{secret}@github.com/owner/repo.git"
+    )
+    payload["task_settings_hash"] = _settings_hash(payload)
+    raw = json.dumps(payload, ensure_ascii=False)
+
+    _assert_sanitized_v2_error(
+        lambda: TaskSettingsV2.from_json(raw, request=request),
+        secret,
+    )
+
+
+def test_unexpected_json_loader_exception_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _request(tmp_path).to_json()
+
+    def fail_programming_error(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise ValueError("unexpected loader programming error")
+
+    monkeypatch.setattr(task_settings_v2_module.json, "loads", fail_programming_error)
+
+    with pytest.raises(ValueError, match="unexpected loader programming error"):
+        TaskRequestV2.from_json(raw)
+
+
+def test_unexpected_nested_parser_exception_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _request(tmp_path).to_json()
+
+    def fail_programming_error(value: object) -> TaskContent:
+        del value
+        raise TypeError("unexpected nested parser programming error")
+
+    monkeypatch.setattr(
+        task_settings_v2_module,
+        "_parse_task_content",
+        fail_programming_error,
+    )
+
+    with pytest.raises(TypeError, match="unexpected nested parser programming error"):
+        TaskRequestV2.from_json(raw)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -46,6 +47,14 @@ _TASK_PROJECT_FIELDS = frozenset(
 
 class TaskProjectError(ValueError):
     """Raised when a project binding is ambiguous or non-canonical."""
+
+
+def _is_utf8_text(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _canonical_repository(owner: object, name: object) -> str:
@@ -109,13 +118,37 @@ def normalize_github_remote(remote: object) -> str:
     return repository
 
 
-def _validate_workspace(workspace: object) -> str:
-    if type(workspace) is not str or not workspace:
+def _validate_utf8_text(value: object, error_message: str) -> str:
+    if type(value) is not str:
+        raise TaskProjectError(error_message)
+    if not _is_utf8_text(value):
+        value = None
+        raise TaskProjectError(error_message) from None
+    return value
+
+
+def _validate_workspace_text(workspace: object) -> str:
+    workspace = _validate_utf8_text(
+        workspace,
+        "workspace must be a canonical absolute path",
+    )
+    if not workspace or "\x00" in workspace:
         raise TaskProjectError("workspace must be a canonical absolute path")
     try:
         path = Path(workspace)
         if not path.is_absolute():
             raise TaskProjectError("workspace must be a canonical absolute path")
+        if os.path.normpath(workspace) != workspace or str(path) != workspace:
+            raise TaskProjectError("workspace must be a canonical absolute path")
+    except (OSError, RuntimeError, ValueError):
+        raise TaskProjectError("workspace must be a canonical absolute path") from None
+    return workspace
+
+
+def _validate_workspace(workspace: object) -> str:
+    workspace = _validate_workspace_text(workspace)
+    try:
+        path = Path(workspace)
         resolved = path.resolve(strict=True)
         if not resolved.is_dir():
             raise TaskProjectError("workspace must be a canonical absolute path")
@@ -138,7 +171,11 @@ def _validate_remote_name(remote_name: object) -> str:
 
 
 def _validate_branch(base_branch: object) -> str:
-    if type(base_branch) is not str or not base_branch:
+    base_branch = _validate_utf8_text(
+        base_branch,
+        "base_branch must be a canonical branch name",
+    )
+    if not base_branch:
         raise TaskProjectError("base_branch must be a canonical branch name")
     if base_branch.startswith(("-", "/", "refs/")) or base_branch.endswith(("/", ".")):
         raise TaskProjectError("base_branch must be a canonical branch name")
@@ -175,7 +212,7 @@ def _validate_host_id(host_id: object) -> str:
         raise TaskProjectError("host_id must be a canonical UUID string")
     try:
         parsed = UUID(host_id)
-    except (TypeError, ValueError, AttributeError):
+    except ValueError:
         raise TaskProjectError("host_id must be a canonical UUID string") from None
     if str(parsed) != host_id:
         raise TaskProjectError("host_id must be a canonical UUID string")
@@ -211,6 +248,57 @@ def _project_id(payload: Mapping[str, str]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validated_binding(
+    *,
+    repository: object,
+    workspace: object,
+    remote_name: object,
+    base_branch: object,
+    base_commit: object,
+    host_id: object,
+    live_workspace: bool,
+) -> dict[str, str]:
+    return _binding_payload(
+        repository=_validate_repository(repository),
+        workspace=(
+            _validate_workspace(workspace)
+            if live_workspace
+            else _validate_workspace_text(workspace)
+        ),
+        remote_name=_validate_remote_name(remote_name),
+        base_branch=_validate_branch(base_branch),
+        base_commit=_validate_commit(base_commit),
+        host_id=_validate_host_id(host_id),
+    )
+
+
+def _validate_project_id(project_id: object, payload: Mapping[str, str]) -> str:
+    expected_id = _project_id(payload)
+    if (
+        type(project_id) is not str
+        or _SHA256_PATTERN.fullmatch(project_id) is None
+        or project_id != expected_id
+    ):
+        raise TaskProjectError("project_id does not match the six binding fields")
+    return project_id
+
+
+def _validate_task_project_live(project: object) -> TaskProject:
+    if not isinstance(project, TaskProject):
+        raise TaskProjectError("project binding must be a TaskProject")
+    payload = _validated_binding(
+        repository=project.repository,
+        workspace=project.workspace,
+        remote_name=project.remote_name,
+        base_branch=project.base_branch,
+        base_commit=project.base_commit,
+        host_id=project.host_id,
+        live_workspace=True,
+    )
+    _validate_project_id(project.project_id, payload)
+    return project
+
+
 # RISK(breaking): These seven fields are the durable public Task Project record.
 # Adding, removing, or silently normalizing a field changes stored binding hashes.
 @dataclass(frozen=True, slots=True)
@@ -224,28 +312,16 @@ class TaskProject:
     host_id: str
 
     def __post_init__(self) -> None:
-        repository = _validate_repository(self.repository)
-        workspace = _validate_workspace(self.workspace)
-        remote_name = _validate_remote_name(self.remote_name)
-        base_branch = _validate_branch(self.base_branch)
-        base_commit = _validate_commit(self.base_commit)
-        host_id = _validate_host_id(self.host_id)
-        expected_id = _project_id(
-            _binding_payload(
-                repository=repository,
-                workspace=workspace,
-                remote_name=remote_name,
-                base_branch=base_branch,
-                base_commit=base_commit,
-                host_id=host_id,
-            )
+        payload = _validated_binding(
+            repository=self.repository,
+            workspace=self.workspace,
+            remote_name=self.remote_name,
+            base_branch=self.base_branch,
+            base_commit=self.base_commit,
+            host_id=self.host_id,
+            live_workspace=True,
         )
-        if (
-            type(self.project_id) is not str
-            or _SHA256_PATTERN.fullmatch(self.project_id) is None
-            or self.project_id != expected_id
-        ):
-            raise TaskProjectError("project_id does not match the six binding fields")
+        _validate_project_id(self.project_id, payload)
 
     @classmethod
     def create(
@@ -260,19 +336,14 @@ class TaskProject:
     ) -> TaskProject:
         """Validate six fields and calculate their deterministic project ID."""
 
-        canonical_repository = _validate_repository(repository)
-        canonical_workspace = _validate_workspace(workspace)
-        canonical_remote_name = _validate_remote_name(remote_name)
-        canonical_branch = _validate_branch(base_branch)
-        canonical_commit = _validate_commit(base_commit)
-        canonical_host_id = _validate_host_id(host_id)
-        payload = _binding_payload(
-            repository=canonical_repository,
-            workspace=canonical_workspace,
-            remote_name=canonical_remote_name,
-            base_branch=canonical_branch,
-            base_commit=canonical_commit,
-            host_id=canonical_host_id,
+        payload = _validated_binding(
+            repository=repository,
+            workspace=workspace,
+            remote_name=remote_name,
+            base_branch=base_branch,
+            base_commit=base_commit,
+            host_id=host_id,
+            live_workspace=True,
         )
         return cls(project_id=_project_id(payload), **payload)
 
@@ -282,15 +353,18 @@ class TaskProject:
 
         if not isinstance(payload, Mapping) or set(payload) != _TASK_PROJECT_FIELDS:
             raise TaskProjectError("TaskProject fields must match the exact public schema")
-        try:
-            return cls(
-                project_id=payload["project_id"],
-                repository=payload["repository"],
-                workspace=payload["workspace"],
-                remote_name=payload["remote_name"],
-                base_branch=payload["base_branch"],
-                base_commit=payload["base_commit"],
-                host_id=payload["host_id"],
-            )
-        except TypeError:
-            raise TaskProjectError("TaskProject fields have invalid types") from None
+        binding = _validated_binding(
+            repository=payload["repository"],
+            workspace=payload["workspace"],
+            remote_name=payload["remote_name"],
+            base_branch=payload["base_branch"],
+            base_commit=payload["base_commit"],
+            host_id=payload["host_id"],
+            live_workspace=False,
+        )
+        project_id = _validate_project_id(payload["project_id"], binding)
+        project = object.__new__(cls)
+        object.__setattr__(project, "project_id", project_id)
+        for field_name, value in binding.items():
+            object.__setattr__(project, field_name, value)
+        return project

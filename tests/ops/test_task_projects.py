@@ -270,3 +270,81 @@ def test_task_project_mapping_rejects_missing_and_extra_fields(tmp_path: Path) -
     payload.pop("host_id")
     with pytest.raises(TaskProjectError, match="fields"):
         TaskProject.from_mapping(payload)
+
+
+def test_stored_task_project_mapping_survives_deleted_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "deleted-after-confirm"
+    workspace.mkdir()
+    project = TaskProject.create(**_binding(workspace))
+    payload = {field.name: getattr(project, field.name) for field in fields(project)}
+    workspace.rmdir()
+
+    assert TaskProject.from_mapping(payload) == project
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ["relative", "dot_segment", "nul", "bad_hash"],
+)
+def test_stored_task_project_rejects_noncanonical_missing_workspace_or_id(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    missing = tmp_path / "missing-workspace"
+    valid = _binding(missing)
+    encoded = json.dumps(
+        valid,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload: dict[str, object] = {
+        "project_id": hashlib.sha256(encoded).hexdigest(),
+        **valid,
+    }
+    if attack == "relative":
+        payload["workspace"] = "relative/missing"
+    elif attack == "dot_segment":
+        payload["workspace"] = str(missing.parent / ".." / missing.parent.name / missing.name)
+    elif attack == "nul":
+        payload["workspace"] = f"{missing}\x00suffix"
+    else:
+        payload["project_id"] = "0" * 64
+
+    if attack != "bad_hash":
+        changed_binding = {
+            key: payload[key]
+            for key in (
+                "repository",
+                "workspace",
+                "remote_name",
+                "base_branch",
+                "base_commit",
+                "host_id",
+            )
+        }
+        changed_encoded = json.dumps(
+            changed_binding,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload["project_id"] = hashlib.sha256(changed_encoded).hexdigest()
+
+    with pytest.raises(TaskProjectError):
+        TaskProject.from_mapping(payload)
+
+
+def test_direct_task_project_constructor_remains_live_strict(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "deleted-before-direct-construction"
+    workspace.mkdir()
+    project = TaskProject.create(**_binding(workspace))
+    payload = {field.name: getattr(project, field.name) for field in fields(project)}
+    workspace.rmdir()
+
+    with pytest.raises(TaskProjectError, match="workspace"):
+        TaskProject(**payload)  # type: ignore[arg-type]
