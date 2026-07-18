@@ -108,6 +108,10 @@ def test_task_content_hash_uses_canonical_utf8_json() -> None:
     ).encode("utf-8")
 
     assert task_content_hash(content) == hashlib.sha256(canonical).hexdigest()
+    assert (
+        task_content_hash(content)
+        == "5d5bd28e8ff50a52de088e27c00e1a6f96e3b77b5c9b0d1211e92946cebc034b"
+    )
 
 
 def test_task_settings_hash_is_canonical_and_excludes_status() -> None:
@@ -135,6 +139,9 @@ def test_task_settings_hash_is_canonical_and_excludes_status() -> None:
     ).hexdigest()
 
     assert task_settings_hash(bound) == expected
+    assert expected == (
+        "ce04fe1beb53b5b1e7c1a6ed5321a4bb025aa93cd3b1ce3f18ef8c2a90f0c2f1"
+    )
     assert (
         task_settings_hash(replace(bound, status=TaskSettingsStatus.ACTIVE)) == expected
     )

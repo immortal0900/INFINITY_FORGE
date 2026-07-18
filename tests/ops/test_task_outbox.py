@@ -79,6 +79,9 @@ def test_restart_loads_the_exact_canonical_request_and_hash(tmp_path: Path) -> N
         separators=(",", ":"),
     )
     assert request_hash == hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+    assert request_hash == (
+        "4b95d11fbd14d9e4e38bf5c844b59e0e43fb88c4c5593f772179587eb8cc9278"
+    )
     assert state == "pending"
 
 
