@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import signal
 import time
@@ -40,6 +41,7 @@ class ProcessBinding:
     """Task fields that must all match before process control is allowed."""
 
     request_id: str
+    task_settings_hash: str
     project_id: str
     task_id: str
     run_id: str
@@ -47,6 +49,7 @@ class ProcessBinding:
 
     def __post_init__(self) -> None:
         _canonical_uuid(self.request_id, "request_id")
+        _lower_sha256(self.task_settings_hash, "task_settings_hash")
         _lower_sha256(self.project_id, "project_id")
         _bounded_text(self.task_id, "task_id", maximum=512)
         _bounded_text(self.run_id, "run_id", maximum=512)
@@ -132,6 +135,7 @@ class ProcessIdentity:
             "format_version": _FORMAT_VERSION,
             "binding": {
                 "request_id": self.binding.request_id,
+                "task_settings_hash": self.binding.task_settings_hash,
                 "project_id": self.binding.project_id,
                 "task_id": self.binding.task_id,
                 "run_id": self.binding.run_id,
@@ -179,7 +183,14 @@ class ProcessIdentity:
             raise ValueError("binding must be an object")
         _exact_fields(
             binding_value,
-            {"request_id", "project_id", "task_id", "run_id", "host_id"},
+            {
+                "request_id",
+                "task_settings_hash",
+                "project_id",
+                "task_id",
+                "run_id",
+                "host_id",
+            },
             "process binding",
         )
         member_values = value["members"]
@@ -203,6 +214,7 @@ class ProcessIdentity:
         return cls(
             binding=ProcessBinding(
                 request_id=binding_value["request_id"],
+                task_settings_hash=binding_value["task_settings_hash"],
                 project_id=binding_value["project_id"],
                 task_id=binding_value["task_id"],
                 run_id=binding_value["run_id"],
@@ -262,10 +274,15 @@ def terminate_exact_process_tree(
     if not isinstance(expected, ProcessBinding):
         raise TypeError("expected must be ProcessBinding")
     _canonical_uuid(current_host, "current_host")
-    _nonnegative_number(term_timeout_seconds, "term_timeout_seconds")
-    _nonnegative_number(force_timeout_seconds, "force_timeout_seconds")
-    if poll_interval_seconds <= 0:
-        raise ValueError("poll_interval_seconds must be positive")
+    term_timeout_seconds = _finite_positive_number(
+        term_timeout_seconds, "term_timeout_seconds"
+    )
+    force_timeout_seconds = _finite_positive_number(
+        force_timeout_seconds, "force_timeout_seconds"
+    )
+    poll_interval_seconds = _finite_positive_number(
+        poll_interval_seconds, "poll_interval_seconds"
+    )
     if identity.binding != expected:
         raise ProcessIdentityMismatch("recorded process belongs to another Task or run")
     if identity.binding.host_id != current_host:
@@ -579,37 +596,154 @@ class PosixProcessBackend:
         if len(matches) != 1:
             return None
         value = "/" + matches[0].lstrip("/")
-        self._cgroup_control(value, "cgroup.procs")
+        if "\x00" in value or any(
+            part in {"", ".", ".."} for part in value[1:].split("/")
+        ):
+            return None
         return value
 
     def _cgroup_members(self, cgroup: str) -> tuple[ProcessMemberIdentity, ...]:
+        root = self._cgroup_directory(cgroup)
+        directories = self._cgroup_descendants(root)
+        process_ids: set[int] = set()
+        for directory in directories:
+            control = self._checked_cgroup_file(directory, "cgroup.procs")
+            try:
+                lines = control.read_text(encoding="ascii").splitlines()
+            except FileNotFoundError:
+                if directory == root:
+                    raise ProcessLookupError(cgroup) from None
+                continue
+            except (OSError, UnicodeError) as error:
+                raise ProcessIdentityError(
+                    "cannot read exact cgroup membership"
+                ) from error
+            for raw_pid in lines:
+                if (
+                    not raw_pid
+                    or not raw_pid.isascii()
+                    or not raw_pid.isdigit()
+                    or int(raw_pid) <= 0
+                ):
+                    raise ProcessIdentityError("cgroup.procs contains an invalid PID")
+                pid = int(raw_pid)
+                process_ids.add(pid)
+
         members: list[ProcessMemberIdentity] = []
-        for pid in self._all_process_ids():
-            if self._process_cgroup(pid) != cgroup:
+        for pid in sorted(process_ids):
+            # A process may move or exit after cgroup.procs is read. Only a
+            # fresh read that is still inside the exact subtree is accepted.
+            current_cgroup = self._process_cgroup(pid)
+            if current_cgroup is None or not _is_same_or_descendant_cgroup(
+                current_cgroup, cgroup
+            ):
                 continue
             snapshot = self._snapshot(pid)
             if snapshot is not None:
                 members.append(
                     ProcessMemberIdentity(pid=pid, start_identity=snapshot[2])
                 )
+
+        populated = self._cgroup_populated(root)
+        if populated and not members:
+            raise ProcessIdentityError(
+                "cgroup is populated but descendant membership is not proven"
+            )
+        if not populated and members:
+            raise ProcessIdentityError(
+                "cgroup populated readback conflicts with descendant membership"
+            )
         return tuple(members)
 
-    def _cgroup_control(self, cgroup: str, filename: str) -> Path:
-        if not isinstance(cgroup, str) or not cgroup.startswith("/"):
+    def _cgroup_descendants(self, root: Path) -> tuple[Path, ...]:
+        directories: list[Path] = []
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            directories.append(directory)
+            try:
+                entries = tuple(directory.iterdir())
+            except FileNotFoundError:
+                if directory == root:
+                    raise ProcessLookupError(str(root)) from None
+                continue
+            except OSError as error:
+                raise ProcessIdentityError(
+                    "cannot enumerate exact cgroup subtree"
+                ) from error
+            children: list[Path] = []
+            for entry in entries:
+                if entry.is_symlink():
+                    raise ProcessIdentityError(
+                        "cgroup subtree contains a symbolic link"
+                    )
+                try:
+                    if entry.is_dir():
+                        children.append(entry)
+                except OSError as error:
+                    raise ProcessIdentityError(
+                        "cannot inspect exact cgroup subtree"
+                    ) from error
+            pending.extend(sorted(children, reverse=True))
+        return tuple(sorted(directories))
+
+    def _cgroup_populated(self, root: Path) -> bool:
+        control = self._checked_cgroup_file(root, "cgroup.events")
+        try:
+            lines = control.read_text(encoding="ascii").splitlines()
+        except FileNotFoundError:
+            raise ProcessLookupError(str(root)) from None
+        except (OSError, UnicodeError) as error:
+            raise ProcessIdentityError("cannot read cgroup populated state") from error
+        values = [line.split() for line in lines]
+        populated = [
+            parts[1] for parts in values if len(parts) == 2 and parts[0] == "populated"
+        ]
+        if len(populated) != 1 or populated[0] not in {"0", "1"}:
+            raise ProcessIdentityError("cgroup.events has no exact populated state")
+        return populated[0] == "1"
+
+    def _cgroup_directory(self, cgroup: str) -> Path:
+        if (
+            not isinstance(cgroup, str)
+            or not cgroup.startswith("/")
+            or cgroup == "/"
+            or "\x00" in cgroup
+            or any(part in {"", ".", ".."} for part in cgroup[1:].split("/"))
+        ):
             raise ProcessIdentityError(
-                "cgroup identity must be an absolute cgroup path"
+                "cgroup identity must be an absolute non-root cgroup path"
             )
         root = self._cgroup_root.resolve()
-        candidate = (root / cgroup.lstrip("/") / filename).resolve()
-        if not candidate.is_relative_to(root) or candidate.parent == root:
+        try:
+            candidate = (root / cgroup.lstrip("/")).resolve(strict=True)
+        except FileNotFoundError:
+            raise ProcessLookupError(cgroup) from None
+        if not candidate.is_relative_to(root):
             raise ProcessIdentityError("cgroup identity escapes the worker boundary")
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise ProcessIdentityError("cgroup identity is not an exact directory")
         return candidate
+
+    @staticmethod
+    def _checked_cgroup_file(directory: Path, filename: str) -> Path:
+        if filename not in {"cgroup.procs", "cgroup.events", "cgroup.kill"}:
+            raise ProcessIdentityError("unsupported cgroup control file")
+        candidate = directory / filename
+        if candidate.is_symlink():
+            raise ProcessIdentityError("cgroup control file is a symbolic link")
+        return candidate
+
+    def _cgroup_control(self, cgroup: str, filename: str) -> Path:
+        return self._checked_cgroup_file(self._cgroup_directory(cgroup), filename)
 
 
 class WindowsJobApi(Protocol):
     def process_start_identity(self, pid: int) -> str: ...
 
     def job_process_ids(self, job_name: str) -> tuple[int, ...]: ...
+
+    def job_breakaway_flags(self, job_name: str) -> int: ...
 
     def send_control_break(self, group_id: int) -> None: ...
 
@@ -633,6 +767,7 @@ class WindowsJobBackend:
         _positive_int(pid, "pid")
         _positive_int(control_group_id, "control_group_id")
         _validate_job_name(job_name)
+        self._require_contained_job(job_name)
         members = self._job_members(job_name)
         root = next((member for member in members if member.pid == pid), None)
         if root is None:
@@ -653,11 +788,13 @@ class WindowsJobBackend:
     ) -> tuple[ProcessMemberIdentity, ...]:
         if identity.scope_kind is not ProcessScopeKind.WINDOWS_JOB:
             raise ProcessIdentityError("Windows backend received a non-Job scope")
+        self._require_contained_job(identity.scope_id)
         return self._job_members(identity.scope_id)
 
     def signal_scope(self, identity: ProcessIdentity, *, force: bool) -> None:
         if identity.scope_kind is not ProcessScopeKind.WINDOWS_JOB:
             raise ProcessIdentityError("Windows backend received a non-Job scope")
+        self._require_contained_job(identity.scope_id)
         if force:
             # RISK(side-effect): TerminateJobObject is restricted to the exact
             # named Job whose recorded PID/start membership was just checked.
@@ -679,6 +816,15 @@ class WindowsJobBackend:
             )
         return tuple(members)
 
+    def _require_contained_job(self, job_name: str) -> None:
+        flags = self._api.job_breakaway_flags(job_name)
+        if not isinstance(flags, int) or isinstance(flags, bool) or flags < 0:
+            raise ProcessIdentityError("Windows Job breakaway policy is invalid")
+        if flags:
+            raise ProcessIdentityError(
+                "Windows Job allows child breakaway from the exact Task boundary"
+            )
+
 
 class _CtypesWindowsJobApi:
     """Small ctypes wrapper; it never searches by process name."""
@@ -687,7 +833,15 @@ class _CtypesWindowsJobApi:
     _JOB_OBJECT_QUERY = 0x0004
     _JOB_OBJECT_TERMINATE = 0x0008
     _JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+    _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
+    _BREAKAWAY_MASK = (
+        _JOB_OBJECT_LIMIT_BREAKAWAY_OK | _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+    )
     _CTRL_BREAK_EVENT = 1
+    _MAX_JOB_QUERY_ATTEMPTS = 8
+    _MAX_JOB_PROCESS_CAPACITY = 65_536
 
     def __init__(self) -> None:
         if os.name != "nt":
@@ -772,7 +926,9 @@ class _CtypesWindowsJobApi:
     def job_process_ids(self, job_name: str) -> tuple[int, ...]:
         handle = self._open_job(job_name, self._JOB_OBJECT_QUERY)
         try:
-            for capacity in (64, 256, 1024, 4096):
+            capacity = 64
+            previous_complete: tuple[int, ...] | None = None
+            for _attempt in range(self._MAX_JOB_QUERY_ATTEMPTS):
                 header_size = ctypes.sizeof(ctypes.c_ulong) * 2
                 buffer = ctypes.create_string_buffer(
                     header_size + capacity * ctypes.sizeof(ctypes.c_size_t)
@@ -784,19 +940,101 @@ class _CtypesWindowsJobApi:
                     len(buffer),
                     None,
                 )
-                assigned = ctypes.c_ulong.from_buffer(buffer, 0).value
-                listed = ctypes.c_ulong.from_buffer(
-                    buffer, ctypes.sizeof(ctypes.c_ulong)
-                ).value
-                if ok and listed <= assigned and assigned <= capacity:
-                    array_type = ctypes.c_size_t * listed
-                    values = array_type.from_buffer(buffer, header_size)
-                    return tuple(int(value) for value in values)
                 if not ok and ctypes.get_last_error() != 234:  # ERROR_MORE_DATA
                     raise OSError(
                         ctypes.get_last_error(), "QueryInformationJobObject failed"
                     )
-            raise ProcessIdentityError("Windows Job has too many processes to verify")
+                assigned = ctypes.c_ulong.from_buffer(buffer, 0).value
+                listed = ctypes.c_ulong.from_buffer(
+                    buffer, ctypes.sizeof(ctypes.c_ulong)
+                ).value
+                if listed > assigned or listed > capacity:
+                    raise ProcessIdentityError(
+                        "Windows Job process membership is inconsistent"
+                    )
+                if ok and listed == assigned:
+                    array_type = ctypes.c_size_t * listed
+                    values = array_type.from_buffer(buffer, header_size)
+                    current = tuple(sorted(int(value) for value in values))
+                    if any(pid <= 0 for pid in current) or len(set(current)) != len(
+                        current
+                    ):
+                        raise ProcessIdentityError(
+                            "Windows Job process membership is inconsistent"
+                        )
+                    if previous_complete == current:
+                        return current
+                    previous_complete = current
+                    continue
+                previous_complete = None
+                if listed < assigned:
+                    capacity = max(capacity * 2, int(assigned))
+                    if capacity > self._MAX_JOB_PROCESS_CAPACITY:
+                        break
+                    continue
+                capacity *= 2
+                if capacity > self._MAX_JOB_PROCESS_CAPACITY:
+                    break
+            raise ProcessIdentityError(
+                "Windows Job process membership did not reach a stable snapshot"
+            )
+        finally:
+            self._kernel32.CloseHandle(handle)
+
+    def job_breakaway_flags(self, job_name: str) -> int:
+        from ctypes import wintypes
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimitInformation),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        handle = self._open_job(job_name, self._JOB_OBJECT_QUERY)
+        try:
+            information = _ExtendedLimitInformation()
+            ok = self._kernel32.QueryInformationJobObject(
+                handle,
+                self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(information),
+                ctypes.sizeof(information),
+                None,
+            )
+            if not ok:
+                raise OSError(
+                    ctypes.get_last_error(),
+                    "QueryInformationJobObject limits failed",
+                )
+            return (
+                int(information.BasicLimitInformation.LimitFlags) & self._BREAKAWAY_MASK
+            )
         finally:
             self._kernel32.CloseHandle(handle)
 
@@ -829,6 +1067,10 @@ def _validate_job_name(value: object) -> str:
     if not job_name.startswith(("Local\\InfinityForge-", "Global\\InfinityForge-")):
         raise ValueError("job_name must use an InfinityForge Job namespace")
     return job_name
+
+
+def _is_same_or_descendant_cgroup(candidate: str, root: str) -> bool:
+    return candidate == root or candidate.startswith(root.rstrip("/") + "/")
 
 
 def _posix_kill_group(group_id: int, signal_number: int) -> None:
@@ -878,10 +1120,16 @@ def _positive_int(value: object, label: str) -> int:
     return value
 
 
-def _nonnegative_number(value: object, label: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"{label} must be non-negative")
-    return float(value)
+def _finite_positive_number(value: object, label: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite positive number")
+    try:
+        number = float(value)
+    except OverflowError as error:
+        raise ValueError(f"{label} must be a finite positive number") from error
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{label} must be a finite positive number")
+    return number
 
 
 def _json_object(raw: str) -> dict[str, object]:

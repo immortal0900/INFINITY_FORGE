@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -33,6 +35,7 @@ class CapturedCardRun:
     """Active Hermes run captured before its card becomes terminal."""
 
     request_id: str
+    task_settings_hash: str
     project_id: str
     card_id: str
     run_id: int
@@ -71,8 +74,10 @@ def archive_matching_cards(
     database_path: str | Path,
     *,
     request_id: str,
+    task_settings_hash: str,
     owner_host: str,
     current_host: str,
+    dispatcher_database_path: str | Path,
     reason: str,
     occurred_at: int | None = None,
     identity_lookup: ProcessIdentityLookup | None = None,
@@ -87,8 +92,10 @@ def archive_matching_cards(
     as one indivisible database change.
     """
 
-    path = Path(database_path).expanduser().resolve()
+    supplied_path = Path(database_path).expanduser().absolute()
+    dispatcher_path = Path(dispatcher_database_path).expanduser().absolute()
     request_id = _canonical_uuid(request_id, "request_id")
+    task_settings_hash = _lower_sha256(task_settings_hash, "task_settings_hash")
     owner_host = _canonical_uuid(owner_host, "owner_host")
     current_host = _canonical_uuid(current_host, "current_host")
     if owner_host != current_host:
@@ -107,27 +114,48 @@ def archive_matching_cards(
         or occurred_at < 0
     ):
         raise ValueError("occurred_at must be a non-negative integer")
-    if (
-        not isinstance(lock_timeout_seconds, (int, float))
-        or isinstance(lock_timeout_seconds, bool)
-        or lock_timeout_seconds < 0
-    ):
-        raise ValueError("lock_timeout_seconds must be non-negative")
-    if not path.is_file():
+    lock_timeout_seconds = _finite_positive_number(
+        lock_timeout_seconds, "lock_timeout_seconds"
+    )
+    if not supplied_path.is_file():
         raise KanbanStopError("Hermes Kanban database does not exist")
+    if not dispatcher_path.is_file():
+        raise KanbanStopError("Hermes dispatcher database does not exist")
+    try:
+        path = supplied_path.resolve(strict=True)
+        if not os.path.samefile(path, dispatcher_path):
+            raise KanbanStopError(
+                "Hermes dispatcher database identity does not match the Stop database"
+            )
+    except OSError as error:
+        raise KanbanStopError(
+            "Hermes dispatcher database identity could not be verified"
+        ) from error
 
     # RISK(race): the file guard is the same board-scoped byte lock held for a
     # complete Hermes dispatcher tick, including its claim -> spawn -> PID gap.
-    with _board_dispatch_guard(path, timeout_seconds=float(lock_timeout_seconds)):
-        connection = _connect_existing(
-            path, timeout_seconds=float(lock_timeout_seconds)
-        )
+    with _board_dispatch_guard(
+        (path, dispatcher_path),
+        dispatcher_database_path=dispatcher_path,
+        timeout_seconds=lock_timeout_seconds,
+    ):
+        try:
+            if not os.path.samefile(path, dispatcher_path):
+                raise KanbanStopError(
+                    "Hermes dispatcher database identity changed under the lock"
+                )
+        except OSError as error:
+            raise KanbanStopError(
+                "Hermes dispatcher database identity changed under the lock"
+            ) from error
+        connection = _connect_existing(path, timeout_seconds=lock_timeout_seconds)
         try:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 result = _archive_in_transaction(
                     connection,
                     request_id=request_id,
+                    task_settings_hash=task_settings_hash,
                     owner_host=owner_host,
                     claimer_host_name=claimer_host_name,
                     reason=reason,
@@ -155,6 +183,7 @@ def _archive_in_transaction(
     connection: sqlite3.Connection,
     *,
     request_id: str,
+    task_settings_hash: str,
     owner_host: str,
     claimer_host_name: str,
     reason: str,
@@ -169,6 +198,7 @@ def _archive_in_transaction(
             connection,
             card=card,
             request_id=request_id,
+            task_settings_hash=task_settings_hash,
             owner_host=owner_host,
             claimer_host_name=claimer_host_name,
             identity_lookup=identity_lookup,
@@ -366,6 +396,7 @@ def _capture_card_runs(
     *,
     card: _Card,
     request_id: str,
+    task_settings_hash: str,
     owner_host: str,
     claimer_host_name: str,
     identity_lookup: ProcessIdentityLookup | None,
@@ -429,6 +460,7 @@ def _capture_card_runs(
             raise KanbanStopError("active worker has no exact process identity lookup")
         binding = ProcessBinding(
             request_id=request_id,
+            task_settings_hash=task_settings_hash,
             project_id=card.project_id,
             task_id=card.card_id,
             run_id=str(run_id),
@@ -451,6 +483,7 @@ def _capture_card_runs(
     return (
         CapturedCardRun(
             request_id=request_id,
+            task_settings_hash=task_settings_hash,
             project_id=card.project_id,
             card_id=card.card_id,
             run_id=run_id,
@@ -495,55 +528,114 @@ def _connect_existing(path: Path, *, timeout_seconds: float) -> sqlite3.Connecti
 
 @contextlib.contextmanager
 def _board_dispatch_guard(
-    database_path: Path,
+    database_paths: tuple[Path, ...],
     *,
+    dispatcher_database_path: Path,
     timeout_seconds: float,
 ) -> Iterator[None]:
-    lock_path = database_path.with_name(database_path.name + ".dispatch.lock")
-    try:
-        handle = lock_path.open("a+b")
-    except OSError as error:
-        raise KanbanStopError("Hermes dispatcher lock could not be opened") from error
-    acquired = False
+    lock_paths = _unique_dispatch_lock_paths(database_paths)
+    handles: list[object] = []
     deadline = time.monotonic() + timeout_seconds
     try:
-        while True:
+        for lock_path in lock_paths:
+            if lock_path.is_symlink():
+                raise KanbanStopError("Hermes dispatcher lock path is a symbolic link")
             try:
-                if os.name == "nt":
-                    import msvcrt
+                handle = lock_path.open("a+b")
+            except OSError as error:
+                raise KanbanStopError(
+                    "Hermes dispatcher lock could not be opened"
+                ) from error
+            try:
+                _acquire_dispatch_lock(handle, deadline=deadline)
+            except Exception:
+                handle.close()
+                raise
+            handles.append(handle)
 
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except (BlockingIOError, OSError):
-                if time.monotonic() >= deadline:
-                    raise KanbanStopError("Hermes dispatcher is still running a tick")
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        try:
+            hermes_acquired = _installed_hermes_dispatch_lock_probe(
+                dispatcher_database_path
+            )
+        except Exception as error:
+            raise KanbanStopError(
+                "Hermes dispatcher lock compatibility could not be verified"
+            ) from error
+        if type(hermes_acquired) is not bool or hermes_acquired:
+            raise KanbanStopError(
+                "Hermes dispatcher lock compatibility evidence is unsafe"
+            )
         yield
     finally:
-        try:
-            if acquired:
+        for handle in reversed(handles):
+            try:
                 try:
-                    if os.name == "nt":
-                        import msvcrt
-
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    _release_dispatch_lock(handle)
                 except OSError:
                     # Closing the handle below releases the OS lock; do not
                     # hide a committed Stop result with a secondary unlock error.
                     pass
-        finally:
-            handle.close()
+            finally:
+                handle.close()
+
+
+def _unique_dispatch_lock_paths(database_paths: tuple[Path, ...]) -> tuple[Path, ...]:
+    unique: dict[str, Path] = {}
+    for database_path in database_paths:
+        lock_path = database_path.with_name(database_path.name + ".dispatch.lock")
+        key = os.path.normcase(os.path.abspath(lock_path))
+        unique[key] = lock_path
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _acquire_dispatch_lock(handle: object, *, deadline: float) -> None:
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)  # type: ignore[attr-defined]
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+            else:
+                import fcntl
+
+                fcntl.flock(
+                    handle.fileno(),  # type: ignore[attr-defined]
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            return
+        except (BlockingIOError, OSError):
+            if time.monotonic() >= deadline:
+                raise KanbanStopError("Hermes dispatcher is still running a tick")
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _release_dispatch_lock(handle: object) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)  # type: ignore[attr-defined]
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+
+
+def _installed_hermes_dispatch_lock_probe(database_path: Path) -> bool:
+    try:
+        module = importlib.import_module("hermes_cli.kanban_db")
+        guard = getattr(module, "_dispatch_tick_lock")
+    except (ImportError, AttributeError) as error:
+        raise KanbanStopError(
+            "installed Hermes dispatcher lock contract is unavailable"
+        ) from error
+    with guard(database_path) as acquired:
+        if type(acquired) is not bool:
+            raise KanbanStopError(
+                "installed Hermes dispatcher lock contract returned invalid evidence"
+            )
+        return acquired
 
 
 def _canonical_uuid(value: object, label: str) -> str:
@@ -566,6 +658,28 @@ def _bounded_text(value: object, label: str, *, maximum_bytes: int) -> str:
     ):
         raise ValueError(f"{label} must be non-empty bounded UTF-8 text")
     return value
+
+
+def _lower_sha256(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def _finite_positive_number(value: object, label: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite positive number")
+    try:
+        number = float(value)
+    except OverflowError as error:
+        raise ValueError(f"{label} must be a finite positive number") from error
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{label} must be a finite positive number")
+    return number
 
 
 def _optional_text(value: object, label: str) -> str | None:

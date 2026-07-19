@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
+import forge.ops.kanban_stop as kanban_stop_module
 from forge.ops.kanban_stop import (
     KanbanStopError,
-    archive_matching_cards,
+    KanbanStopResult,
+    archive_matching_cards as _archive_matching_cards,
 )
 from forge.ops.process_identity import (
     ProcessBinding,
@@ -25,6 +29,11 @@ REQUEST_ID = str(uuid4())
 OTHER_REQUEST_ID = str(uuid4())
 HOST_ID = str(uuid4())
 PROJECT_IDS = tuple(f"{number:064x}" for number in range(1, 12))
+TASK_SETTINGS_HASH = "f" * 64
+OTHER_TASK_SETTINGS_HASH = "e" * 64
+_REAL_HERMES_DISPATCH_LOCK_PROBE = (
+    kanban_stop_module._installed_hermes_dispatch_lock_probe
+)
 NONTERMINAL = (
     "triage",
     "todo",
@@ -135,6 +144,233 @@ def _identity(binding: ProcessBinding, pid: int) -> ProcessIdentity:
 def _statuses(path: Path) -> dict[str, str]:
     with sqlite3.connect(path) as connection:
         return dict(connection.execute("SELECT id, status FROM tasks ORDER BY id"))
+
+
+def _hermes_style_dispatch_probe(database_path: Path) -> bool:
+    """Return Hermes' acquired flag for its board lock path."""
+
+    lock_path = database_path.with_name(database_path.name + ".dispatch.lock")
+    handle = lock_path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return False
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return True
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            return False
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return True
+    finally:
+        handle.close()
+
+
+@pytest.fixture(autouse=True)
+def _compatible_installed_hermes_dispatch_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        kanban_stop_module,
+        "_installed_hermes_dispatch_lock_probe",
+        _hermes_style_dispatch_probe,
+    )
+
+
+def archive_matching_cards(
+    database_path: str | Path,
+    **kwargs: object,
+) -> KanbanStopResult:
+    kwargs.setdefault("task_settings_hash", TASK_SETTINGS_HASH)
+    kwargs.setdefault("dispatcher_database_path", database_path)
+    return _archive_matching_cards(database_path, **kwargs)  # type: ignore[arg-type]
+
+
+def test_active_task_settings_hash_is_captured_in_the_process_binding(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "kanban.db"
+    connection = _create_database(path)
+    _insert_card(
+        connection,
+        task_id="worker-card",
+        status="running",
+        worker_pid=101,
+        current_run_id=17,
+        claim_lock="owner-machine:42",
+    )
+    connection.execute(
+        """
+        INSERT INTO task_runs (
+            id, task_id, status, claim_lock, claim_expires, worker_pid, started_at
+        ) VALUES (17, 'worker-card', 'running', 'owner-machine:42', 999, 101, 50)
+        """
+    )
+    connection.commit()
+    connection.close()
+    seen: list[ProcessBinding] = []
+
+    def lookup(binding: ProcessBinding, pid: int) -> ProcessIdentity:
+        seen.append(binding)
+        return _identity(binding, pid)
+
+    archive_matching_cards(
+        path,
+        request_id=REQUEST_ID,
+        task_settings_hash=TASK_SETTINGS_HASH,
+        owner_host=HOST_ID,
+        current_host=HOST_ID,
+        reason="stop",
+        identity_lookup=lookup,
+        claimer_host_name="owner-machine",
+        dispatcher_database_path=path,
+    )
+
+    assert seen[0].task_settings_hash == TASK_SETTINGS_HASH
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), 10**1000])
+def test_dispatch_lock_timeout_must_be_finite_and_positive(
+    tmp_path: Path,
+    timeout: float,
+) -> None:
+    path = tmp_path / "kanban.db"
+    connection = _create_database(path)
+    _insert_card(connection, task_id="ready", status="ready")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(ValueError, match="finite positive"):
+        archive_matching_cards(
+            path,
+            request_id=REQUEST_ID,
+            task_settings_hash=TASK_SETTINGS_HASH,
+            owner_host=HOST_ID,
+            current_host=HOST_ID,
+            reason="stop",
+            lock_timeout_seconds=timeout,
+            dispatcher_database_path=path,
+        )
+
+    assert _statuses(path)["ready"] == "ready"
+
+
+def test_dispatch_lock_covers_a_different_symlink_alias_used_by_hermes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "real" / "kanban.db"
+    path.parent.mkdir()
+    connection = _create_database(path)
+    _insert_card(connection, task_id="ready", status="ready")
+    connection.commit()
+    connection.close()
+    alias = tmp_path / "alias" / "board.db"
+    alias.parent.mkdir()
+    try:
+        alias.symlink_to(path)
+    except OSError:
+        os.link(path, alias)
+    probed: list[Path] = []
+
+    def probe(database_path: Path) -> bool:
+        probed.append(database_path)
+        return _hermes_style_dispatch_probe(database_path)
+
+    monkeypatch.setattr(
+        kanban_stop_module,
+        "_installed_hermes_dispatch_lock_probe",
+        probe,
+    )
+
+    result = archive_matching_cards(
+        path,
+        request_id=REQUEST_ID,
+        task_settings_hash=TASK_SETTINGS_HASH,
+        owner_host=HOST_ID,
+        current_host=HOST_ID,
+        reason="stop",
+        dispatcher_database_path=alias,
+    )
+
+    assert result.archived_card_ids == ("ready",)
+    assert probed == [alias.absolute()]
+
+
+def test_dispatcher_lock_noop_or_wrong_database_fails_before_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "kanban.db"
+    other = tmp_path / "other.db"
+    connection = _create_database(path)
+    _insert_card(connection, task_id="ready", status="ready")
+    connection.commit()
+    connection.close()
+    _create_database(other).close()
+
+    monkeypatch.setattr(
+        kanban_stop_module,
+        "_installed_hermes_dispatch_lock_probe",
+        lambda _path: True,
+    )
+    with pytest.raises(KanbanStopError, match="lock compatibility"):
+        archive_matching_cards(
+            path,
+            request_id=REQUEST_ID,
+            task_settings_hash=TASK_SETTINGS_HASH,
+            owner_host=HOST_ID,
+            current_host=HOST_ID,
+            reason="stop",
+            dispatcher_database_path=path,
+        )
+    monkeypatch.setattr(
+        kanban_stop_module,
+        "_installed_hermes_dispatch_lock_probe",
+        _hermes_style_dispatch_probe,
+    )
+    with pytest.raises(KanbanStopError, match="database identity"):
+        archive_matching_cards(
+            path,
+            request_id=REQUEST_ID,
+            task_settings_hash=TASK_SETTINGS_HASH,
+            owner_host=HOST_ID,
+            current_host=HOST_ID,
+            reason="stop",
+            dispatcher_database_path=other,
+        )
+
+    assert _statuses(path)["ready"] == "ready"
+
+
+def test_installed_hermes_dispatch_probe_invokes_the_actual_lock_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "kanban.db"
+    path.touch()
+    seen: list[Path] = []
+
+    @contextlib.contextmanager
+    def guard(database_path: Path):  # type: ignore[no-untyped-def]
+        seen.append(database_path)
+        yield False
+
+    def load(name: str) -> SimpleNamespace:
+        assert name == "hermes_cli.kanban_db"
+        return SimpleNamespace(_dispatch_tick_lock=guard)
+
+    monkeypatch.setattr(kanban_stop_module.importlib, "import_module", load)
+
+    assert _REAL_HERMES_DISPATCH_LOCK_PROBE(path) is False
+    assert seen == [path]
 
 
 def test_all_matching_nonterminal_cards_archive_in_one_transaction(
@@ -266,6 +502,7 @@ def test_active_run_and_exact_process_identity_are_captured_before_archive(
     assert seen == [
         ProcessBinding(
             request_id=REQUEST_ID,
+            task_settings_hash=TASK_SETTINGS_HASH,
             project_id=PROJECT_IDS[0],
             task_id="worker-card",
             run_id="17",
@@ -317,6 +554,7 @@ def test_mismatched_process_binding_rolls_back_without_archiving(
         return _identity(
             ProcessBinding(
                 request_id=binding.request_id,
+                task_settings_hash=binding.task_settings_hash,
                 project_id=binding.project_id,
                 task_id="another-card",
                 run_id=binding.run_id,
@@ -594,7 +832,7 @@ def test_dispatch_tick_file_lock_blocks_stop_before_any_sqlite_write(
                 owner_host=HOST_ID,
                 current_host=HOST_ID,
                 reason="stop",
-                lock_timeout_seconds=0,
+                lock_timeout_seconds=0.001,
             )
     finally:
         if os.name == "nt":
