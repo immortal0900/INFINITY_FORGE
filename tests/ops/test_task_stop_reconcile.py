@@ -992,8 +992,8 @@ def _process_identity() -> ProcessIdentity:
         platform="posix",
         pid=901,
         start_identity=member.start_identity,
-        scope_kind=ProcessScopeKind.PROCESS_GROUP,
-        scope_id="901",
+        scope_kind=ProcessScopeKind.CGROUP,
+        scope_id="/forge/test",
         control_group_id=None,
         members=(member,),
     )
@@ -1063,8 +1063,8 @@ def _durable_process_identity(
         platform="posix",
         pid=member.pid,
         start_identity=member.start_identity,
-        scope_kind=ProcessScopeKind.PROCESS_GROUP,
-        scope_id=str(member.pid),
+        scope_kind=ProcessScopeKind.CGROUP,
+        scope_id="/forge/test",
         control_group_id=None,
         members=(member,),
     )
@@ -1099,6 +1099,36 @@ def _insert_runtime_identity(
                 NOW_TEXT,
             ),
         )
+
+
+def test_reconcile_rejects_process_group_before_archiving_its_card(
+    tmp_path: Path,
+) -> None:
+    database, request, stop_id = _seed_stop(tmp_path)
+    identity = replace(
+        _durable_process_identity(database, request),
+        scope_kind=ProcessScopeKind.PROCESS_GROUP,
+        scope_id="901",
+    )
+    _insert_runtime_identity(
+        database,
+        identity,
+        row_run_id=identity.binding.run_id,
+        raw_identity=identity.to_json(),
+    )
+    prs = FakePullRequests()
+    _set_pr(database, request, 0, merged=False, reader=prs)
+    cards = FakeCards()
+
+    result = _reconciler(
+        database,
+        FakeIssues(request),
+        prs,
+        cards,
+    ).reconcile(stop_id)
+
+    assert result.state == "cleanup_incomplete"
+    assert cards.calls == []
 
 
 @pytest.mark.parametrize("stored", ("missing", "malformed", "ambiguous"))

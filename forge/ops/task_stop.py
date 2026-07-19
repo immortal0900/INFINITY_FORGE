@@ -27,6 +27,7 @@ from .kanban_stop import (
 from .process_identity import (
     ProcessIdentity,
     ProcessScopeBackend,
+    ProcessScopeKind,
     ProcessStopResult,
     terminate_exact_process_tree,
 )
@@ -1438,6 +1439,16 @@ class TaskStopReconciler:
         for _attempt in range(3):
             authority = self._service.guard_stop_cleanup(authority.stop_request_id)
             runtime_identities = self._active_runtime_identities(authority, projects)
+            if any(
+                identity.scope_kind is ProcessScopeKind.PROCESS_GROUP
+                for identity in runtime_identities
+            ):
+                # RISK(side-effect): reject a legacy escapable boundary before
+                # Kanban archival; otherwise an escaped child could survive
+                # while its only dispatch/run pointers are made terminal.
+                raise TaskStopError(
+                    "exact worker Stop requires a Linux cgroup or Windows Job"
+                )
             cards = self._kanban.archive(authority)
             if cards.request_id != authority.request_id or not cards.all_cards_terminal:
                 raise TaskStopError("Task Stop cards did not become terminal")

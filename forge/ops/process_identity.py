@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import json
 import math
 import os
@@ -70,7 +71,7 @@ class ProcessMemberIdentity:
 
 @dataclass(frozen=True, slots=True)
 class ProcessIdentity:
-    """Durable identity for one exact worker process group, cgroup, or Job."""
+    """Durable worker identity; exact Stop permits only cgroup or Job scopes."""
 
     binding: ProcessBinding
     platform: str
@@ -287,6 +288,10 @@ def terminate_exact_process_tree(
         raise ProcessIdentityMismatch("recorded process belongs to another Task or run")
     if identity.binding.host_id != current_host:
         raise ProcessIdentityMismatch("recorded process belongs to another owner host")
+    if identity.scope_kind is ProcessScopeKind.PROCESS_GROUP:
+        raise ProcessIdentityError(
+            "exact worker stop requires a Linux cgroup or Windows Job boundary"
+        )
 
     current, authorized_members = _initial_scope_members(identity, backend)
     if not current:
@@ -313,7 +318,7 @@ def terminate_exact_process_tree(
     forced = False
     if remaining:
         # RISK(side-effect): the force path addresses only the same recorded
-        # process group/cgroup/Job after a fresh start-identity read-back.
+        # cgroup/Job after a fresh start-identity read-back.
         forced = _signal_or_gone(identity, backend, force=True)
         remaining = _wait_for_zero(
             identity,
@@ -408,17 +413,24 @@ def _trusted_scope_members(
         return ()
     for member in current:
         expected_start = authorized_members.get(member.pid)
-        if expected_start is None:
-            raise ProcessIdentityMismatch(
-                f"recorded process scope contains unrecorded member PID {member.pid}"
-            )
         if expected_start != member.start_identity:
-            raise ProcessIdentityMismatch(f"PID {member.pid} start identity changed")
+            # RISK(security): after the initial root/start proof, cgroup and Job
+            # membership is the kernel-owned authority. Descendants may spawn,
+            # exit, and reuse a PID while TERM is pending; they remain inside
+            # the exact boundary and must be included in force/readback.
+            if identity.scope_kind not in {
+                ProcessScopeKind.CGROUP,
+                ProcessScopeKind.WINDOWS_JOB,
+            }:
+                raise ProcessIdentityMismatch(
+                    f"recorded process scope contains unrecorded member PID {member.pid}"
+                )
+            authorized_members[member.pid] = member.start_identity
     return current
 
 
 class PosixProcessBackend:
-    """Linux /proc adapter for an exact process group or cgroup."""
+    """Linux /proc adapter; exact signaling requires a cgroup v2 boundary."""
 
     def __init__(
         self,
@@ -440,6 +452,9 @@ class PosixProcessBackend:
         self._kill_process = (
             kill_process if kill_process is not None else _posix_kill_process
         )
+        self._pidfd_open = getattr(os, "pidfd_open", None)
+        self._pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        self._close_fd = os.close
 
     def capture_process_group(
         self,
@@ -511,9 +526,9 @@ class PosixProcessBackend:
 
     def signal_scope(self, identity: ProcessIdentity, *, force: bool) -> None:
         if identity.scope_kind is ProcessScopeKind.PROCESS_GROUP:
-            signal_number = signal.SIGKILL if force else signal.SIGTERM
-            self._kill_group(int(identity.scope_id), signal_number)
-            return
+            raise ProcessIdentityError(
+                "exact POSIX worker signaling requires a cgroup boundary"
+            )
         if identity.scope_kind is not ProcessScopeKind.CGROUP:
             raise ProcessIdentityError("POSIX backend received a non-POSIX scope")
         if force:
@@ -522,8 +537,64 @@ class PosixProcessBackend:
             # validated cgroup path and never for a parent/global cgroup.
             control.write_text("1\n", encoding="ascii")
             return
+        if self._pidfd_open is None or self._pidfd_send_signal is None:
+            raise ProcessIdentityError(
+                "Linux pidfd signaling is required for exact cgroup TERM"
+            )
         for member in self.scope_members(identity):
-            self._kill_process(member.pid, signal.SIGTERM)
+            self._signal_cgroup_member(identity, member)
+
+    def _signal_cgroup_member(
+        self,
+        identity: ProcessIdentity,
+        member: ProcessMemberIdentity,
+    ) -> None:
+        assert self._pidfd_open is not None
+        assert self._pidfd_send_signal is not None
+        try:
+            descriptor = self._pidfd_open(member.pid, 0)
+        except OSError as error:
+            if error.errno == errno.ESRCH:
+                return
+            raise ProcessIdentityError(
+                f"cannot open pidfd for cgroup PID {member.pid}"
+            ) from error
+        if (
+            not isinstance(descriptor, int)
+            or isinstance(descriptor, bool)
+            or descriptor < 0
+        ):
+            raise ProcessIdentityError("pidfd_open returned an invalid descriptor")
+        try:
+            snapshot = self._snapshot(member.pid)
+            if snapshot is None:
+                return
+            if snapshot[2] != member.start_identity:
+                raise ProcessIdentityMismatch(
+                    f"PID {member.pid} start identity changed before pidfd signal"
+                )
+            current_cgroup = self._process_cgroup(member.pid)
+            if current_cgroup is None:
+                raise ProcessIdentityMismatch(
+                    f"PID {member.pid} cgroup cannot be proven before pidfd signal"
+                )
+            if not _is_same_or_descendant_cgroup(
+                current_cgroup,
+                identity.scope_id,
+            ):
+                raise ProcessIdentityMismatch(
+                    f"PID {member.pid} left the exact cgroup before pidfd signal"
+                )
+            try:
+                self._pidfd_send_signal(descriptor, signal.SIGTERM)
+            except OSError as error:
+                if error.errno == errno.ESRCH:
+                    return
+                raise ProcessIdentityError(
+                    f"pidfd signal failed for cgroup PID {member.pid}"
+                ) from error
+        finally:
+            self._close_fd(descriptor)
 
     def _read_boot_id(self) -> str:
         try:
@@ -1064,7 +1135,22 @@ class _CtypesWindowsJobApi:
 
 def _validate_job_name(value: object) -> str:
     job_name = _bounded_text(value, "job_name", maximum=256)
-    if not job_name.startswith(("Local\\InfinityForge-", "Global\\InfinityForge-")):
+    prefix = next(
+        (
+            candidate
+            for candidate in ("Local\\InfinityForge-", "Global\\InfinityForge-")
+            if job_name.startswith(candidate)
+        ),
+        None,
+    )
+    suffix = "" if prefix is None else job_name[len(prefix) :]
+    if (
+        prefix is None
+        or not suffix
+        or "\\" in suffix
+        or "/" in suffix
+        or any(ord(character) < 32 or ord(character) == 127 for character in suffix)
+    ):
         raise ValueError("job_name must use an InfinityForge Job namespace")
     return job_name
 

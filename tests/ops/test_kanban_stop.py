@@ -134,8 +134,8 @@ def _identity(binding: ProcessBinding, pid: int) -> ProcessIdentity:
         platform="posix",
         pid=pid,
         start_identity=member.start_identity,
-        scope_kind=ProcessScopeKind.PROCESS_GROUP,
-        scope_id=str(pid),
+        scope_kind=ProcessScopeKind.CGROUP,
+        scope_id="/forge/test",
         control_group_id=None,
         members=(member,),
     )

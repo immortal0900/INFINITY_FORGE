@@ -48,8 +48,8 @@ def _identity(**changes: object) -> ProcessIdentity:
         "platform": "posix",
         "pid": 101,
         "start_identity": "boot-id:9001",
-        "scope_kind": ProcessScopeKind.PROCESS_GROUP,
-        "scope_id": "101",
+        "scope_kind": ProcessScopeKind.CGROUP,
+        "scope_id": "/forge/test",
         "control_group_id": None,
         "members": (
             ProcessMemberIdentity(pid=101, start_identity="boot-id:9001"),
@@ -58,6 +58,22 @@ def _identity(**changes: object) -> ProcessIdentity:
     }
     values.update(changes)
     return ProcessIdentity(**values)  # type: ignore[arg-type]
+
+
+def _kernel_boundary_identity(scope_kind: ProcessScopeKind) -> ProcessIdentity:
+    if scope_kind is ProcessScopeKind.CGROUP:
+        return replace(
+            _identity(),
+            scope_kind=scope_kind,
+            scope_id="/forge/test",
+        )
+    return replace(
+        _identity(),
+        platform="windows",
+        scope_kind=ProcessScopeKind.WINDOWS_JOB,
+        scope_id="Local\\InfinityForge-test",
+        control_group_id=101,
+    )
 
 
 class _FakeBackend:
@@ -182,6 +198,25 @@ def test_wrong_task_run_or_host_fails_before_any_process_signal(
     assert backend.signals == []
 
 
+def test_exact_worker_stop_rejects_a_process_group_boundary_before_signal() -> None:
+    identity = replace(
+        _identity(),
+        scope_kind=ProcessScopeKind.PROCESS_GROUP,
+        scope_id="101",
+    )
+    backend = _FakeBackend([identity.members])
+
+    with pytest.raises(ProcessIdentityError, match="cgroup|Windows Job"):
+        terminate_exact_process_tree(
+            identity,
+            expected=identity.binding,
+            current_host=HOST_ID,
+            backend=backend,
+        )
+
+    assert backend.signals == []
+
+
 def test_pid_reuse_fails_before_any_process_signal() -> None:
     reused = (ProcessMemberIdentity(pid=101, start_identity="boot-id:DIFFERENT"),)
     backend = _FakeBackend([reused])
@@ -255,6 +290,34 @@ def test_term_then_exact_force_requires_descendant_zero_readback() -> None:
     assert result.forced is True
     assert result.completed is True
     assert result.remaining_members == ()
+
+
+@pytest.mark.parametrize(
+    "scope_kind",
+    (ProcessScopeKind.CGROUP, ProcessScopeKind.WINDOWS_JOB),
+)
+def test_new_in_boundary_descendant_after_term_is_included_in_force_readback(
+    scope_kind: ProcessScopeKind,
+) -> None:
+    identity = _kernel_boundary_identity(scope_kind)
+    new_descendant = ProcessMemberIdentity(pid=103, start_identity="new:9003")
+    backend = _FakeBackend(
+        [identity.members, (*identity.members, new_descendant), ()]
+    )
+    clock = iter(range(0, 100, 2))
+
+    result = terminate_exact_process_tree(
+        identity,
+        expected=identity.binding,
+        current_host=HOST_ID,
+        backend=backend,
+        term_timeout_seconds=0.000001,
+        force_timeout_seconds=0.000001,
+        monotonic=lambda: float(next(clock)),
+    )
+
+    assert backend.signals == [False, True]
+    assert result.completed is True
 
 
 def test_already_dead_tree_is_complete_without_signal() -> None:
@@ -337,7 +400,7 @@ def _write_proc_stat(
     start_ticks: int,
 ) -> None:
     process_dir = proc_root / str(pid)
-    process_dir.mkdir(parents=True)
+    process_dir.mkdir(parents=True, exist_ok=True)
     # Linux /proc/<pid>/stat fields 3..22. The command deliberately contains
     # spaces and ')' so the parser must split at the final closing parenthesis.
     tail = ["S", str(parent), str(group), str(group)]
@@ -378,7 +441,7 @@ def _write_cgroup(
     return path
 
 
-def test_posix_adapter_captures_group_and_start_identity_without_name_search(
+def test_posix_adapter_can_capture_but_never_signal_a_process_group_as_exact(
     tmp_path: Path,
 ) -> None:
     proc_root = tmp_path / "proc"
@@ -393,14 +456,15 @@ def test_posix_adapter_captures_group_and_start_identity_without_name_search(
     )
 
     identity = backend.capture_process_group(_binding(), pid=101)
-    backend.signal_scope(identity, force=False)
+    with pytest.raises(ProcessIdentityError, match="cgroup"):
+        backend.signal_scope(identity, force=False)
 
     assert identity.scope_id == "101"
     assert identity.members == (
         ProcessMemberIdentity(pid=101, start_identity="boot-id:9001"),
         ProcessMemberIdentity(pid=102, start_identity="boot-id:9002"),
     )
-    assert signals and signals[0][0] == 101
+    assert signals == []
 
 
 def test_cgroup_scope_includes_descendants_and_skips_unrelated_root_members(
@@ -502,6 +566,61 @@ def test_cgroup_membership_tolerates_kernel_documented_duplicate_pid_reads(
     )
 
 
+class _PidReuseBeforeSignalBackend(PosixProcessBackend):
+    def scope_members(
+        self,
+        identity: ProcessIdentity,
+    ) -> tuple[ProcessMemberIdentity, ...]:
+        members = super().scope_members(identity)
+        _write_proc_stat(
+            self._proc_root,
+            pid=101,
+            parent=1,
+            group=777,
+            start_ticks=9999,
+        )
+        _set_process_cgroup(self._proc_root, 101, "/unrelated")
+        return members
+
+
+def test_cgroup_soft_signal_revalidates_pidfd_identity_after_pid_reuse(
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / "proc"
+    cgroup_root = tmp_path / "cgroup"
+    _write_proc_stat(proc_root, pid=101, parent=1, group=101, start_ticks=9001)
+    _write_cgroup(
+        cgroup_root,
+        "forge/test",
+        process_ids=(101,),
+        populated=True,
+    )
+    opened: list[int] = []
+    sent: list[tuple[int, int]] = []
+    closed: list[int] = []
+    raw_signals: list[tuple[int, int]] = []
+    backend = _PidReuseBeforeSignalBackend(
+        proc_root=proc_root,
+        cgroup_root=cgroup_root,
+        boot_id="boot-id",
+        kill_process=lambda pid, signal_number: raw_signals.append(
+            (pid, signal_number)
+        ),
+    )
+    backend._pidfd_open = lambda pid, _flags: opened.append(pid) or 50
+    backend._pidfd_send_signal = lambda fd, sig: sent.append((fd, sig))
+    backend._close_fd = closed.append
+    identity = backend.capture_cgroup(_binding(), pid=101)
+
+    with pytest.raises(ProcessIdentityMismatch, match="start identity|cgroup"):
+        backend.signal_scope(identity, force=False)
+
+    assert opened == [101]
+    assert sent == []
+    assert closed == [50]
+    assert raw_signals == []
+
+
 class _FakeWindowsJobApi:
     def __init__(self) -> None:
         self.break_groups: list[int] = []
@@ -542,6 +661,34 @@ def test_windows_adapter_targets_only_recorded_job_and_control_group() -> None:
     assert identity.start_identity == "creation:1"
     assert api.break_groups == [101]
     assert api.terminated_jobs == ["Local\\InfinityForge-test"]
+
+
+@pytest.mark.parametrize(
+    "job_name",
+    (
+        "Local\\InfinityForge-safe\x00alias",
+        "Local\\InfinityForge-safe\nalias",
+        "Local\\InfinityForge-safe\\alias",
+        "Global\\InfinityForge-safe\\alias",
+        "Local\\InfinityForge-",
+    ),
+)
+def test_windows_job_name_rejects_control_and_namespace_aliases(
+    job_name: str,
+) -> None:
+    members = (ProcessMemberIdentity(pid=101, start_identity="creation:1"),)
+
+    with pytest.raises(ValueError, match="job_name"):
+        ProcessIdentity(
+            binding=_binding(),
+            platform="windows",
+            pid=101,
+            start_identity="creation:1",
+            scope_kind=ProcessScopeKind.WINDOWS_JOB,
+            scope_id=job_name,
+            control_group_id=101,
+            members=members,
+        )
 
 
 class _BreakawayWindowsJobApi(_FakeWindowsJobApi):
@@ -717,4 +864,8 @@ def test_identity_rejects_scope_that_does_not_contain_the_recorded_pid() -> None
 
 def test_identity_rejects_a_process_group_not_led_by_the_recorded_pid() -> None:
     with pytest.raises(ValueError, match="process group"):
-        replace(_identity(), scope_id="999")
+        replace(
+            _identity(),
+            scope_kind=ProcessScopeKind.PROCESS_GROUP,
+            scope_id="999",
+        )
