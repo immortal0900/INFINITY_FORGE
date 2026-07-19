@@ -19,7 +19,13 @@ from .safe_files import (
     SafeFilesEvidence,
     check_safe_files,
 )
-from .task_service import TaskIssue, TaskServiceError, read_task_marker
+from .task_service import (
+    TaskIssue,
+    TaskParentIssue,
+    TaskServiceError,
+    read_task_marker,
+    read_task_marker_v2,
+)
 
 
 _PR_URL_RE = re.compile(
@@ -1070,3 +1076,187 @@ class GitHubTaskIssueClient:
         ):
             raise GateError("GitHub issue label response is invalid")
         return self.get_issue(repository, issue_number)
+
+
+class GitHubTaskIssueClientV2:
+    """Find and mutate only v2 central parent issues through ``gh api``."""
+
+    def __init__(
+        self,
+        gh_path: str | Path,
+        *,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ) -> None:
+        self._gh_path = str(Path(gh_path).expanduser())
+        self._runner = runner
+
+    def _run_json(self, arguments: Sequence[str], label: str) -> object:
+        result = self._runner(
+            [self._gh_path, "api", *arguments],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise GateError(
+                f"GitHub {label} request failed with exit code {result.returncode}"
+            )
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise GateError(f"GitHub {label} response is not valid JSON") from error
+
+    @staticmethod
+    def _repository(value: str) -> str:
+        if not isinstance(value, str) or _REPOSITORY_RE.fullmatch(value) is None:
+            raise GateError("GitHub repository must use OWNER/REPO format")
+        return value
+
+    @staticmethod
+    def _issue_number(value: int) -> int:
+        if type(value) is not int or value <= 0:
+            raise GateError("GitHub issue number must be a positive integer")
+        return value
+
+    @staticmethod
+    def _parse_parent_issue(value: object) -> TaskParentIssue:
+        if not isinstance(value, dict) or "pull_request" in value:
+            raise GateError("GitHub parent issue response is not an issue object")
+        number = value.get("number")
+        title = value.get("title")
+        body = value.get("body")
+        state = value.get("state")
+        if type(number) is not int or number <= 0:
+            raise GateError("GitHub parent issue number is invalid")
+        if not isinstance(title, str) or not title.strip():
+            raise GateError("GitHub parent issue title is invalid")
+        if not isinstance(body, str):
+            raise GateError("GitHub parent issue body is invalid")
+        if type(state) is not str or state not in {"open", "closed"}:
+            raise GateError("GitHub parent issue state is invalid")
+        try:
+            return TaskParentIssue(
+                number=number,
+                title=title,
+                body=body,
+                state=state,
+            )
+        except TaskServiceError as error:
+            raise GateError("GitHub parent issue response is invalid") from error
+
+    def find_issue(
+        self,
+        repository: str,
+        request_id: str,
+    ) -> TaskParentIssue | None:
+        repository = self._repository(repository)
+        if not isinstance(request_id, str) or _REQUEST_ID_RE.fullmatch(request_id) is None:
+            raise GateError("GitHub v2 Task request_id is invalid")
+        # RISK(data-loss): every page and every state is required. Missing a
+        # prior v2 parent after a lost create response would duplicate the Task.
+        payload = self._run_json(
+            (
+                "--paginate",
+                "--slurp",
+                f"repos/{repository}/issues?state=all&per_page=100",
+            ),
+            "v2 parent issue list",
+        )
+        if not isinstance(payload, list) or any(
+            not isinstance(page, list) for page in payload
+        ):
+            raise GateError("GitHub paginated parent issue response is invalid")
+        matches: list[TaskParentIssue] = []
+        for page in payload:
+            for raw_issue in page:
+                if not isinstance(raw_issue, dict):
+                    raise GateError("GitHub parent issue list contains an invalid item")
+                if "pull_request" in raw_issue:
+                    continue
+                body = raw_issue.get("body")
+                if body is None:
+                    continue
+                if not isinstance(body, str):
+                    raise GateError("GitHub parent issue body is invalid")
+                if "<!-- forge-v2-task-request" not in body:
+                    continue
+                try:
+                    marker = read_task_marker_v2(body)
+                except TaskServiceError as error:
+                    raise GateError("GitHub parent issue Task marker is invalid") from error
+                if marker.get("request_id") != request_id:
+                    continue
+                issue = self._parse_parent_issue(raw_issue)
+                if issue.state != "open":
+                    raise GateError("GitHub v2 parent issue is closed")
+                matches.append(issue)
+        if len(matches) > 1:
+            raise GateError("GitHub v2 request_id matched more than one parent issue")
+        return matches[0] if matches else None
+
+    def create_issue(
+        self,
+        repository: str,
+        title: str,
+        body: str,
+    ) -> TaskParentIssue:
+        repository = self._repository(repository)
+        if not isinstance(title, str) or not title.strip():
+            raise GateError("GitHub parent issue title must be non-empty text")
+        if not isinstance(body, str):
+            raise GateError("GitHub parent issue body must be text")
+        payload = self._run_json(
+            (
+                "-X",
+                "POST",
+                f"repos/{repository}/issues",
+                "-f",
+                f"title={title}",
+                "-f",
+                f"body={body}",
+            ),
+            "v2 parent issue create",
+        )
+        return self._parse_parent_issue(payload)
+
+    def update_issue(
+        self,
+        repository: str,
+        issue_number: int,
+        *,
+        title: str,
+        body: str,
+    ) -> TaskParentIssue:
+        repository = self._repository(repository)
+        issue_number = self._issue_number(issue_number)
+        if not isinstance(title, str) or not title.strip():
+            raise GateError("GitHub parent issue title must be non-empty text")
+        if not isinstance(body, str):
+            raise GateError("GitHub parent issue body must be text")
+        payload = self._run_json(
+            (
+                "-X",
+                "PATCH",
+                f"repos/{repository}/issues/{issue_number}",
+                "-f",
+                f"title={title}",
+                "-f",
+                f"body={body}",
+            ),
+            "v2 parent issue update",
+        )
+        return self._parse_parent_issue(payload)
+
+    def get_issue(
+        self,
+        repository: str,
+        issue_number: int,
+    ) -> TaskParentIssue:
+        repository = self._repository(repository)
+        issue_number = self._issue_number(issue_number)
+        payload = self._run_json(
+            (f"repos/{repository}/issues/{issue_number}",),
+            "v2 parent issue readback",
+        )
+        return self._parse_parent_issue(payload)

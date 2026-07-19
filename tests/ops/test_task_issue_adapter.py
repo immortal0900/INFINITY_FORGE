@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from forge.ops.github import GitHubTaskIssueClient
+from forge.ops.github import GitHubTaskIssueClient, GitHubTaskIssueClientV2
 from forge.ops.hermes import GateError
 from forge.ops.task_service import READY_TO_BUILD_LABEL
 
@@ -28,6 +28,24 @@ BODY = (
     )
     + "\n-->"
 )
+V2_BODY = (
+    "Task body\n\n"
+    "<!-- forge-v2-progress:start -->\n"
+    "progress\n"
+    "<!-- forge-v2-progress:end -->\n\n"
+    "<!-- forge-v2-task-request\n"
+    + json.dumps(
+        {
+            "format_version": "forge-task-request/v2",
+            "request_id": REQUEST_ID,
+            "request_hash": "c" * 64,
+            "task_content_hash": CONTENT_HASH,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    + "\n-->"
+)
 
 
 def _issue(number: int, *, body: str = BODY, labels: tuple[str, ...] = ()) -> dict:
@@ -36,6 +54,20 @@ def _issue(number: int, *, body: str = BODY, labels: tuple[str, ...] = ()) -> di
         "title": "Task title",
         "body": body,
         "labels": [{"name": label} for label in labels],
+    }
+
+
+def _issue_v2(
+    number: int,
+    *,
+    body: str = V2_BODY,
+    state: str = "open",
+) -> dict:
+    return {
+        "number": number,
+        "title": "Task title",
+        "body": body,
+        "state": state,
     }
 
 
@@ -157,3 +189,107 @@ def test_github_api_failure_does_not_return_an_empty_issue() -> None:
 
     with pytest.raises(GateError, match="exit code 1"):
         client.find_issue("openai/infinity-forge", REQUEST_ID)
+
+
+def test_v1_and_v2_finders_ignore_the_other_marker_and_read_every_page() -> None:
+    v1_runner = Runner([[[ _issue_v2(1), _issue(2) ]]])
+    v2_runner = Runner([[[ _issue(1)], [_issue_v2(2) ]]])
+
+    v1 = GitHubTaskIssueClient("gh", runner=v1_runner).find_issue(
+        "openai/infinity-forge",
+        REQUEST_ID,
+    )
+    v2 = GitHubTaskIssueClientV2("gh", runner=v2_runner).find_issue(
+        "openai/infinity-forge",
+        REQUEST_ID,
+    )
+
+    assert v1 is not None and v1.number == 2
+    assert v2 is not None and v2.number == 2 and v2.state == "open"
+    assert "--paginate" in v2_runner.calls[0]
+    assert "--slurp" in v2_runner.calls[0]
+    assert "state=all" in v2_runner.calls[0][-1]
+
+
+def test_v2_issue_client_does_not_expose_the_v1_ready_label_write() -> None:
+    client = GitHubTaskIssueClientV2("gh", runner=Runner([]))
+
+    assert not hasattr(client, "add_label")
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    (
+        ([[ _issue_v2(1, state="closed") ]], "closed"),
+        ([[ _issue_v2(1), _issue_v2(2) ]], "more than one"),
+        (
+            [[_issue_v2(1, body="<!-- forge-v2-task-request\nbad\n-->")]],
+            "Task marker",
+        ),
+    ),
+)
+def test_v2_finder_rejects_closed_duplicate_or_malformed_parent(
+    payload: object,
+    message: str,
+) -> None:
+    client = GitHubTaskIssueClientV2("gh", runner=Runner([payload]))
+
+    with pytest.raises(GateError, match=message):
+        client.find_issue("openai/infinity-forge", REQUEST_ID)
+
+
+def test_v2_issue_write_and_read_commands_return_strict_parent_snapshots() -> None:
+    runner = Runner(
+        [
+            _issue_v2(3),
+            _issue_v2(3, body=V2_BODY + "\nupdated"),
+            _issue_v2(3, body=V2_BODY + "\nupdated"),
+        ]
+    )
+    client = GitHubTaskIssueClientV2("gh", runner=runner)
+
+    created = client.create_issue("openai/infinity-forge", "Task title", V2_BODY)
+    updated = client.update_issue(
+        "openai/infinity-forge",
+        3,
+        title="Task title",
+        body=V2_BODY + "\nupdated",
+    )
+    fetched = client.get_issue("openai/infinity-forge", 3)
+
+    assert created.number == updated.number == fetched.number == 3
+    assert runner.calls[0][1:5] == [
+        "api",
+        "-X",
+        "POST",
+        "repos/openai/infinity-forge/issues",
+    ]
+    assert runner.calls[1][2:5] == [
+        "-X",
+        "PATCH",
+        "repos/openai/infinity-forge/issues/3",
+    ]
+    assert runner.calls[2][1:] == [
+        "api",
+        "repos/openai/infinity-forge/issues/3",
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {**_issue_v2(1), "number": True},
+        {**_issue_v2(1), "title": ""},
+        {**_issue_v2(1), "body": None},
+        {**_issue_v2(1), "state": "merged"},
+        {**_issue_v2(1), "state": []},
+        {**_issue_v2(1), "pull_request": {}},
+    ),
+)
+def test_v2_malformed_or_pr_response_is_never_treated_as_parent(
+    payload: object,
+) -> None:
+    client = GitHubTaskIssueClientV2("gh", runner=Runner([payload]))
+
+    with pytest.raises(GateError, match="GitHub parent issue"):
+        client.get_issue("openai/infinity-forge", 1)
