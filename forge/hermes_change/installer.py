@@ -612,6 +612,42 @@ def _replace_unique_sequence(
     return "".join(lines)
 
 
+def _insert_before_function_return_after_anchor(
+    source: str,
+    *,
+    anchor: str,
+    additions: tuple[str, ...],
+    max_lines: int,
+    label: str,
+) -> str:
+    lines = source.splitlines(keepends=True)
+    anchors = [index for index, line in enumerate(lines) if line.strip() == anchor]
+    if len(anchors) != 1:
+        raise InstallError(f"{label} anchor is not unique")
+    anchor_index = anchors[0]
+    anchor_line = lines[anchor_index]
+    indent = anchor_line[: len(anchor_line) - len(anchor_line.lstrip())]
+    matches = [
+        index
+        for index in range(
+            anchor_index + 1,
+            min(len(lines), anchor_index + max_lines),
+        )
+        if lines[index].startswith(indent)
+        and not lines[index].startswith(indent + " ")
+        and lines[index].strip() in {"return response", "return result"}
+    ]
+    if len(matches) != 1:
+        raise InstallError(f"{label} return seam is not unique")
+    return_index = matches[0]
+    original = lines[return_index]
+    newline = "\r\n" if original.endswith("\r\n") else "\n"
+    lines[return_index:return_index] = [
+        f"{indent}{addition}{newline}" for addition in additions
+    ]
+    return "".join(lines)
+
+
 def _insert_after_line_in_unique_block(
     source: str,
     *,
@@ -640,6 +676,47 @@ def _insert_after_line_in_unique_block(
     additions = (addition,) if isinstance(addition, str) else addition
     lines[index + 1 : index + 1] = [
         f"{indent}{item}{newline}" for item in additions
+    ]
+    return "".join(lines)
+
+
+def _insert_after_guard_in_unique_block(
+    source: str,
+    *,
+    block_start: str,
+    guard: str,
+    terminal: str,
+    addition: tuple[str, ...],
+    max_lines: int,
+    label: str,
+) -> str:
+    """Insert at the guard's scope, after its one-line nested terminal."""
+
+    lines = source.splitlines(keepends=True)
+    starts = [index for index, line in enumerate(lines) if line.strip() == block_start]
+    if len(starts) != 1:
+        raise InstallError(f"{label} block is not unique")
+    start = starts[0]
+    end = min(len(lines) - 1, start + max_lines)
+    matches = [
+        index
+        for index in range(start, end)
+        if lines[index].strip() == guard and lines[index + 1].strip() == terminal
+    ]
+    if len(matches) != 1:
+        raise InstallError(f"{label} guard is not unique")
+    guard_index = matches[0]
+    guard_line = lines[guard_index]
+    terminal_line = lines[guard_index + 1]
+    indent = guard_line[: len(guard_line) - len(guard_line.lstrip())]
+    terminal_indent = terminal_line[
+        : len(terminal_line) - len(terminal_line.lstrip())
+    ]
+    if len(terminal_indent) <= len(indent):
+        raise InstallError(f"{label} terminal is not nested under its guard")
+    newline = "\r\n" if terminal_line.endswith("\r\n") else "\n"
+    lines[guard_index + 2 : guard_index + 2] = [
+        f"{indent}{item}{newline}" for item in addition
     ]
     return "".join(lines)
 
@@ -1217,18 +1294,20 @@ def change_cli_source(source: str) -> str:
         tuple(_CLI_CHOICE_METHODS.strip("\n").splitlines()) + ("",),
         label="cli.py generic chooser methods",
     )
-    source = _insert_before_unique_line(
+    source = _insert_before_function_return_after_anchor(
         source,
-        'response = result.get("final_response", "") if result else ""',
-        (
+        anchor='response = result.get("final_response", "") if result else ""',
+        additions=(
             "if (",
             "    _forge_source_outbox is not None",
             "    and _forge_source_event_id",
             "    and isinstance(result, dict)",
             "    and not result.get(\"failed\")",
+            "    and not result.get(\"partial\")",
             "):",
             "    _forge_source_outbox.acknowledge(_forge_source_event_id)",
         ),
+        max_lines=260,
         label="cli.py source event acknowledgement",
     )
     source = _insert_after_line_in_unique_block(
@@ -1384,10 +1463,30 @@ def change_tui_gateway_source(source: str) -> str:
 
     if _HOOK_MARKER in source:
         raise InstallError("tui_gateway/server.py user-turn handling is already installed")
-    source = _insert_after_line_in_unique_block(
+    source = _insert_before_unique_line(
+        source,
+        '@method("prompt.submit")',
+        (
+            "def _forge_source_session_id(session: dict, sid: str) -> str:",
+            "    # RISK(security): only the server DB may collapse a compression tip to its lineage root.",
+            "    session_key = str(session.get(\"session_key\") or sid)",
+            "    try:",
+            "        database = _get_db()",
+            "        row = database.get_session(session_key) if database is not None else None",
+            "    except (AttributeError, NameError, TypeError):",
+            "        row = None",
+            "    lineage_root = row.get(\"_lineage_root_id\") if isinstance(row, dict) else None",
+            "    return str(lineage_root or session_key)",
+            "",
+            "",
+        ),
+        label="TUI server-authenticated source session identity",
+    )
+    source = _insert_after_guard_in_unique_block(
         source,
         block_start='@method("prompt.submit")',
-        expected="return err",
+        guard="if err:",
+        terminal="return err",
         addition=(
             '_forge_source_event_id = params.get("source_event_id")',
             "if _forge_source_event_id is None:",
@@ -1494,7 +1593,7 @@ def change_tui_gateway_source(source: str) -> str:
             '"trusted_turn_context": {',
             '    "owner_host": __import__("os").environ.get("INFINITY_FORGE_HOST_ID", ""),',
             '    "subject_id": __import__("os").environ.get("HERMES_USER_ID", "local-user"),',
-            '    "session_id": str(session.get("session_key") or sid),',
+            '    "session_id": _forge_source_session_id(session, sid),',
             '    "surface": "tui",',
             '    "source_event_id": (source_event_id if "source_event_id" in locals() else session.get("_infinity_forge_source_event_id", "")),',
             '    "working_directory": session.get("cwd"),',
@@ -1595,7 +1694,7 @@ def change_tui_gateway_source(source: str) -> str:
             "    # A normal turn invalidates any chooser the prior turn published.",
             '    session.pop("_choice_prompt", None)',
         ),
-        max_lines=25,
+        max_lines=48,
         label="tui gateway normal-turn chooser invalidation",
     )
 
@@ -1763,12 +1862,41 @@ def _(rid, params: dict) -> dict:
 
 
 '''
+    live_session_anchor = (
+        '"session_key": _session_lookup_key(session, fallback=sid),'
+    )
+    if live_session_anchor in source:
+        source = _insert_after_unique_line(
+            source,
+            live_session_anchor,
+            ('"source_event_session_id": _forge_source_session_id(session, sid),',),
+            label="TUI live source session response",
+        )
+    elif "def _live_session_payload(" in source:
+        raise InstallError("TUI live source session payload anchor is missing")
     return source.replace(rpc_anchor, chooser_rpc + rpc_anchor)
 
 
 def change_tui_gateway_types_source(source: str) -> str:
     """Carry the complete chooser event and structured submission types."""
 
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="export interface SessionCreateResponse {",
+        expected="session_id: string",
+        addition="stored_session_id?: string",
+        max_lines=5,
+        label="TUI durable session response type",
+    )
+    if "export interface SessionActivateResponse {" in source:
+        source = _insert_after_line_in_unique_block(
+            source,
+            block_start="export interface SessionActivateResponse {",
+            expected="session_id: string",
+            addition="source_event_session_id?: string",
+            max_lines=11,
+            label="TUI active lineage response type",
+        )
     source = _insert_before_unique_line(
         source,
         "export interface PromptSubmitResponse {",
@@ -2116,10 +2244,11 @@ def change_tui_app_overlays_source(source: str) -> str:
     return source
 
 
-_TUI_SOURCE_EVENT_OUTBOX = r'''import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+_TUI_SOURCE_EVENT_OUTBOX = r'''import { execFileSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import { chmodSync, closeSync, constants, existsSync, fsyncSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, parse, resolve, sep } from 'node:path'
 
 type ForgePendingSourceEvent = {
   id: string
@@ -2132,30 +2261,249 @@ type ForgeSourceEventOutbox = {
   pending: ForgePendingSourceEvent[]
 }
 
+const forgeSourceEventHome = process.env.HERMES_HOME || join(homedir(), '.hermes')
 const forgeSourceEventPath = join(
-  process.env.HERMES_HOME || join(homedir(), '.hermes'),
+  forgeSourceEventHome,
   'infinity-forge',
   'tui-source-events.json',
 )
+const forgeSourceEventLockPath = join(forgeSourceEventHome, '.infinity-forge-source-events.lock')
+const forgeSourceEventLockTimeoutMs = 30_000
+
+const sleepForSourceEventLock = (): void => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+}
+
+const pathParts = (path: string): string[] => {
+  const absolute = resolve(path)
+  const root = parse(absolute).root
+  const tail = absolute.slice(root.length).split(sep).filter(Boolean)
+  const parts = [root]
+  let current = root
+  for (const part of tail) {
+    current = join(current, part)
+    parts.push(current)
+  }
+  return parts
+}
+
+const comparablePath = (path: string): string => {
+  const normalized = resolve(path).replace(/^\\\\\?\\/, '')
+  return process.platform === 'win32' ? normalized.toLocaleLowerCase('en-US') : normalized
+}
+
+const assertSafeSourceEventPath = (path: string): void => {
+  for (const part of pathParts(path)) {
+    let info
+    try {
+      info = lstatSync(part)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      throw error
+    }
+    if (info.isSymbolicLink()) {
+      throw new Error('Infinity Forge TUI source-event path cannot contain a symbolic link')
+    }
+    let realPath
+    try {
+      realPath = realpathSync.native(part)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      throw error
+    }
+    if (comparablePath(realPath) !== comparablePath(part)) {
+      throw new Error('Infinity Forge TUI source-event path cannot contain a reparse point')
+    }
+  }
+}
+
+const verifyOwnerOnlyWindows = (path: string): void => {
+  const script = [
+    '$item = if ($env:FORGE_ACL_DIRECTORY -eq "1") { New-Object System.IO.DirectoryInfo($env:FORGE_ACL_PATH) } else { New-Object System.IO.FileInfo($env:FORGE_ACL_PATH) }',
+    '$acl = $item.GetAccessControl()',
+    '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+    '$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value',
+    '$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))',
+    '$full = [System.Security.AccessControl.FileSystemRights]::FullControl',
+    '$ok = $acl.AreAccessRulesProtected -and $owner -eq $sid -and $rules.Count -gt 0',
+    'foreach ($rule in $rules) { $ok = $ok -and -not $rule.IsInherited -and $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and $rule.IdentityReference.Value -eq $sid -and (($rule.FileSystemRights -band $full) -eq $full) }',
+    'if (-not $ok) { exit 3 }',
+  ].join('\n')
+  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { env: { ...process.env, FORGE_ACL_DIRECTORY: statSync(path).isDirectory() ? '1' : '0', FORGE_ACL_PATH: path }, stdio: 'ignore', windowsHide: true })
+}
+
+const restrictOwnerOnlyWindows = (path: string): void => {
+  const script = [
+    '$path = $env:FORGE_ACL_PATH',
+    '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User',
+    '$isDirectory = $env:FORGE_ACL_DIRECTORY -eq "1"',
+    '$item = if ($isDirectory) { New-Object System.IO.DirectoryInfo($path) } else { New-Object System.IO.FileInfo($path) }',
+    '$acl = $item.GetAccessControl()',
+    '$rights = [System.Security.AccessControl.FileSystemRights]::FullControl',
+    '$allow = [System.Security.AccessControl.AccessControlType]::Allow',
+    '$acl.SetAccessRuleProtection($true, $false)',
+    'foreach ($existing in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRuleAll($existing) }',
+    'if ($isDirectory) {',
+    '  $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit',
+    '  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, $allow)',
+    '} else {',
+    '  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $allow)',
+    '}',
+    '[void]$acl.AddAccessRule($rule)',
+    '$item.SetAccessControl($acl)',
+  ].join('\n')
+  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { env: { ...process.env, FORGE_ACL_DIRECTORY: statSync(path).isDirectory() ? '1' : '0', FORGE_ACL_PATH: path }, stdio: 'ignore', windowsHide: true })
+}
+
+const ensureOwnerOnlyPath = (path: string, mode: number): void => {
+  if (process.platform === 'win32') {
+    let lastError: unknown = null
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        verifyOwnerOnlyWindows(path)
+        return
+      } catch (error) {
+        lastError = error
+      }
+      try {
+        restrictOwnerOnlyWindows(path)
+      } catch (error) {
+        lastError = error
+      }
+      sleepForSourceEventLock()
+    }
+    throw new Error('Infinity Forge TUI source-event ACL is not owner-only', { cause: lastError })
+  }
+  chmodSync(path, mode)
+  const info = statSync(path)
+  const expectedUid = typeof process.getuid === 'function' ? process.getuid() : info.uid
+  if ((info.mode & 0o777) !== mode || info.uid !== expectedUid) {
+    throw new Error('Infinity Forge TUI source-event permissions are not owner-only')
+  }
+}
+
+const ensureSourceEventDirectory = (): void => {
+  const directory = dirname(forgeSourceEventPath)
+  assertSafeSourceEventPath(directory)
+  mkdirSync(directory, { mode: 0o700, recursive: true })
+  assertSafeSourceEventPath(directory)
+  ensureOwnerOnlyPath(directory, 0o700)
+}
+
+const fsyncSourceEventDirectory = (directory = dirname(forgeSourceEventPath)): void => {
+  if (process.platform === 'win32') return
+  const descriptor = openSync(directory, constants.O_RDONLY)
+  try {
+    fsyncSync(descriptor)
+  } finally {
+    closeSync(descriptor)
+  }
+}
+
+const withSourceEventLock = <T>(action: () => T): T => {
+  assertSafeSourceEventPath(forgeSourceEventHome)
+  mkdirSync(forgeSourceEventHome, { mode: 0o700, recursive: true })
+  assertSafeSourceEventPath(forgeSourceEventHome)
+  ensureOwnerOnlyPath(forgeSourceEventHome, 0o700)
+  const deadline = Date.now() + forgeSourceEventLockTimeoutMs
+  let acquired = false
+  while (!acquired) {
+    assertSafeSourceEventPath(forgeSourceEventLockPath)
+    try {
+      mkdirSync(forgeSourceEventLockPath, { mode: 0o700 })
+      ensureOwnerOnlyPath(forgeSourceEventLockPath, 0o700)
+      acquired = true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      if (Date.now() >= deadline) {
+        throw new Error('Infinity Forge TUI source-event lock timed out')
+      }
+      sleepForSourceEventLock()
+    }
+  }
+  try {
+    ensureSourceEventDirectory()
+    return action()
+  } finally {
+    assertSafeSourceEventPath(forgeSourceEventLockPath)
+    rmdirSync(forgeSourceEventLockPath)
+    fsyncSourceEventDirectory(forgeSourceEventHome)
+  }
+}
+
+const readSourceEventSessionId = (): string | null => {
+  const activeSessionPath = process.env.HERMES_TUI_ACTIVE_SESSION_FILE
+  if (!activeSessionPath) return null
+  try {
+    const value = JSON.parse(readFileSync(activeSessionPath, 'utf8')) as { session_id?: unknown }
+    const sessionId = value.session_id
+    if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 512 || [...sessionId].some(character => character.charCodeAt(0) < 32)) return null
+    return sessionId
+  } catch {
+    return null
+  }
+}
 
 const readSourceEvents = (): ForgeSourceEventOutbox => {
   if (!existsSync(forgeSourceEventPath)) return { format: 'forge-surface-event/v1', pending: [] }
-  const value = JSON.parse(readFileSync(forgeSourceEventPath, 'utf8')) as ForgeSourceEventOutbox
+  assertSafeSourceEventPath(forgeSourceEventPath)
+  ensureOwnerOnlyPath(forgeSourceEventPath, 0o600)
+  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW || 0)
+  const descriptor = openSync(forgeSourceEventPath, flags)
+  let value: ForgeSourceEventOutbox
+  try {
+    const opened = fstatSync(descriptor)
+    const named = lstatSync(forgeSourceEventPath)
+    if (!opened.isFile() || named.isSymbolicLink() || opened.dev !== named.dev || opened.ino !== named.ino) {
+      throw new Error('Infinity Forge TUI source-event outbox path changed')
+    }
+    value = JSON.parse(readFileSync(descriptor, 'utf8')) as ForgeSourceEventOutbox
+  } finally {
+    closeSync(descriptor)
+  }
   if (value.format !== 'forge-surface-event/v1' || !Array.isArray(value.pending)) {
     throw new Error('Infinity Forge TUI source-event outbox is invalid')
+  }
+  const keys = new Set<string>()
+  for (const event of value.pending) {
+    const fields = event && typeof event === 'object' ? Object.keys(event).sort().join(',') : ''
+    const key = event && typeof event.sessionId === 'string' && typeof event.payloadHash === 'string' ? `${event.sessionId}\0${event.payloadHash}` : ''
+    if (fields !== 'id,payloadHash,sessionId' || typeof event.id !== 'string' || !/^tui:[0-9a-f-]{36}$/i.test(event.id) || typeof event.sessionId !== 'string' || !event.sessionId || event.sessionId.length > 512 || [...event.sessionId].some(character => character.charCodeAt(0) < 32) || !/^[0-9a-f]{64}$/.test(event.payloadHash) || keys.has(key)) {
+      throw new Error('Infinity Forge TUI source-event outbox entry is invalid')
+    }
+    keys.add(key)
   }
   return value
 }
 
 const writeSourceEvents = (value: ForgeSourceEventOutbox): void => {
-  mkdirSync(dirname(forgeSourceEventPath), { mode: 0o700, recursive: true })
-  const temporary = `${forgeSourceEventPath}.${process.pid}.tmp`
-  writeFileSync(temporary, JSON.stringify(value), { encoding: 'utf8', mode: 0o600 })
-  chmodSync(temporary, 0o600)
-  renameSync(temporary, forgeSourceEventPath)
+  ensureSourceEventDirectory()
+  assertSafeSourceEventPath(forgeSourceEventPath)
+  const temporary = `${forgeSourceEventPath}.${process.pid}.${randomUUID()}.tmp`
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0)
+  let descriptor: number | null = null
+  try {
+    descriptor = openSync(temporary, flags, 0o600)
+    writeSync(descriptor, JSON.stringify(value), undefined, 'utf8')
+    fsyncSync(descriptor)
+    closeSync(descriptor)
+    descriptor = null
+    ensureOwnerOnlyPath(temporary, 0o600)
+    assertSafeSourceEventPath(temporary)
+    renameSync(temporary, forgeSourceEventPath)
+    assertSafeSourceEventPath(forgeSourceEventPath)
+    ensureOwnerOnlyPath(forgeSourceEventPath, 0o600)
+    fsyncSourceEventDirectory()
+  } finally {
+    if (descriptor !== null) closeSync(descriptor)
+    if (existsSync(temporary)) {
+      assertSafeSourceEventPath(temporary)
+      unlinkSync(temporary)
+    }
+  }
 }
 
-const prepareSourceEvent = (sessionId: string, payload: string): ForgePendingSourceEvent => {
+export const prepareSourceEvent = (sessionId: string, payload: string): ForgePendingSourceEvent => withSourceEventLock(() => {
   const payloadHash = createHash('sha256').update(payload, 'utf8').digest('hex')
   const outbox = readSourceEvents()
   const prior = [...outbox.pending].reverse().find(
@@ -2166,13 +2514,15 @@ const prepareSourceEvent = (sessionId: string, payload: string): ForgePendingSou
   outbox.pending.push(event)
   writeSourceEvents(outbox)
   return event
-}
+})
 
 export const acknowledgeSourceEvent = (sourceEventId: string): void => {
-  const outbox = readSourceEvents()
-  const pending = outbox.pending.filter(event => event.id !== sourceEventId)
-  if (pending.length === outbox.pending.length) return
-  writeSourceEvents({ ...outbox, pending })
+  withSourceEventLock(() => {
+    const outbox = readSourceEvents()
+    const pending = outbox.pending.filter(event => event.id !== sourceEventId)
+    if (pending.length === outbox.pending.length) return
+    writeSourceEvents({ ...outbox, pending })
+  })
 }
 '''
 
@@ -2182,7 +2532,8 @@ def change_tui_submission_source(source: str) -> str:
 
     if "forge-surface-event/v1" in source:
         raise InstallError("TUI source-event outbox is already installed")
-    source = _TUI_SOURCE_EVENT_OUTBOX + "\n" + source
+    newline = "\r\n" if "\r\n" in source else "\n"
+    source = _TUI_SOURCE_EVENT_OUTBOX.replace("\n", newline) + newline + source
     request_line = (
         "deps.gw.request<PromptSubmitResponse>('prompt.submit', "
         "{ session_id: liveSid, text: submitText }).catch((e: Error) => {"
@@ -2190,19 +2541,51 @@ def change_tui_submission_source(source: str) -> str:
     source = _insert_before_unique_line(
         source,
         request_line,
-        ("const sourceEvent = prepareSourceEvent(liveSid, submitText)",),
+        (
+            "const sourceEventSessionId = readSourceEventSessionId()",
+            "const sourceEvent = sourceEventSessionId ? prepareSourceEvent(sourceEventSessionId, submitText) : null",
+        ),
         label="TUI durable source event preparation",
     )
     return _replace_unique_line(
         source,
         request_line,
-        "deps.gw.request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText, source_event_id: sourceEvent.id }).catch((e: Error) => {",
+        "deps.gw.request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText, ...(sourceEvent ? { source_event_id: sourceEvent.id } : {}) }).catch((e: Error) => {",
         label="TUI source event submission",
     )
 
 
+def change_tui_session_lifecycle_source(source: str) -> str:
+    """Persist the server-authenticated durable key, never the ephemeral sid."""
+
+    source = _replace_unique_line(
+        source,
+        "writeActiveSessionFile(r.session_id)",
+        "writeActiveSessionFile(r.stored_session_id ?? r.session_id)",
+        label="TUI durable active session identity",
+    )
+    active_anchor = "writeActiveSessionFile(r.session_key ?? r.session_id)"
+    if active_anchor in source:
+        source = _replace_unique_line(
+            source,
+            active_anchor,
+            "writeActiveSessionFile(r.source_event_session_id ?? r.session_key ?? r.session_id)",
+            label="TUI active lineage identity",
+        )
+    resume_anchor = "writeActiveSessionFile(r.resumed ?? r.session_id)"
+    if resume_anchor in source:
+        source = _replace_unique_line(
+            source,
+            resume_anchor,
+            "writeActiveSessionFile(id)",
+            label="TUI resumed lineage identity",
+        )
+    return source
+
+
 _DESKTOP_SOURCE_EVENT_OUTBOX = r'''type ForgeDesktopSourceEvent = {
   id: string
+  liveSessionId: string
   payloadHash: string
   sessionId: string
 }
@@ -2214,6 +2597,9 @@ const readDesktopSourceEvents = (): ForgeDesktopSourceEvent[] => {
   if (!raw) return []
   const value = JSON.parse(raw) as unknown
   if (!Array.isArray(value)) throw new Error('Infinity Forge Desktop source-event outbox is invalid')
+  if (value.some(event => !event || typeof event !== 'object' || typeof event.id !== 'string' || typeof event.liveSessionId !== 'string' || typeof event.payloadHash !== 'string' || typeof event.sessionId !== 'string')) {
+    throw new Error('Infinity Forge Desktop source-event outbox entry is invalid')
+  }
   return value as ForgeDesktopSourceEvent[]
 }
 
@@ -2223,14 +2609,22 @@ const payloadHash = async (payload: string): Promise<string> => {
   return [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, '0')).join('')
 }
 
-const prepareSourceEvent = async (sessionId: string, payload: string): Promise<ForgeDesktopSourceEvent> => {
+const prepareSourceEvent = async (sessionId: string, liveSessionId: string, payload: string): Promise<ForgeDesktopSourceEvent> => {
   const hash = await payloadHash(payload)
   const pending = readDesktopSourceEvents()
   const prior = [...pending].reverse().find(event => event.sessionId === sessionId && event.payloadHash === hash)
   if (prior) return prior
-  const event = { id: `desktop:${globalThis.crypto.randomUUID()}`, payloadHash: hash, sessionId }
+  const event = { id: `desktop:${globalThis.crypto.randomUUID()}`, liveSessionId, payloadHash: hash, sessionId }
   globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify([...pending, event]))
   return event
+}
+
+const rebindSourceEvent = (sourceEventId: string, liveSessionId: string): void => {
+  const pending = readDesktopSourceEvents()
+  const index = pending.findIndex(event => event.id === sourceEventId)
+  if (index < 0) throw new Error('Infinity Forge Desktop source event is not pending')
+  pending[index] = { ...pending[index]!, liveSessionId }
+  globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify(pending))
 }
 
 export const acknowledgeSourceEvent = (sourceEventId: string): void => {
@@ -2248,11 +2642,18 @@ def change_desktop_submit_source(source: str) -> str:
 
     if "forge-surface-event/v1" in source:
         raise InstallError("Desktop source-event outbox is already installed")
-    source = _DESKTOP_SOURCE_EVENT_OUTBOX + "\n" + source
+    newline = "\r\n" if "\r\n" in source else "\n"
+    source = _DESKTOP_SOURCE_EVENT_OUTBOX.replace("\n", newline) + newline + source
     source = _insert_after_unique_line(
         source,
         "let submitErr: unknown = null",
-        ("const sourceEvent = await prepareSourceEvent(sessionId, text)",),
+        (
+            "const sourceEvent = await prepareSourceEvent(",
+            "  selectedStoredSessionIdRef.current ?? sessionId,",
+            "  sessionId,",
+            "  text",
+            ")",
+        ),
         label="Desktop durable source event preparation",
     )
     if source.count("{ session_id: sessionId, text }") != 1 or source.count(
@@ -2263,6 +2664,12 @@ def change_desktop_submit_source(source: str) -> str:
         "{ session_id: sessionId, text }",
         "{ session_id: sessionId, text, source_event_id: sourceEvent.id }",
         1,
+    )
+    source = _insert_after_unique_line(
+        source,
+        "if (recoveredId) {",
+        ("rebindSourceEvent(sourceEvent.id, recoveredId)",),
+        label="Desktop recovered source event binding",
     )
     return source.replace(
         "{ session_id: recoveredId, text }",
@@ -2791,6 +3198,9 @@ def change_slack_adapter_source(source: str) -> str:
         return True, {"choice_prompt_id": state["prompt"]["choice_prompt_id"], "selected_choice_ids": selected_ids}
 
     async def _dispatch_choice_submission(self, state: Dict[str, Any], selected_ids: List[str]) -> None:
+        workspace_id = str(state.get("workspace_id") or "")
+        if not workspace_id:
+            raise ValueError("Slack chooser workspace identity is missing")
         source = self.build_source(
             chat_id=state["channel_id"],
             chat_name=state["channel_id"],
@@ -2800,6 +3210,20 @@ def change_slack_adapter_source(source: str) -> str:
             thread_id=state.get("thread_ts"),
         )
         envelope = {"choice_prompt_id": state["prompt"]["choice_prompt_id"], "selected_choice_ids": selected_ids}
+        source_identity = __import__("json").dumps(
+            [
+                "forge-slack-choice-source-event/v1",
+                workspace_id,
+                state["channel_id"],
+                str(state.get("thread_ts") or ""),
+                state["user_id"],
+                state["prompt"]["choice_prompt_id"],
+                sorted(selected_ids),
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        source_event_id = "slack-choice:" + __import__("hashlib").sha256(source_identity).hexdigest()
         event = MessageEvent(
             text=",".join(selected_ids),
             message_type=MessageType.TEXT,
@@ -2807,10 +3231,7 @@ def change_slack_adapter_source(source: str) -> str:
             raw_message={"type": "forge_choice_action"},
             metadata={
                 "structured_user_message": envelope,
-                "source_event_id": (
-                    f"slack-choice:{state['channel_id']}:{state['user_id']}:"
-                    f"{state['prompt']['choice_prompt_id']}:{','.join(selected_ids)}"
-                ),
+                "source_event_id": source_event_id,
             },
         )
         await self.handle_message(event)
@@ -2857,7 +3278,8 @@ def change_slack_adapter_source(source: str) -> str:
                 if not message_ts:
                     return SendResult(success=False, error="Slack chooser message has no timestamp")
             context_key = self._choice_context_key(chat_id, thread_ts, user_id)
-            state = {"channel_id": chat_id, "chat_type": chat_type, "context_key": context_key, "prompt": prompt, "session_key": session_key, "thread_ts": thread_ts, "user_id": user_id, "user_name": user_name}
+            workspace_id = str((metadata or {}).get("team_id") or (metadata or {}).get("workspace_id") or "")
+            state = {"channel_id": chat_id, "chat_type": chat_type, "context_key": context_key, "prompt": prompt, "session_key": session_key, "thread_ts": thread_ts, "user_id": user_id, "user_name": user_name, "workspace_id": workspace_id}
             previous_message_ts = self._choice_reply_prompts.get(context_key)
             if previous_message_ts:
                 self._choice_prompts.pop(previous_message_ts, None)
@@ -2876,9 +3298,11 @@ def change_slack_adapter_source(source: str) -> str:
         if not state:
             return
         channel_id = str((body.get("channel") or {}).get("id") or "")
+        workspace_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
         user = body.get("user") or {}
         user_id = str(user.get("id") or "")
-        if channel_id != state["channel_id"] or user_id != state["user_id"] or not self._is_interactive_user_authorized(user_id, channel_id=channel_id, user_name=user.get("name")):
+        expected_workspace_id = str(state.get("workspace_id") or "")
+        if not workspace_id or (expected_workspace_id and workspace_id != expected_workspace_id) or channel_id != state["channel_id"] or user_id != state["user_id"] or not self._is_interactive_user_authorized(user_id, channel_id=channel_id, user_name=user.get("name")):
             return
         if str(message.get("thread_ts") or "") != str(state.get("thread_ts") or ""):
             return
@@ -2904,6 +3328,7 @@ def change_slack_adapter_source(source: str) -> str:
         claimed = self._claim_choice_state(message_ts, selected_ids)
         if not claimed:
             return
+        claimed["workspace_id"] = workspace_id
         try:
             await self._get_client(channel_id).chat_update(channel=channel_id, ts=message_ts, text="Choice submitted", blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": "Choice submitted."}]}])
         except Exception:
@@ -2927,7 +3352,9 @@ def change_slack_adapter_source(source: str) -> str:
         "    logger.warning(\"[Slack] Ignoring invalid exact-ID chooser reply from %s\", user_id)",
         "    return",
         "_forge_platform_event_id = (event.get(\"event_ts\") if event.get(\"subtype\") == \"message_changed\" else event.get(\"client_msg_id\")) or event.get(\"event_ts\") or event.get(\"ts\") or (event.get(\"message\") or {}).get(\"client_msg_id\")",
-        "_forge_source_event_id = f\"slack:{channel_id}:{_forge_platform_event_id}\" if _forge_platform_event_id else \"\"",
+        "_forge_workspace_id = str(event.get(\"team\") or event.get(\"team_id\") or \"\")",
+        "_forge_source_identity = __import__(\"json\").dumps([\"forge-slack-source-event/v1\", _forge_workspace_id, channel_id, str(thread_ts or \"\"), str(_forge_platform_event_id or \"\")], ensure_ascii=False, separators=(\",\", \":\")).encode(\"utf-8\")",
+        "_forge_source_event_id = \"slack:\" + __import__(\"hashlib\").sha256(_forge_source_identity).hexdigest() if _forge_workspace_id and _forge_platform_event_id else \"\"",
         "choice_metadata = {\"structured_user_message\": structured_choice} if structured_choice else {}",
         "if _forge_source_event_id:",
         "    choice_metadata[\"source_event_id\"] = _forge_source_event_id",
@@ -2972,13 +3399,28 @@ def change_gateway_source(source: str) -> str:
             "    @staticmethod",
             "    def _forge_trusted_turn_context(event, source, session_id):",
             "        # RISK(security): source identity is adapter-authenticated; user/model text is ignored.",
+            "        platform_value = str(getattr(getattr(source, \"platform\", None), \"value\", getattr(source, \"platform\", \"gateway\")) or \"gateway\")",
             "        metadata = getattr(event, \"metadata\", None)",
             "        source_event_id = metadata.get(\"source_event_id\", \"\") if isinstance(metadata, dict) else \"\"",
+            "        if not source_event_id:",
+            "            scope_id = str(getattr(source, \"scope_id\", None) or getattr(source, \"guild_id\", None) or \"\")",
+            "            profile = str(getattr(source, \"profile\", None) or \"\")",
+            "            chat_id = str(getattr(source, \"chat_id\", \"\") or \"\")",
+            "            thread_id = str(getattr(source, \"thread_id\", None) or \"\")",
+            "            platform_event_id = getattr(event, \"platform_update_id\", None)",
+            "            event_kind = \"update\"",
+            "            if platform_event_id is None:",
+            "                platform_event_id = getattr(event, \"message_id\", None) or getattr(source, \"message_id\", None)",
+            "                event_kind = \"message\"",
+            "            if platform_event_id is not None and str(platform_event_id):",
+            "                event_identity = f\"forge-gateway-source-event/v1\\0{platform_value}\\0{scope_id}\\0{profile}\\0{chat_id}\\0{thread_id}\\0{event_kind}\\0{platform_event_id}\"",
+            "                event_digest = __import__(\"hashlib\").sha256(event_identity.encode(\"utf-8\")).hexdigest()",
+            "                source_event_id = f\"gateway:{event_digest}\"",
             "        return {",
             "            \"owner_host\": os.environ.get(\"INFINITY_FORGE_HOST_ID\", \"\"),",
             "            \"subject_id\": str(getattr(source, \"user_id\", \"\") or \"\"),",
             "            \"session_id\": str(session_id or \"\"),",
-            "            \"surface\": str(getattr(source, \"platform\", \"\") or \"gateway\"),",
+            "            \"surface\": platform_value,",
             "            \"source_event_id\": str(source_event_id or \"\"),",
             "            \"working_directory\": getattr(source, \"working_directory\", None),",
             "        }",
@@ -3392,6 +3834,7 @@ _CHANGES: dict[str, Callable[[str], str]] = {
     "ui-tui/src/app/createGatewayEventHandler.ts": change_tui_event_handler_source,
     "ui-tui/src/app/overlayStore.ts": change_tui_overlay_store_source,
     "ui-tui/src/app/submissionCore.ts": change_tui_submission_source,
+    "ui-tui/src/app/useSessionLifecycle.ts": change_tui_session_lifecycle_source,
     "ui-tui/src/components/prompts.tsx": change_tui_prompts_source,
     "ui-tui/src/components/appOverlays.tsx": change_tui_app_overlays_source,
     "apps/desktop/src/lib/chat-messages.ts": change_desktop_chat_messages_source,

@@ -4,6 +4,9 @@ import asyncio
 import json
 import os
 import queue
+import shutil
+import stat
+import subprocess
 import sys
 import threading
 import time
@@ -21,6 +24,7 @@ from forge.hermes_change.installer import (
     install_change,
     restore_change,
 )
+from forge.ops.surface_events import _verify_owner_only_permissions
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -118,6 +122,7 @@ def _apply_tool_request_middleware_for_agent(
         return function_args, []
 
 def concurrent(agent, function_name, function_args, effective_task_id, tool_call):
+    _ts_scope_block = None
     function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
         agent,
         function_name=function_name,
@@ -132,6 +137,7 @@ def concurrent(agent, function_name, function_args, effective_task_id, tool_call
         dispatch(function_args)
 
 def sequential(agent, function_name, function_args, effective_task_id, tool_call):
+    _ts_scope_block = None
     function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
         agent,
         function_name=function_name,
@@ -438,7 +444,18 @@ GATEWAY_SOURCE = '''class Gateway:
         }
 '''
 
-TUI_GATEWAY_TYPES_SOURCE = """export interface PromptSubmitResponse {
+TUI_GATEWAY_TYPES_SOURCE = """export interface SessionCreateResponse {
+  info?: unknown
+  session_id: string
+}
+
+export interface SessionActivateResponse {
+  info?: unknown
+  session_id: string
+  session_key?: string
+}
+
+export interface PromptSubmitResponse {
   ok?: boolean
 }
 
@@ -459,6 +476,19 @@ TUI_SUBMISSION_SOURCE = """export function submitPrompt(text: string, deps: any)
     })
   }
   startSubmit(text, text)
+}
+"""
+
+TUI_SESSION_LIFECYCLE_SOURCE = """export function rememberCreatedSession(r: SessionCreateResponse): void {
+  writeActiveSessionFile(r.session_id)
+}
+
+export function rememberActivatedSession(r: SessionActivateResponse): void {
+  writeActiveSessionFile(r.session_key ?? r.session_id)
+}
+
+export function rememberResumedSession(id: string, r: SessionResumeResponse): void {
+  writeActiveSessionFile(r.resumed ?? r.session_id)
 }
 """
 
@@ -723,6 +753,9 @@ def _hermes_tree(root: Path) -> None:
     (root / "ui-tui" / "src" / "app" / "submissionCore.ts").write_text(
         TUI_SUBMISSION_SOURCE, encoding="utf-8"
     )
+    (root / "ui-tui" / "src" / "app" / "useSessionLifecycle.ts").write_text(
+        TUI_SESSION_LIFECYCLE_SOURCE, encoding="utf-8"
+    )
     (root / "ui-tui" / "src" / "components" / "prompts.tsx").write_text(
         TUI_PROMPTS_SOURCE, encoding="utf-8"
     )
@@ -784,6 +817,7 @@ def test_carried_change_targets_user_surfaces_and_forwarder(tmp_path: Path) -> N
         "ui-tui/src/app/createGatewayEventHandler.ts",
         "ui-tui/src/app/overlayStore.ts",
         "ui-tui/src/app/submissionCore.ts",
+        "ui-tui/src/app/useSessionLifecycle.ts",
         "ui-tui/src/components/prompts.tsx",
         "ui-tui/src/components/appOverlays.tsx",
         "apps/desktop/src/lib/chat-messages.ts",
@@ -1275,6 +1309,7 @@ def test_slack_paginates_256_project_fallback_without_losing_tail_ids() -> None:
             prompt,
             "session-1",
             "U1",
+            metadata={"team_id": "W1"},
         )
     )
 
@@ -1293,6 +1328,122 @@ def test_slack_paginates_256_project_fallback_without_losing_tail_ids() -> None:
     assert adapter._choice_reply_prompts[("C1", "root", "U1")] == str(
         len(messages)
     )
+    assert adapter._choice_prompts[str(len(messages))]["workspace_id"] == "W1"
+
+
+def test_slack_source_ids_are_hashed_bounded_and_workspace_scoped() -> None:
+    changed = installer.change_slack_adapter_source(SLACK_ADAPTER_SOURCE)
+
+    class MessageEvent:
+        def __init__(self, **values: object) -> None:
+            self.__dict__.update(values)
+
+    namespace: dict[str, object] = {
+        "Any": object,
+        "BasePlatformAdapter": type("BasePlatformAdapter", (), {}),
+        "Dict": dict,
+        "List": list,
+        "MessageEvent": MessageEvent,
+        "MessageType": type("MessageType", (), {"TEXT": "text"}),
+        "Optional": typing.Optional,
+        "Platform": type("Platform", (), {"SLACK": "slack"}),
+        "PlatformConfig": object,
+        "SendResult": type("SendResult", (), {}),
+        "Tuple": tuple,
+        "datetime": __import__("datetime").datetime,
+        "logger": types.SimpleNamespace(
+            error=lambda *args, **kwargs: None,
+            warning=lambda *args, **kwargs: None,
+        ),
+    }
+    exec(changed, namespace)
+    adapter = namespace["SlackAdapter"].__new__(namespace["SlackAdapter"])
+    adapter.build_source = lambda **values: values
+    captured: list[MessageEvent] = []
+
+    async def handle_message(event: MessageEvent) -> None:
+        captured.append(event)
+
+    adapter.handle_message = handle_message
+    long_id = "x" * 512
+    state = {
+        "channel_id": "C1",
+        "chat_type": "group",
+        "prompt": {"choice_prompt_id": long_id},
+        "thread_ts": "T1",
+        "user_id": "U1",
+        "user_name": "user",
+        "workspace_id": "W1",
+    }
+
+    asyncio.run(adapter._dispatch_choice_submission(state, [long_id] * 256))
+    asyncio.run(
+        adapter._dispatch_choice_submission(
+            {**state, "workspace_id": "W2"},
+            [long_id] * 256,
+        )
+    )
+
+    first = captured[0].metadata["source_event_id"]
+    second = captured[1].metadata["source_event_id"]
+    assert first.startswith("slack-choice:")
+    assert len(first) <= 512
+    assert len(first) == len("slack-choice:") + 64
+    assert first != second
+
+
+def test_slack_message_source_id_requires_and_binds_workspace() -> None:
+    changed = installer.change_slack_adapter_source(SLACK_ADAPTER_SOURCE)
+
+    class MessageEvent:
+        def __init__(self, **values: object) -> None:
+            self.__dict__.update(values)
+
+    namespace: dict[str, object] = {
+        "Any": object,
+        "BasePlatformAdapter": type("BasePlatformAdapter", (), {}),
+        "Dict": dict,
+        "List": list,
+        "MessageEvent": MessageEvent,
+        "MessageType": type("MessageType", (), {"TEXT": "text"}),
+        "Optional": typing.Optional,
+        "Platform": type("Platform", (), {"SLACK": "slack"}),
+        "PlatformConfig": object,
+        "SendResult": type("SendResult", (), {}),
+        "Tuple": tuple,
+        "datetime": __import__("datetime").datetime,
+        "logger": types.SimpleNamespace(
+            error=lambda *args, **kwargs: None,
+            warning=lambda *args, **kwargs: None,
+        ),
+    }
+    exec(changed, namespace)
+    adapter = namespace["SlackAdapter"].__new__(namespace["SlackAdapter"])
+    adapter._choice_prompts = {}
+    adapter._choice_reply_prompts = {}
+    adapter.build_source = lambda **values: values
+    captured: list[MessageEvent] = []
+
+    async def handle_message(event: MessageEvent) -> None:
+        captured.append(event)
+
+    adapter.handle_message = handle_message
+    base = {
+        "text": "hello",
+        "user": "U1",
+        "channel": "C1",
+        "client_msg_id": "same-message",
+    }
+    asyncio.run(adapter._handle_slack_message({**base, "team": "W1"}))
+    asyncio.run(adapter._handle_slack_message({**base, "team": "W2"}))
+    asyncio.run(adapter._handle_slack_message(base))
+
+    first = captured[0].metadata["source_event_id"]
+    second = captured[1].metadata["source_event_id"]
+    assert first.startswith("slack:")
+    assert len(first) == len("slack:") + 64
+    assert first != second
+    assert "source_event_id" not in captured[2].metadata
 
 
 def test_user_surfaces_opt_in_and_handled_turns_skip_model_followups() -> None:
@@ -1361,6 +1512,163 @@ def test_cli_outbox_reuses_source_event_after_failed_submission(
     assert raw["pending"] == {}
 
 
+def test_cli_keeps_source_event_until_response_is_deliverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outbox_path = tmp_path / "cli-source-events.json"
+    monkeypatch.setenv("INFINITY_FORGE_SOURCE_EVENT_OUTBOX", str(outbox_path))
+    monkeypatch.setenv(
+        "INFINITY_FORGE_HOST_ID", "d6f70d5d-6482-45f5-80d2-219ec2ad4d19"
+    )
+    namespace: dict[str, object] = {
+        "queue": queue,
+        "maybe_auto_title": lambda: None,
+    }
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    source_event_ids: list[str] = []
+
+    class LostResponse(dict):
+        def get(self, key, default=None):
+            if key == "final_response":
+                raise RuntimeError("response could not be delivered")
+            return super().get(key, default)
+
+    class Agent:
+        def __init__(self, lose_response: bool) -> None:
+            self.lose_response = lose_response
+
+        def run_conversation(self, **kwargs):
+            source_event_ids.append(
+                kwargs["trusted_turn_context"]["source_event_id"]
+            )
+            if self.lose_response:
+                return LostResponse(messages=[], api_calls=1)
+            return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    first = namespace["ModalShell"]()
+    first.agent = Agent(True)
+    first.session_id = "session-1"
+    first.conversation_history = [{"role": "user", "content": "hello"}]
+    with pytest.raises(RuntimeError, match="could not be delivered"):
+        namespace["process"](first, "hello", "hello", None)
+
+    restarted = namespace["ModalShell"]()
+    restarted.agent = Agent(False)
+    restarted.session_id = "session-1"
+    restarted.conversation_history = [{"role": "user", "content": "hello"}]
+    namespace["process"](restarted, "hello", "hello", None)
+
+    assert source_event_ids[0] == source_event_ids[1]
+
+
+def _run_tui_outbox_processes(
+    tmp_path: Path,
+    payloads: list[str],
+) -> tuple[list[dict[str, str]], Path]:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    module_path = tmp_path / "submissionCore.ts"
+    module_path.write_text(
+        installer.change_tui_submission_source(TUI_SUBMISSION_SOURCE),
+        encoding="utf-8",
+    )
+    start_path = tmp_path / "start"
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(mode=0o700)
+    if os.name == "nt":
+        script = "\n".join(
+            (
+                "$path = $env:FORGE_ACL_PATH",
+                "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+                "$item = New-Object System.IO.DirectoryInfo($path)",
+                "$acl = $item.GetAccessControl()",
+                "$acl.SetAccessRuleProtection($true, $false)",
+                "foreach ($existing in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRuleAll($existing) }",
+                "$inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit",
+                "$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)",
+                "[void]$acl.AddAccessRule($rule)",
+                "$item.SetAccessControl($acl)",
+            )
+        )
+        acl_result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "FORGE_ACL_PATH": str(hermes_home)},
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        assert acl_result.returncode == 0, acl_result.stderr
+    else:
+        hermes_home.chmod(0o700)
+        assert stat.S_IMODE(hermes_home.stat().st_mode) == 0o700
+    module_url = module_path.as_uri()
+    runner_path = tmp_path / "prepare.mjs"
+    runner_path.write_text(
+        "\n".join(
+            (
+                "import { existsSync } from 'node:fs'",
+                f"import {{ prepareSourceEvent }} from {json.dumps(module_url)}",
+                "while (!existsSync(process.env.FORGE_TEST_START)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5)",
+                "const event = prepareSourceEvent('session-1', process.argv[2])",
+                "process.stdout.write(JSON.stringify(event))",
+            )
+        ),
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        "HERMES_HOME": str(hermes_home),
+        "FORGE_TEST_START": str(start_path),
+    }
+    processes = [
+        subprocess.Popen(
+            [node, "--experimental-strip-types", str(runner_path), payload],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+        )
+        for payload in payloads
+    ]
+    time.sleep(0.25)
+    start_path.write_text("start", encoding="utf-8")
+    results: list[dict[str, str]] = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=60)
+        assert process.returncode == 0, stderr
+        results.append(json.loads(stdout))
+    return results, tmp_path / "hermes-home" / "infinity-forge" / "tui-source-events.json"
+
+
+def test_tui_outbox_serializes_processes_and_preserves_payloads_and_retries(
+    tmp_path: Path,
+) -> None:
+    payloads = ["same", "same", "different"]
+
+    results, outbox_path = _run_tui_outbox_processes(tmp_path, payloads)
+
+    raw = json.loads(outbox_path.read_text(encoding="utf-8"))
+    assert len(raw["pending"]) == 2
+    assert {event["id"] for event in raw["pending"]} == {
+        event["id"] for event in results
+    }
+    assert results[0]["id"] == results[1]["id"]
+    assert _verify_owner_only_permissions(outbox_path)
+
+
 def test_clients_reuse_one_persisted_source_event_id_for_transport_retry() -> None:
     changed_tui = installer.change_tui_submission_source(TUI_SUBMISSION_SOURCE)
     changed_desktop = installer.change_desktop_submit_source(DESKTOP_SUBMIT_SOURCE)
@@ -1373,10 +1681,52 @@ def test_clients_reuse_one_persisted_source_event_id_for_transport_retry() -> No
     assert "acknowledgeSourceEvent" in changed_desktop
     assert (
         "let submitErr: unknown = null\n"
-        "  const sourceEvent = await prepareSourceEvent(sessionId, text)\n"
+        "  const sourceEvent = await prepareSourceEvent(\n"
+        "    selectedStoredSessionIdRef.current ?? sessionId,\n"
+        "    sessionId,\n"
+        "    text\n"
+        "  )\n"
         "  try {"
     ) in changed_desktop
     assert "withSessionBusyRetry(() =>\n      const sourceEvent" not in changed_desktop
+    assert "rebindSourceEvent(sourceEvent.id, recoveredId)" in changed_desktop
+    assert "event.sessionId === sessionId" in changed_desktop
+    assert "readSourceEventSessionId()" in changed_tui
+    assert "sourceEventSessionId ? prepareSourceEvent" in changed_tui
+    assert "source_event_session_id" not in changed_tui
+
+
+def test_client_source_transforms_preserve_crlf_files() -> None:
+    changed_tui = installer.change_tui_submission_source(
+        TUI_SUBMISSION_SOURCE.replace("\n", "\r\n")
+    )
+    changed_desktop = installer.change_desktop_submit_source(
+        DESKTOP_SUBMIT_SOURCE.replace("\n", "\r\n")
+    )
+
+    assert "\n" not in changed_tui.replace("\r\n", "")
+    assert "\n" not in changed_desktop.replace("\r\n", "")
+
+
+def test_tui_persists_server_durable_session_key_for_outbox_lookup() -> None:
+    changed_types = installer.change_tui_gateway_types_source(
+        TUI_GATEWAY_TYPES_SOURCE
+    )
+    changed_lifecycle = installer.change_tui_session_lifecycle_source(
+        TUI_SESSION_LIFECYCLE_SOURCE
+    )
+
+    assert "stored_session_id?: string" in changed_types
+    assert "source_event_session_id?: string" in changed_types
+    assert (
+        "writeActiveSessionFile(r.stored_session_id ?? r.session_id)"
+        in changed_lifecycle
+    )
+    assert (
+        "writeActiveSessionFile(r.source_event_session_id ?? r.session_key ?? r.session_id)"
+        in changed_lifecycle
+    )
+    assert "writeActiveSessionFile(id)" in changed_lifecycle
 
 
 def test_gateway_and_slack_carry_authenticated_source_event_identity() -> None:
@@ -1408,6 +1758,140 @@ def test_gateway_trusted_context_attaches_to_the_runner_class() -> None:
     assert runner.index("def _forge_trusted_turn_context") < runner.index(
         "async def _run_agent("
     )
+
+
+def test_gateway_uses_authenticated_platform_event_identity_outside_slack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    changed = installer.change_gateway_source(GATEWAY_SOURCE)
+    namespace: dict[str, object] = {"Optional": typing.Optional, "os": os}
+    exec(changed, namespace)
+    gateway = namespace["Gateway"]()
+    event = types.SimpleNamespace(
+        metadata={},
+        message_id="71",
+        platform_update_id=9001,
+    )
+    source = types.SimpleNamespace(
+        platform=types.SimpleNamespace(value="telegram"),
+        chat_id="chat-4",
+        message_id="71",
+        user_id="user-2",
+        working_directory=None,
+    )
+    monkeypatch.setenv("INFINITY_FORGE_HOST_ID", "host-id")
+
+    context = gateway._forge_trusted_turn_context(event, source, "session-3")
+
+    identity = (
+        "forge-gateway-source-event/v1\0telegram\0\0\0chat-4\0\0update\09001"
+    )
+    digest = __import__("hashlib").sha256(identity.encode("utf-8")).hexdigest()
+    assert context["source_event_id"] == f"gateway:{digest}"
+    assert context["subject_id"] == "user-2"
+    assert context["session_id"] == "session-3"
+    assert context["surface"] == "telegram"
+
+
+def test_gateway_message_identity_is_namespaced_by_platform_and_chat() -> None:
+    changed = installer.change_gateway_source(GATEWAY_SOURCE)
+    namespace: dict[str, object] = {"Optional": typing.Optional, "os": os}
+    exec(changed, namespace)
+    gateway = namespace["Gateway"]()
+    event = types.SimpleNamespace(
+        metadata={},
+        message_id="same-message",
+        platform_update_id=None,
+    )
+
+    def source(
+        platform: str,
+        chat: str,
+        *,
+        profile: str = "",
+        scope: str = "",
+        thread: str = "",
+    ) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            platform=types.SimpleNamespace(value=platform),
+            profile=profile,
+            scope_id=scope,
+            chat_id=chat,
+            thread_id=thread,
+            message_id=None,
+            user_id="user",
+            working_directory=None,
+        )
+
+    first = gateway._forge_trusted_turn_context(
+        event, source("matrix", "room-a"), "session"
+    )["source_event_id"]
+    second = gateway._forge_trusted_turn_context(
+        event, source("matrix", "room-b"), "session"
+    )["source_event_id"]
+    third = gateway._forge_trusted_turn_context(
+        event, source("discord", "room-a"), "session"
+    )["source_event_id"]
+    fourth = gateway._forge_trusted_turn_context(
+        event,
+        source("matrix", "room-a", profile="work", scope="server-2", thread="t"),
+        "session",
+    )["source_event_id"]
+
+    assert len({first, second, third, fourth}) == 4
+
+
+def test_tui_gateway_uses_only_its_server_authenticated_session_key() -> None:
+    session = {
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "compression-tip",
+    }
+    database = types.SimpleNamespace(
+        get_session=lambda key: {
+            "_lineage_root_id": "lineage-root",
+            "id": key,
+        }
+    )
+    namespace: dict[str, object] = {
+        "_err": lambda rid, code, message: {
+            "error": {"code": code, "message": message}
+        },
+        "_sess_nowait": lambda params, rid: (session, None),
+        "_get_db": lambda: database,
+    }
+    changed = installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE)
+    exec(changed, namespace)
+
+    rejected = namespace["_METHODS"]["prompt.submit"](
+        "request-1",
+        {
+            "session_id": "live-session",
+            "source_event_id": " forged ",
+            "text": "continue",
+        },
+    )
+
+    assert rejected["error"]["code"] == 4004
+    assert session["running"] is False
+
+    accepted = namespace["_METHODS"]["prompt.submit"](
+        "request-2",
+        {
+            "session_id": "live-session",
+            "source_event_id": "desktop:event-1",
+            "text": "continue",
+        },
+    )
+
+    assert accepted is None
+    assert session["_infinity_forge_source_event_id"] == "desktop:event-1"
+    assert (
+        namespace["_forge_source_session_id"](session, "live-session")
+        == "lineage-root"
+    )
+    assert '"session_id": _forge_source_session_id(session, sid)' in changed
+    assert "source_event_session_id" not in changed
 
 
 def test_tui_busy_queue_keeps_one_authenticated_source_event() -> None:
@@ -1463,7 +1947,9 @@ run_thread = threading.Thread(target=run_after_agent_ready)
     assert 'queued.get("source_event_id")' in changed
 
 
-def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event() -> None:
+def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     changed = installer.change_tool_executor_source(TOOL_EXECUTOR_SOURCE)
 
     assert "RISK(security)" in changed
@@ -1472,6 +1958,91 @@ def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event(
     assert "send_to_task" in changed and "stop_task" in changed
     assert changed.count("_forge_context_block") >= 4
     compile(changed, "<changed Hermes tool executor>", "exec")
+
+    middleware_calls: list[tuple[str, dict, dict]] = []
+
+    def apply_tool_request_middleware(
+        function_name: str,
+        function_args: dict,
+        **kwargs: object,
+    ) -> object:
+        middleware_calls.append(
+            (
+                function_name,
+                dict(function_args),
+                dict(kwargs["trusted_turn_context"]),
+            )
+        )
+        return types.SimpleNamespace(payload=dict(function_args), trace=[])
+
+    middleware_module = types.ModuleType("hermes_cli.middleware")
+    middleware_module.apply_tool_request_middleware = apply_tool_request_middleware
+    hermes_cli_module = types.ModuleType("hermes_cli")
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli_module)
+    monkeypatch.setitem(sys.modules, "hermes_cli.middleware", middleware_module)
+    dispatched: list[dict] = []
+    namespace: dict[str, object] = {
+        "_ts_scope_block": None,
+        "dispatch": lambda values: dispatched.append(dict(values)),
+        "json": json,
+    }
+    exec(changed, namespace)
+    tool_call = types.SimpleNamespace(id="tool-1")
+
+    for path_name in ("concurrent", "sequential"):
+        dispatched.clear()
+        middleware_calls.clear()
+        agent = types.SimpleNamespace(
+            _infinity_forge_trusted_turn_context={
+                "owner_host": "host-1",
+                "subject_id": "user-1",
+                "session_id": "session-1",
+                "surface": "desktop",
+                "source_event_id": "",
+                "working_directory": "C:/work",
+            }
+        )
+        namespace[path_name](
+            agent,
+            "send_to_task",
+            {
+                "value": 1,
+                "owner_host": "forged-host",
+                "source_event_id": "forged-event",
+                "cwd": "C:/forged",
+            },
+            "task-1",
+            tool_call,
+        )
+
+        assert dispatched == []
+        assert middleware_calls[0][1] == {"value": 1}
+        assert middleware_calls[0][2]["owner_host"] == "host-1"
+        assert middleware_calls[0][2]["source_event_id"] == ""
+
+        middleware_calls.clear()
+        namespace[path_name](
+            agent,
+            "read_only_tool",
+            {"value": 2, "subject_id": "forged-user"},
+            "task-1",
+            tool_call,
+        )
+        assert middleware_calls[0][1] == {"value": 2}
+        assert dispatched == [{"value": 2}]
+
+        dispatched.clear()
+        agent._infinity_forge_trusted_turn_context["source_event_id"] = (
+            "desktop:event-1"
+        )
+        namespace[path_name](
+            agent,
+            "stop_task",
+            {"value": 3, "user_id": "forged-user"},
+            "task-1",
+            tool_call,
+        )
+        assert dispatched == [{"value": 3}]
 
 
 def test_run_agent_forwards_trusted_context_without_exposing_schema_fields() -> None:
