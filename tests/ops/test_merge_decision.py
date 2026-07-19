@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from itertools import product
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -16,7 +17,9 @@ from forge.ops.merge_decision import (
     WAIT,
     MergeContext,
     MergePullRequest,
+    ProjectMergeProof,
     decide_merge,
+    decide_project_group,
 )
 from forge.ops.safe_files import (
     AUTO_MERGE_ALLOWED as SAFE_FILES_ALLOWED,
@@ -37,6 +40,8 @@ from forge.ops.task_settings import (
     TaskSettings,
     TaskSettingsStatus,
 )
+from forge.ops.task_projects import TaskProject
+from forge.ops.task_settings_v2 import TaskRequestV2, TaskSettingsV2
 
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
@@ -478,3 +483,108 @@ def test_malformed_pull_request_values_return_check_error(
     malformed = replace(_context().pull_request, **{field: value})
 
     assert decide_merge(_context(pull_request=malformed)).code == CHECK_ERROR
+
+
+def _v2_settings(
+    tmp_path: Path,
+    *,
+    merge_mode: MergeMode,
+) -> TaskSettingsV2:
+    for index in (1, 2):
+        (tmp_path / f"project-{index}").mkdir()
+    projects = tuple(
+        TaskProject.create(
+            repository=f"owner/project-{index}",
+            workspace=str((tmp_path / f"project-{index}").resolve()),
+            remote_name="origin",
+            base_branch="main",
+            base_commit=str(index) * 40,
+            host_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        for index in (1, 2)
+    )
+    merge_order = (
+        tuple(project.project_id for project in reversed(projects))
+        if merge_mode is MergeMode.FULL_AUTO
+        else None
+    )
+    request = TaskRequestV2.create(
+        request_id="12345678-1234-4234-8234-123456789abc",
+        management_repository="owner/management",
+        task_content=TaskContent(
+            title="Merge two Projects",
+            description="Wait for both exact Project proofs.",
+            acceptance_criteria=("No Project merges early.",),
+        ),
+        task_flow=TaskFlow.BUILD_REVIEW,
+        merge_mode=merge_mode,
+        merge_order=merge_order,
+        projects=projects,
+        task_owner_host="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        confirmed_by="user-7",
+        confirmed_at=NOW - timedelta(hours=1),
+        auto_merge_expires_at=(
+            None if merge_mode is MergeMode.MANUAL else NOW + timedelta(hours=1)
+        ),
+    )
+    return TaskSettingsV2.create(request=request, parent_issue_number=21)
+
+
+@pytest.mark.parametrize("merge_mode", (MergeMode.MANUAL, MergeMode.SAFE_AUTO))
+def test_multi_project_manual_and_safe_auto_never_open_the_merge_barrier(
+    tmp_path: Path,
+    merge_mode: MergeMode,
+) -> None:
+    settings = _v2_settings(tmp_path, merge_mode=merge_mode)
+    proofs = tuple(
+        ProjectMergeProof(
+            project_id=project.project_id,
+            repository=project.repository,
+            decision=AUTO_MERGE_ALLOWED,
+            expected_head_commit=HEAD,
+        )
+        for project in settings.projects
+    )
+
+    decision = decide_project_group(settings, proofs)
+
+    assert decision.code == MANUAL_MERGE_REQUIRED
+    assert decision.ordered_project_ids == ()
+
+
+def test_full_auto_requires_every_exact_project_proof_before_ordering(
+    tmp_path: Path,
+) -> None:
+    settings = _v2_settings(tmp_path, merge_mode=MergeMode.FULL_AUTO)
+    one_proof = ProjectMergeProof(
+        project_id=settings.projects[0].project_id,
+        repository=settings.projects[0].repository,
+        decision=AUTO_MERGE_ALLOWED,
+        expected_head_commit=HEAD,
+    )
+
+    decision = decide_project_group(settings, (one_proof,))
+
+    assert decision.code == WAIT
+    assert "every Project" in decision.reason
+    assert decision.ordered_project_ids == ()
+
+
+def test_full_auto_returns_only_the_confirmed_dependency_order(
+    tmp_path: Path,
+) -> None:
+    settings = _v2_settings(tmp_path, merge_mode=MergeMode.FULL_AUTO)
+    proofs = tuple(
+        ProjectMergeProof(
+            project_id=project.project_id,
+            repository=project.repository,
+            decision=AUTO_MERGE_ALLOWED,
+            expected_head_commit=("a" if index == 0 else "b") * 40,
+        )
+        for index, project in enumerate(settings.projects)
+    )
+
+    decision = decide_project_group(settings, proofs)
+
+    assert decision.code == AUTO_MERGE_ALLOWED
+    assert decision.ordered_project_ids == settings.merge_order
