@@ -24,7 +24,11 @@ from forge.hermes_change.installer import (
     install_change,
     restore_change,
 )
-from forge.ops.surface_events import _verify_owner_only_permissions
+from forge.ops.surface_events import (
+    TrustedTurnContext,
+    _verify_owner_only_permissions,
+    surface_event_payload_hash,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -2188,7 +2192,14 @@ run_thread = threading.Thread(target=run_after_agent_ready)
     class SteeringAgent:
         def __init__(self) -> None:
             self._infinity_forge_trusted_turn_context = {
+                "owner_host": "e0ec4ee3-f4d6-4f81-bca5-1b4ef6a05d89",
+                "subject_id": "user-1",
+                "session_id": "live-session",
+                "surface": "desktop",
                 "source_event_id": "tui:old-event",
+                "source_payload": "old turn",
+                "source_payload_hash": "a" * 64,
+                "working_directory": "C:/work",
             }
 
         @staticmethod
@@ -2213,7 +2224,47 @@ run_thread = threading.Thread(target=run_after_agent_ready)
     assert agent._infinity_forge_trusted_turn_context["source_event_id"] == (
         "tui:new-event"
     )
+    assert agent._infinity_forge_trusted_turn_context["source_payload"] == (
+        "steer this"
+    )
+    expected_context = TrustedTurnContext(
+        owner_host="e0ec4ee3-f4d6-4f81-bca5-1b4ef6a05d89",
+        subject_id="user-1",
+        session_id="live-session",
+        surface="desktop",
+        source_event_id="tui:new-event",
+        working_directory="C:/work",
+    )
+    assert agent._infinity_forge_trusted_turn_context["source_payload_hash"] == (
+        surface_event_payload_hash(expected_context, "steer this")
+    )
     assert steer_session["_infinity_forge_source_event_id"] == "tui:new-event"
+
+    missing_event_agent = SteeringAgent()
+    missing_event_session = {"agent": missing_event_agent}
+    namespace["_handle_busy_submit"](
+        "request-2",
+        "live-session",
+        missing_event_session,
+        "steer this",
+        object(),
+        None,
+    )
+    assert missing_event_agent._infinity_forge_trusted_turn_context == {}
+    assert missing_event_session["_infinity_forge_source_event_id"] == ""
+
+    invalid_owner_agent = SteeringAgent()
+    invalid_owner_agent._infinity_forge_trusted_turn_context["owner_host"] = ""
+    invalid_owner_session = {"agent": invalid_owner_agent}
+    namespace["_handle_busy_submit"](
+        "request-3",
+        "live-session",
+        invalid_owner_session,
+        "steer this",
+        object(),
+        "tui:third-event",
+    )
+    assert invalid_owner_agent._infinity_forge_trusted_turn_context == {}
 
 
 def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event(
