@@ -122,11 +122,7 @@ class SurfaceEventStore:
 
         if not isinstance(context, TrustedTurnContext):
             raise SurfaceEventError("context must be a TrustedTurnContext")
-        payload_hash = _bound_payload_hash(
-            context.owner_host,
-            context.working_directory,
-            payload,
-        )
+        payload_hash = surface_event_payload_hash(context, payload)
         received_at = _utc(at if at is not None else self._clock(), "received_at")
         retention_until = received_at + self._retention
         with self._database.transaction() as connection:
@@ -456,6 +452,21 @@ def _bound_payload_hash(
         f"{owner_host}\0{directory_digest}\0{payload_digest}"
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def surface_event_payload_hash(
+    context: TrustedTurnContext,
+    payload: str | bytes,
+) -> str:
+    """Return the exact host/directory-bound digest used by a source receipt."""
+
+    if not isinstance(context, TrustedTurnContext):
+        raise SurfaceEventError("context must be a TrustedTurnContext")
+    return _bound_payload_hash(
+        context.owner_host,
+        context.working_directory,
+        payload,
+    )
 
 
 def _utc(value: datetime, field_name: str) -> datetime:

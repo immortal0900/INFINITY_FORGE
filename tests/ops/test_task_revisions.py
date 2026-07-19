@@ -10,7 +10,12 @@ import pytest
 
 from forge.ops.surface_events import SurfaceEventStore, TrustedTurnContext
 from forge.ops.task_database import TaskDatabase
-from forge.ops.task_messages import TaskMessageError, TaskMessageStore
+from forge.ops.task_messages import (
+    TaskMessageError,
+    TaskMessagePacket,
+    TaskMessageReceipt,
+    TaskMessageStore,
+)
 from forge.ops.task_options import MergeMode, TaskFlow
 from forge.ops.task_projects import TaskProject
 from forge.ops.task_revisions import TaskRevisionError, TaskRevisionService
@@ -375,6 +380,225 @@ def _seed_runtime_run(
                 .replace("+00:00", "Z"),
                 ended_at,
             ),
+        )
+
+
+def _activated_replacement_packet(
+    tmp_path: Path,
+) -> tuple[
+    TaskDatabase,
+    TaskRequestV2,
+    TaskSettingsV2,
+    TaskMessageReceipt,
+    TaskMessageStore,
+    TaskMessagePacket,
+]:
+    database, base, _settings, project = _seed_active(tmp_path)
+    receipt = _send(database, base, 1, "apply", at=NOW + timedelta(seconds=1))
+    replacement = _new_request(
+        project,
+        request_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        description="replacement",
+        confirmed_at=NOW + timedelta(minutes=1),
+        replaces_request_id=base.request_id,
+    )
+    _stage_replacement(database, replacement)
+    revisions = TaskRevisionService(database)
+    preview = revisions.prepare_preview(receipt.revision_request_id, replacement)
+    revisions.confirm(
+        receipt.revision_request_id,
+        replacement,
+        preview_hash=preview.preview_hash,
+        at=NOW + timedelta(minutes=1, seconds=1),
+    )
+    settings = TaskSettingsV2.create(request=replacement, parent_issue_number=21)
+    _bind_replacement(database, replacement, root_card_id="root-2")
+    revisions.activate_confirmed(
+        receipt.revision_request_id,
+        settings,
+        at=NOW + timedelta(minutes=2),
+    )
+    store = TaskMessageStore(database, clock=lambda: NOW + timedelta(minutes=6))
+    packet = store.build_packet(replacement.request_id, settings.task_settings_hash)
+    return database, replacement, settings, receipt, store, packet
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "event_id",
+        "reason",
+        "terminal_before_run",
+        "included_after_terminal",
+    ),
+)
+def test_result_ack_requires_exact_event_identity_and_run_chronology(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    database, replacement, settings, receipt, store, packet = (
+        _activated_replacement_packet(tmp_path)
+    )
+    _seed_runtime_run(
+        database,
+        replacement,
+        settings,
+        packet_hash=packet.packet_hash,
+        worker_task_id="worker-1",
+        run_id="tampered-run",
+    )
+    store.record_included(
+        packet,
+        worker_task_id="worker-1",
+        run_id="tampered-run",
+        at=NOW + timedelta(minutes=3),
+    )
+    store.record_ack(
+        packet,
+        message_id=receipt.message.message_id,
+        outcome="applied",
+        worker_task_id="worker-1",
+        run_id="tampered-run",
+        reason="implemented",
+        at=NOW + timedelta(minutes=4),
+    )
+    with database.transaction() as connection:
+        if tamper == "event_id":
+            connection.execute(
+                """
+                UPDATE task_message_events SET message_event_id = 'forged-event-id'
+                WHERE run_id = 'tampered-run' AND event_type = 'applied'
+                """
+            )
+        elif tamper == "reason":
+            connection.execute(
+                """
+                UPDATE task_message_events SET reason = ' implemented '
+                WHERE run_id = 'tampered-run' AND event_type = 'applied'
+                """
+            )
+        elif tamper == "terminal_before_run":
+            connection.execute(
+                """
+                UPDATE task_message_events SET occurred_at = ?
+                WHERE run_id = 'tampered-run' AND event_type = 'applied'
+                """,
+                (
+                    (NOW + timedelta(minutes=2))
+                    .isoformat(timespec="microseconds")
+                    .replace("+00:00", "Z"),
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE task_message_events SET occurred_at = ?
+                WHERE run_id = 'tampered-run' AND event_type = 'included'
+                """,
+                (
+                    (NOW + timedelta(minutes=5))
+                    .isoformat(timespec="microseconds")
+                    .replace("+00:00", "Z"),
+                ),
+            )
+
+    with pytest.raises(TaskMessageError, match="event|reason|time|chronology"):
+        store.require_result_acknowledged(
+            packet,
+            worker_task_id="worker-1",
+            run_id="tampered-run",
+        )
+
+
+@pytest.mark.parametrize("tamper", ("noncanonical", "different_binding"))
+def test_runtime_run_requires_exact_canonical_project_record(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    database, replacement, settings, _receipt, store, packet = (
+        _activated_replacement_packet(tmp_path)
+    )
+    _seed_runtime_run(
+        database,
+        replacement,
+        settings,
+        packet_hash=packet.packet_hash,
+        worker_task_id="worker-1",
+        run_id="project-run",
+    )
+    project_payload = json.loads(replacement.to_json())["projects"][0]
+    if tamper == "different_binding":
+        project_payload["repository"] = "example/different-project"
+        rendered = _json(project_payload)
+    else:
+        rendered = json.dumps(project_payload, ensure_ascii=False, indent=2)
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE task_projects SET project_json = ?
+            WHERE request_id = ? AND project_id = ?
+            """,
+            (rendered, replacement.request_id, replacement.projects[0].project_id),
+        )
+
+    with pytest.raises(TaskMessageError, match="Project|project"):
+        store.record_included(
+            packet,
+            worker_task_id="worker-1",
+            run_id="project-run",
+            at=NOW + timedelta(minutes=3),
+        )
+
+
+def test_runtime_run_and_message_times_must_be_canonical_and_ordered(
+    tmp_path: Path,
+) -> None:
+    database, replacement, settings, receipt, store, packet = (
+        _activated_replacement_packet(tmp_path)
+    )
+    _seed_runtime_run(
+        database,
+        replacement,
+        settings,
+        packet_hash=packet.packet_hash,
+        worker_task_id="worker-1",
+        run_id="chronology-run",
+    )
+    store.record_included(
+        packet,
+        worker_task_id="worker-1",
+        run_id="chronology-run",
+        at=NOW + timedelta(minutes=3),
+    )
+    store.record_ack(
+        packet,
+        message_id=receipt.message.message_id,
+        outcome="applied",
+        worker_task_id="worker-1",
+        run_id="chronology-run",
+        reason="implemented",
+        at=NOW + timedelta(minutes=4),
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE task_runtime_runs
+            SET state = 'completed', result_hash = ?, ended_at = ?
+            WHERE run_id = 'chronology-run'
+            """,
+            (
+                hashlib.sha256(b"result").hexdigest(),
+                (NOW + timedelta(minutes=2))
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z"),
+            ),
+        )
+
+    with pytest.raises(TaskMessageError, match="time|chronology"):
+        store.require_result_acknowledged(
+            packet,
+            worker_task_id="worker-1",
+            run_id="chronology-run",
         )
 
 

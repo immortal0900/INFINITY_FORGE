@@ -262,6 +262,34 @@ def test_send_requires_exact_task_access_without_revealing_task_existence(
         )
 
 
+def test_send_requires_source_receipt_for_the_exact_message_payload(
+    tmp_path: Path,
+) -> None:
+    database, request, _settings = _active_task(tmp_path)
+    context = _context(1)
+    _receive(
+        database,
+        context,
+        "payload recorded by the trusted surface",
+        at=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(TaskMessageConflictError, match="payload"):
+        TaskMessageStore(database).send(
+            request.request_id,
+            context,
+            "different payload supplied after receipt",
+            at=NOW + timedelta(seconds=1),
+        )
+
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM task_messages").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM task_revision_requests").fetchone()[0]
+            == 0
+        )
+
+
 def test_exact_session_binding_can_authorize_task_message(
     tmp_path: Path,
 ) -> None:

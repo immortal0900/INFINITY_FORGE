@@ -10,8 +10,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from .surface_events import TrustedTurnContext
+from .surface_events import (
+    SurfaceEventError,
+    TrustedTurnContext,
+    surface_event_payload_hash,
+)
 from .task_database import TaskDatabase, TaskDatabaseError
+from .task_projects import TaskProject, TaskProjectError
+from .task_settings_v2 import TaskRequestV2, TaskSettingsV2, TaskSettingsV2Error
 
 
 TASK_MESSAGE_FORMAT = "forge-task-message/v1"
@@ -114,6 +120,16 @@ class TaskMessagePacket:
         return _canonical_json(self._payload())
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimeRunWindow:
+    state: str
+    started_at: datetime
+    ended_at: datetime | None
+
+    def upper_bound(self, current_at: datetime) -> datetime:
+        return self.ended_at if self.ended_at is not None else current_at
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -176,6 +192,26 @@ def _require_id(value: object, field_name: str) -> str:
 def _require_hash(value: object, field_name: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise TaskMessageError(f"{field_name} must be a lowercase SHA-256")
+    return value
+
+
+def _require_reason(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\x00" in value
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise TaskMessageError("worker acknowledgement reason is not canonical")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise TaskMessageError(
+            "worker acknowledgement reason is not canonical"
+        ) from None
+    if len(encoded) > 4096:
+        raise TaskMessageError("worker acknowledgement reason is not canonical")
     return value
 
 
@@ -498,6 +534,30 @@ class TaskMessageStore:
     ) -> TaskMessageReceipt:
         _require_message_access(connection, request_id, context)
 
+        event = connection.execute(
+            """
+            SELECT subject_id, session_id, surface, payload_hash, state
+            FROM surface_events WHERE source_event_id = ?
+            """,
+            (context.source_event_id,),
+        ).fetchone()
+        if event is None:
+            raise TaskMessageError("trusted source event was not recorded")
+        if tuple(event[:3]) != (
+            context.subject_id,
+            context.session_id,
+            context.surface,
+        ):
+            raise TaskMessageConflictError("source event identity changed")
+        try:
+            expected_payload_hash = surface_event_payload_hash(context, text)
+        except SurfaceEventError as error:
+            raise TaskMessageError("trusted source event payload is invalid") from error
+        if event[3] != expected_payload_hash:
+            raise TaskMessageConflictError("source event payload changed")
+        if event[4] == "expired":
+            raise TaskMessageError("trusted source event has expired")
+
         existing_row = connection.execute(
             "SELECT * FROM task_messages WHERE source_event_id = ?",
             (context.source_event_id,),
@@ -520,24 +580,6 @@ class TaskMessageStore:
                 existing,
             )
             return TaskMessageReceipt(existing, revision_id, base_hash, False)
-
-        event = connection.execute(
-            """
-            SELECT subject_id, session_id, surface, state
-            FROM surface_events WHERE source_event_id = ?
-            """,
-            (context.source_event_id,),
-        ).fetchone()
-        if event is None:
-            raise TaskMessageError("trusted source event was not recorded")
-        if tuple(event[:3]) != (
-            context.subject_id,
-            context.session_id,
-            context.surface,
-        ):
-            raise TaskMessageConflictError("source event identity changed")
-        if event[3] == "expired":
-            raise TaskMessageError("trusted source event has expired")
 
         settings = connection.execute(
             """
@@ -913,16 +955,18 @@ class TaskMessageStore:
         run_id: str,
         at: datetime | None = None,
     ) -> None:
-        timestamp = _utc(at if at is not None else self._clock(), "included time")
+        current_at = _utc(self._clock(), "included check time")
+        timestamp = _utc(at if at is not None else current_at, "included time")
         worker_task_id = _require_id(worker_task_id, "worker_task_id")
         run_id = _require_id(run_id, "run_id")
         with self._database.transaction() as connection:
             self._validate_packet(connection, packet)
-            run_state = self._require_exact_run_packet(
+            run_window = self._require_exact_run_packet(
                 connection,
                 packet,
                 worker_task_id=worker_task_id,
                 run_id=run_id,
+                current_at=current_at,
             )
             for message in packet.messages:
                 self._ensure_message_event(
@@ -934,7 +978,9 @@ class TaskMessageStore:
                     event_type="included",
                     reason=None,
                     occurred_at=timestamp,
-                    allow_insert=run_state == "running",
+                    run_window=run_window,
+                    current_at=current_at,
+                    allow_insert=run_window.state == "running",
                 )
 
     def record_ack(
@@ -953,52 +999,64 @@ class TaskMessageStore:
         _require_id(message_id, "message_id")
         worker_task_id = _require_id(worker_task_id, "worker_task_id")
         run_id = _require_id(run_id, "run_id")
-        if not isinstance(reason, str) or not reason.strip():
-            raise TaskMessageError("worker acknowledgement reason is required")
-        timestamp = _utc(at if at is not None else self._clock(), "ack time")
+        reason = _require_reason(reason)
+        current_at = _utc(self._clock(), "ack check time")
+        timestamp = _utc(at if at is not None else current_at, "ack time")
         with self._database.transaction() as connection:
             self._validate_packet(connection, packet)
-            run_state = self._require_exact_run_packet(
+            run_window = self._require_exact_run_packet(
                 connection,
                 packet,
                 worker_task_id=worker_task_id,
                 run_id=run_id,
+                current_at=current_at,
             )
             if message_id not in {message.message_id for message in packet.messages}:
                 raise TaskMessageError(
                     "worker acknowledged a message outside its packet"
                 )
-            included = connection.execute(
-                """
-                SELECT worker_task_id FROM task_message_events
-                WHERE message_id = ? AND task_settings_hash = ? AND run_id = ?
-                  AND event_type = 'included'
-                """,
-                (message_id, packet.task_settings_hash, run_id),
-            ).fetchall()
-            if len(included) != 1 or included[0][0] != worker_task_id:
-                raise TaskMessageError("worker did not include this message in the run")
             terminal = connection.execute(
                 """
-                SELECT event_type, worker_task_id, reason
+                SELECT event_type, reason
                 FROM task_message_events
                 WHERE message_id = ? AND task_settings_hash = ? AND run_id = ?
                   AND event_type IN ('applied', 'rejected')
                 """,
                 (message_id, packet.task_settings_hash, run_id),
             ).fetchall()
-            if terminal:
-                if len(terminal) != 1 or tuple(terminal[0]) != (
-                    outcome,
-                    worker_task_id,
-                    reason,
-                ):
-                    raise TaskMessageError("worker acknowledgement is immutable")
-                return
-            if run_state != "running":
+            if not terminal and run_window.state != "running":
                 raise TaskMessageError(
                     "completed runtime run cannot add message acknowledgements"
                 )
+            included_at = self._require_message_event(
+                connection,
+                message_id=message_id,
+                task_settings_hash=packet.task_settings_hash,
+                worker_task_id=worker_task_id,
+                run_id=run_id,
+                event_type="included",
+                run_window=run_window,
+                current_at=current_at,
+            )
+            if terminal:
+                if len(terminal) != 1:
+                    raise TaskMessageError("worker acknowledgement is ambiguous")
+                stored_outcome = str(terminal[0][0])
+                stored_reason = _require_reason(terminal[0][1])
+                self._require_message_event(
+                    connection,
+                    message_id=message_id,
+                    task_settings_hash=packet.task_settings_hash,
+                    worker_task_id=worker_task_id,
+                    run_id=run_id,
+                    event_type=stored_outcome,
+                    run_window=run_window,
+                    current_at=current_at,
+                    not_before=included_at,
+                )
+                if (stored_outcome, stored_reason) != (outcome, reason):
+                    raise TaskMessageError("worker acknowledgement is immutable")
+                return
             self._ensure_message_event(
                 connection,
                 message_id=message_id,
@@ -1008,6 +1066,9 @@ class TaskMessageStore:
                 event_type=outcome,
                 reason=reason,
                 occurred_at=timestamp,
+                run_window=run_window,
+                current_at=current_at,
+                not_before=included_at,
             )
 
     def require_result_acknowledged(
@@ -1019,28 +1080,53 @@ class TaskMessageStore:
     ) -> None:
         worker_task_id = _require_id(worker_task_id, "worker_task_id")
         run_id = _require_id(run_id, "run_id")
+        current_at = _utc(self._clock(), "result check time")
         with self._database.transaction() as connection:
             self._validate_packet(connection, packet)
-            self._require_exact_run_packet(
+            run_window = self._require_exact_run_packet(
                 connection,
                 packet,
                 worker_task_id=worker_task_id,
                 run_id=run_id,
+                current_at=current_at,
             )
             for message in packet.messages:
+                included_at = self._require_message_event(
+                    connection,
+                    message_id=message.message_id,
+                    task_settings_hash=packet.task_settings_hash,
+                    worker_task_id=worker_task_id,
+                    run_id=run_id,
+                    event_type="included",
+                    run_window=run_window,
+                    current_at=current_at,
+                )
                 rows = connection.execute(
                     """
-                    SELECT event_type, worker_task_id
+                    SELECT event_type, reason
                     FROM task_message_events
                     WHERE message_id = ? AND task_settings_hash = ? AND run_id = ?
                       AND event_type IN ('applied', 'rejected')
                     """,
                     (message.message_id, packet.task_settings_hash, run_id),
                 ).fetchall()
-                if len(rows) != 1 or rows[0][1] != worker_task_id:
+                if len(rows) != 1:
                     raise TaskMessageError(
                         f"pending message blocks result acceptance: {message.message_id}"
                     )
+                outcome = str(rows[0][0])
+                _require_reason(rows[0][1])
+                self._require_message_event(
+                    connection,
+                    message_id=message.message_id,
+                    task_settings_hash=packet.task_settings_hash,
+                    worker_task_id=worker_task_id,
+                    run_id=run_id,
+                    event_type=outcome,
+                    run_window=run_window,
+                    current_at=current_at,
+                    not_before=included_at,
+                )
 
     def _validate_packet(
         self,
@@ -1115,15 +1201,26 @@ class TaskMessageStore:
         *,
         worker_task_id: str,
         run_id: str,
-    ) -> str:
+        current_at: datetime,
+    ) -> _RuntimeRunWindow:
         run = connection.execute(
             """
-            SELECT runtime.request_id, runtime.task_settings_hash,
-                   runtime.project_id, runtime.host_id,
-                   runtime.worker_task_id, runtime.message_packet_hash,
-                   request.task_owner_host, settings.task_owner_host,
-                   project.task_settings_hash, runtime.state,
-                   runtime.result_hash, runtime.ended_at
+            SELECT runtime.request_id AS runtime_request_id,
+                   runtime.task_settings_hash AS runtime_settings_hash,
+                   runtime.project_id AS runtime_project_id,
+                   runtime.host_id AS runtime_host_id,
+                   runtime.worker_task_id AS runtime_worker_task_id,
+                   runtime.message_packet_hash AS message_packet_hash,
+                   runtime.state AS runtime_state,
+                   runtime.result_hash AS result_hash,
+                   runtime.started_at AS started_at,
+                   runtime.ended_at AS ended_at,
+                   request.request_json AS request_json,
+                   request.task_owner_host AS request_host,
+                   settings.settings_json AS settings_json,
+                   settings.task_owner_host AS settings_host,
+                   project.task_settings_hash AS project_settings_hash,
+                   project.project_json AS project_json
             FROM task_runtime_runs AS runtime
             JOIN task_requests AS request
               ON request.request_id = runtime.request_id
@@ -1140,33 +1237,82 @@ class TaskMessageStore:
         ).fetchone()
         if run is None:
             raise TaskMessageError("runtime run is unavailable or does not match")
-        if run[0] != packet.request_id or run[1] != packet.task_settings_hash:
-            raise TaskMessageError("runtime run Task or settings do not match packet")
-        if run[4] != worker_task_id:
-            raise TaskMessageError("runtime run worker does not match")
-        if run[5] != packet.packet_hash:
-            raise TaskMessageError("runtime run packet hash does not match")
         if (
-            run[6] != run[7]
-            or run[3] != run[6]
-            or run[8] != packet.task_settings_hash
+            run["runtime_request_id"] != packet.request_id
+            or run["runtime_settings_hash"] != packet.task_settings_hash
+        ):
+            raise TaskMessageError("runtime run Task or settings do not match packet")
+        if run["runtime_worker_task_id"] != worker_task_id:
+            raise TaskMessageError("runtime run worker does not match")
+        if run["message_packet_hash"] != packet.packet_hash:
+            raise TaskMessageError("runtime run packet hash does not match")
+
+        try:
+            request = TaskRequestV2.from_json(run["request_json"])
+            settings = TaskSettingsV2.from_json(
+                run["settings_json"],
+                request=request,
+            )
+            project_payload = json.loads(run["project_json"])
+            project = TaskProject.from_mapping(project_payload)
+        except (
+            json.JSONDecodeError,
+            TaskProjectError,
+            TaskSettingsV2Error,
+            TypeError,
+        ) as error:
+            raise TaskMessageError("runtime run Project record is invalid") from error
+        canonical_project = _canonical_json(
+            {
+                "base_branch": project.base_branch,
+                "base_commit": project.base_commit,
+                "host_id": project.host_id,
+                "project_id": project.project_id,
+                "remote_name": project.remote_name,
+                "repository": project.repository,
+                "workspace": project.workspace,
+            }
+        )
+        if (
+            run["request_json"] != request.to_json()
+            or run["settings_json"] != settings.to_json()
+            or run["project_json"] != canonical_project
+            or request.request_id != packet.request_id
+            or settings.request_id != packet.request_id
+            or settings.task_settings_hash != packet.task_settings_hash
+            or run["runtime_project_id"] != project.project_id
+            or run["project_settings_hash"] != packet.task_settings_hash
+            or tuple(item for item in request.projects if item == project) != (project,)
+            or tuple(item for item in settings.projects if item == project) != (project,)
+            or run["request_host"] != run["settings_host"]
+            or run["runtime_host_id"] != run["request_host"]
+            or project.host_id != run["request_host"]
         ):
             raise TaskMessageError("runtime run Project or host binding changed")
-        run_state = run[9]
+
+        current_at = _utc(current_at, "runtime check time")
+        started_at = _parse_time(run["started_at"], "runtime started_at")
+        if started_at > current_at:
+            raise TaskMessageError("runtime run time is in the future")
+        run_state = run["runtime_state"]
         if run_state not in {"running", "completed"}:
             raise TaskMessageError(
                 f"runtime run state {run_state} does not permit message events"
             )
         if run_state == "running":
-            if run[10] is not None or run[11] is not None:
+            if run["result_hash"] is not None or run["ended_at"] is not None:
                 raise TaskMessageError("running runtime run result binding changed")
-        elif (
-            not isinstance(run[10], str)
-            or _SHA256.fullmatch(run[10]) is None
-            or not isinstance(run[11], str)
-            or not run[11]
-        ):
-            raise TaskMessageError("completed runtime run result binding changed")
+            ended_at = None
+        else:
+            if (
+                not isinstance(run["result_hash"], str)
+                or _SHA256.fullmatch(run["result_hash"]) is None
+            ):
+                raise TaskMessageError("completed runtime run result binding changed")
+            ended_at = _parse_time(run["ended_at"], "runtime ended_at")
+            if ended_at < started_at or ended_at > current_at:
+                raise TaskMessageError("runtime run chronology is invalid")
+        run_window = _RuntimeRunWindow(str(run_state), started_at, ended_at)
         revision = connection.execute(
             """
             SELECT request_id, created_at, updated_at
@@ -1178,7 +1324,7 @@ class TaskMessageStore:
         if not revision:
             if packet.messages:
                 raise TaskMessageError("run packet has no confirmed revision")
-            return
+            return run_window
         if len(revision) != 1:
             raise TaskMessageError("run packet revision is ambiguous")
         rows = connection.execute(
@@ -1214,7 +1360,55 @@ class TaskMessageStore:
         actual_ids = tuple(message.message_id for message in packet.messages)
         if actual_ids != expected_ids:
             raise TaskMessageError("run packet omits or adds a revision message")
-        return str(run_state)
+        return run_window
+
+    @staticmethod
+    def _require_message_event(
+        connection: sqlite3.Connection,
+        *,
+        message_id: str,
+        task_settings_hash: str,
+        worker_task_id: str,
+        run_id: str,
+        event_type: str,
+        run_window: _RuntimeRunWindow,
+        current_at: datetime,
+        not_before: datetime | None = None,
+    ) -> datetime:
+        rows = connection.execute(
+            """
+            SELECT message_event_id, worker_task_id, reason, occurred_at
+            FROM task_message_events
+            WHERE message_id = ? AND task_settings_hash = ? AND run_id = ?
+              AND event_type = ?
+            """,
+            (message_id, task_settings_hash, run_id, event_type),
+        ).fetchall()
+        if len(rows) != 1:
+            if event_type == "included":
+                raise TaskMessageError("worker did not include this message in the run")
+            raise TaskMessageError("worker acknowledgement event is unavailable")
+        row = rows[0]
+        expected_event_id = _event_id(
+            message_id,
+            task_settings_hash,
+            run_id,
+            event_type,
+        )
+        if row[0] != expected_event_id or row[1] != worker_task_id:
+            raise TaskMessageError("Task message event identity changed")
+        if event_type == "included":
+            if row[2] is not None:
+                raise TaskMessageError("included event reason changed")
+        else:
+            _require_reason(row[2])
+        occurred_at = _parse_time(row[3], "message event occurred_at")
+        upper_bound = run_window.upper_bound(current_at)
+        if occurred_at < run_window.started_at or occurred_at > upper_bound:
+            raise TaskMessageError("Task message event time is outside its runtime run")
+        if not_before is not None and occurred_at < not_before:
+            raise TaskMessageError("Task message event chronology is invalid")
+        return occurred_at
 
     @staticmethod
     def _ensure_message_event(
@@ -1227,30 +1421,45 @@ class TaskMessageStore:
         event_type: str,
         reason: str | None,
         occurred_at: datetime,
+        run_window: _RuntimeRunWindow | None = None,
+        current_at: datetime | None = None,
+        not_before: datetime | None = None,
         allow_insert: bool = True,
     ) -> None:
         event_id = _event_id(message_id, task_settings_hash, run_id, event_type)
-        existing = connection.execute(
-            """
-            SELECT message_id, task_settings_hash, worker_task_id, run_id,
-                   event_type, reason
-            FROM task_message_events WHERE message_event_id = ?
-            """,
-            (event_id,),
-        ).fetchone()
-        expected = (
-            message_id,
-            task_settings_hash,
-            worker_task_id,
-            run_id,
-            event_type,
-            reason,
-        )
-        if existing is None:
+        if run_id is None:
+            if (
+                worker_task_id is not None
+                or event_type != "rejected"
+                or run_window is not None
+                or current_at is not None
+                or not_before is not None
+            ):
+                raise TaskMessageError("non-runtime message event binding is invalid")
+            reason = _require_reason(reason)
+            expected = (
+                message_id,
+                task_settings_hash,
+                None,
+                None,
+                event_type,
+                reason,
+                _format_time(occurred_at),
+            )
+            existing = connection.execute(
+                """
+                SELECT message_id, task_settings_hash, worker_task_id, run_id,
+                       event_type, reason, occurred_at
+                FROM task_message_events WHERE message_event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != expected:
+                    raise TaskMessageError("Task message event is immutable")
+                return
             if not allow_insert:
-                raise TaskMessageError(
-                    "completed runtime run cannot add message events"
-                )
+                raise TaskMessageError("Task message event is unavailable")
             connection.execute(
                 """
                 INSERT INTO task_message_events (
@@ -1258,14 +1467,71 @@ class TaskMessageStore:
                     worker_task_id, run_id, event_type, reason, occurred_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    event_id,
-                    *expected,
-                    _format_time(occurred_at),
-                ),
+                (event_id, *expected),
             )
-        elif tuple(existing) != expected:
-            raise TaskMessageError("Task message event is immutable")
+            return
+        if worker_task_id is None or run_window is None or current_at is None:
+            raise TaskMessageError("runtime message event binding is incomplete")
+        existing = connection.execute(
+            """
+            SELECT reason, occurred_at
+            FROM task_message_events
+            WHERE message_id = ? AND task_settings_hash = ? AND run_id = ?
+              AND event_type = ?
+            """,
+            (message_id, task_settings_hash, run_id, event_type),
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != reason:
+                raise TaskMessageError("Task message event is immutable")
+            TaskMessageStore._require_message_event(
+                connection,
+                message_id=message_id,
+                task_settings_hash=task_settings_hash,
+                worker_task_id=worker_task_id,
+                run_id=run_id,
+                event_type=event_type,
+                run_window=run_window,
+                current_at=current_at,
+                not_before=not_before,
+            )
+            return
+        if not allow_insert:
+            raise TaskMessageError("completed runtime run cannot add message events")
+        upper_bound = run_window.upper_bound(current_at)
+        if occurred_at < run_window.started_at or occurred_at > upper_bound:
+            raise TaskMessageError("Task message event time is outside its runtime run")
+        if not_before is not None and occurred_at < not_before:
+            raise TaskMessageError("Task message event chronology is invalid")
+        connection.execute(
+            """
+            INSERT INTO task_message_events (
+                message_event_id, message_id, task_settings_hash,
+                worker_task_id, run_id, event_type, reason, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                message_id,
+                task_settings_hash,
+                worker_task_id,
+                run_id,
+                event_type,
+                reason,
+                _format_time(occurred_at),
+            ),
+        )
+        TaskMessageStore._require_message_event(
+            connection,
+            message_id=message_id,
+            task_settings_hash=task_settings_hash,
+            worker_task_id=worker_task_id,
+            run_id=run_id,
+            event_type=event_type,
+            run_window=run_window,
+            current_at=current_at,
+            not_before=not_before,
+        )
 
 
 __all__ = [
