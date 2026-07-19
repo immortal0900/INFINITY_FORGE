@@ -2249,13 +2249,9 @@ def change_desktop_submit_source(source: str) -> str:
     if "forge-surface-event/v1" in source:
         raise InstallError("Desktop source-event outbox is already installed")
     source = _DESKTOP_SOURCE_EVENT_OUTBOX + "\n" + source
-    first_request = (
-        "requestGateway('prompt.submit', { session_id: sessionId, text }, "
-        "PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)"
-    )
-    source = _insert_before_unique_line(
+    source = _insert_after_unique_line(
         source,
-        first_request,
+        "let submitErr: unknown = null",
         ("const sourceEvent = await prepareSourceEvent(sessionId, text)",),
         label="Desktop durable source event preparation",
     )

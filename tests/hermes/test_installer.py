@@ -604,14 +604,21 @@ DESKTOP_SUBMIT_SOURCE = """export async function submitPrompt(
   text: string,
   recoveredId: string | null,
 ): Promise<void> {
-  await withSessionBusyRetry(() =>
-    requestGateway('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
-  )
-  if (recoveredId) {
+  let submitErr: unknown = null
+  try {
     await withSessionBusyRetry(() =>
-      requestGateway('prompt.submit', { session_id: recoveredId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+      requestGateway('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
     )
+  } catch (firstErr) {
+    if (recoveredId) {
+      await withSessionBusyRetry(() =>
+        requestGateway('prompt.submit', { session_id: recoveredId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+      )
+    } else {
+      submitErr = firstErr
+    }
   }
+  if (submitErr !== null) throw submitErr
 }
 """
 
@@ -1364,6 +1371,12 @@ def test_clients_reuse_one_persisted_source_event_id_for_transport_retry() -> No
     assert "localStorage" in changed_desktop
     assert changed_desktop.count("source_event_id: sourceEvent.id") == 2
     assert "acknowledgeSourceEvent" in changed_desktop
+    assert (
+        "let submitErr: unknown = null\n"
+        "  const sourceEvent = await prepareSourceEvent(sessionId, text)\n"
+        "  try {"
+    ) in changed_desktop
+    assert "withSessionBusyRetry(() =>\n      const sourceEvent" not in changed_desktop
 
 
 def test_gateway_and_slack_carry_authenticated_source_event_identity() -> None:
