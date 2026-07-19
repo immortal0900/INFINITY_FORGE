@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import UUID
 
 from .contracts import CheckRun
+from .displayed_status import FORGE_STATUS_LABELS
 from .hermes import GateError
 from .safe_files import (
     ChangedFile,
@@ -109,6 +110,18 @@ class PullRequestWriteState:
     merged_commit: str | None
     merged_base_commit: str | None
     merged_head_commit: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskStopIssueState:
+    """Minimal authoritative parent Issue state used by Stop cleanup."""
+
+    number: int
+    title: str
+    body: str
+    state: str
+    state_reason: str | None
+    labels: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +341,59 @@ class GitHubClient:
             merged_base_commit=merged_base,
             merged_head_commit=merged_head,
         )
+
+    def find_pr_write_state(
+        self,
+        repository: str,
+        branch_name: str,
+    ) -> PullRequestWriteState | None:
+        """Find an exact same-repository PR after an ambiguous create response."""
+
+        if (
+            not isinstance(repository, str)
+            or _REPOSITORY_RE.fullmatch(repository) is None
+        ):
+            raise GateError("GitHub repository must use OWNER/REPO format")
+        if (
+            not isinstance(branch_name, str)
+            or not branch_name
+            or branch_name != branch_name.strip()
+            or any(
+                character.isspace() or ord(character) < 32 for character in branch_name
+            )
+        ):
+            raise GateError("GitHub PR branch name is invalid")
+        owner = repository.split("/", 1)[0]
+        head_filter = quote(f"{owner}:{branch_name}", safe=":")
+        pages = self._get_pages(
+            (f"repos/{repository}/pulls?state=all&head={head_filter}&per_page=100",),
+            "pull request recovery list",
+        )
+        matches: list[str] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise GateError("GitHub PR recovery page is invalid")
+            for item in page:
+                raw = _require_object(item, "PR recovery item")
+                head = _require_object(raw.get("head"), "PR recovery head")
+                head_repository = _require_object(
+                    head.get("repo"), "PR recovery head repository"
+                )
+                if (
+                    head.get("ref") != branch_name
+                    or head_repository.get("full_name") != repository
+                ):
+                    continue
+                number = raw.get("number")
+                if type(number) is not int or number <= 0:
+                    raise GateError("GitHub PR recovery number is invalid")
+                url = f"https://github.com/{repository}/pull/{number}"
+                if raw.get("html_url") != url:
+                    raise GateError("GitHub PR recovery URL is invalid")
+                matches.append(url)
+        if len(matches) > 1:
+            raise GateError("GitHub branch matched more than one pull request")
+        return None if not matches else self.get_pr_write_state(matches[0])
 
     def _read_merge_parents(
         self,
@@ -1120,6 +1186,27 @@ class GitHubTaskIssueClientV2:
         except json.JSONDecodeError as error:
             raise GateError(f"GitHub {label} response is not valid JSON") from error
 
+    def _run_mutation(self, arguments: Sequence[str], label: str) -> object | None:
+        """Accept a valid JSON response or GitHub's successful 204 empty body."""
+
+        result = self._runner(
+            [self._gh_path, "api", *arguments],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise GateError(
+                f"GitHub {label} request failed with exit code {result.returncode}"
+            )
+        if not result.stdout.strip():
+            return None
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise GateError(f"GitHub {label} response is not valid JSON") from error
+
     @staticmethod
     def _repository(value: str) -> str:
         if not isinstance(value, str) or _REPOSITORY_RE.fullmatch(value) is None:
@@ -1157,6 +1244,262 @@ class GitHubTaskIssueClientV2:
             )
         except TaskServiceError as error:
             raise GateError("GitHub parent issue response is invalid") from error
+
+    @staticmethod
+    def _parse_stop_issue(value: object) -> TaskStopIssueState:
+        if not isinstance(value, dict) or "pull_request" in value:
+            raise GateError("GitHub Stop parent response is not an issue object")
+        number = value.get("number")
+        title = value.get("title")
+        body = value.get("body")
+        state = value.get("state")
+        state_reason = value.get("state_reason")
+        raw_labels = value.get("labels")
+        if type(number) is not int or number <= 0:
+            raise GateError("GitHub Stop parent issue number is invalid")
+        if not isinstance(title, str) or not title.strip():
+            raise GateError("GitHub Stop parent issue title is invalid")
+        if not isinstance(body, str):
+            raise GateError("GitHub Stop parent issue body is invalid")
+        if state not in {"open", "closed"}:
+            raise GateError("GitHub Stop parent issue state is invalid")
+        if state_reason not in {None, "completed", "not_planned", "reopened"}:
+            raise GateError("GitHub Stop parent issue state reason is invalid")
+        if not isinstance(raw_labels, list):
+            raise GateError("GitHub Stop parent issue labels are invalid")
+        labels: list[str] = []
+        for raw_label in raw_labels:
+            if not isinstance(raw_label, dict):
+                raise GateError("GitHub Stop parent issue label is invalid")
+            name = raw_label.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise GateError("GitHub Stop parent issue label is invalid")
+            labels.append(name)
+        if len(labels) != len(set(labels)):
+            raise GateError("GitHub Stop parent issue labels contain duplicates")
+        return TaskStopIssueState(
+            number=number,
+            title=title,
+            body=body,
+            state=state,
+            state_reason=state_reason,
+            labels=tuple(sorted(labels)),
+        )
+
+    def get_stop_issue(
+        self,
+        repository: str,
+        issue_number: int,
+    ) -> TaskStopIssueState:
+        """Read all fields required to prove one Stop cleanup result."""
+
+        repository = self._repository(repository)
+        issue_number = self._issue_number(issue_number)
+        payload = self._run_json(
+            (f"repos/{repository}/issues/{issue_number}",),
+            "Stop parent issue readback",
+        )
+        issue = self._parse_stop_issue(payload)
+        if issue.number != issue_number:
+            raise GateError("GitHub Stop parent issue number changed")
+        return issue
+
+    def find_stop_issue(
+        self,
+        repository: str,
+        request_id: str,
+    ) -> TaskStopIssueState | None:
+        """Find an open or closed v2 parent after an ambiguous create."""
+
+        repository = self._repository(repository)
+        if not _is_canonical_v2_request_id(request_id):
+            raise GateError("GitHub v2 Task request_id is invalid")
+        payload = self._run_json(
+            (
+                "--paginate",
+                "--slurp",
+                f"repos/{repository}/issues?state=all&per_page=100",
+            ),
+            "Stop parent issue list",
+        )
+        if not isinstance(payload, list) or any(
+            not isinstance(page, list) for page in payload
+        ):
+            raise GateError("GitHub paginated Stop parent response is invalid")
+        matches: list[TaskStopIssueState] = []
+        for page in payload:
+            for raw_issue in page:
+                if not isinstance(raw_issue, dict):
+                    raise GateError("GitHub Stop parent list contains an invalid item")
+                if "pull_request" in raw_issue:
+                    continue
+                body = raw_issue.get("body")
+                if body is None:
+                    continue
+                if not isinstance(body, str):
+                    raise GateError("GitHub Stop parent issue body is invalid")
+                if "<!-- forge-v2-task-request" not in body:
+                    continue
+                try:
+                    marker = read_task_marker_v2(body)
+                except TaskServiceError as error:
+                    raise GateError(
+                        "GitHub Stop parent Task marker is invalid"
+                    ) from error
+                if marker.get("request_id") == request_id:
+                    matches.append(self._parse_stop_issue(raw_issue))
+        if len(matches) > 1:
+            raise GateError("GitHub v2 request_id matched more than one Stop parent")
+        return matches[0] if matches else None
+
+    def reconcile_stop_status(
+        self,
+        repository: str,
+        issue_number: int,
+        *,
+        target: str | None,
+    ) -> TaskStopIssueState:
+        """Remove only Forge status labels, optionally keeping needs-decision."""
+
+        repository = self._repository(repository)
+        issue_number = self._issue_number(issue_number)
+        if target not in {None, "forge:needs-decision"}:
+            raise GateError("Stop cleanup target must be needs-decision or empty")
+        endpoint = f"repos/{repository}/issues/{issue_number}"
+        before = self.get_stop_issue(repository, issue_number)
+        if target is not None and before.state != "open":
+            raise GateError("partial Stop parent issue must remain open")
+        forge_labels = tuple(
+            label for label in before.labels if label in FORGE_STATUS_LABELS
+        )
+        for label in forge_labels:
+            if label == target:
+                continue
+            # RISK(side-effect): delete only an official Forge status label;
+            # never replace the complete label list owned by other writers.
+            self._run_mutation(
+                (
+                    "-X",
+                    "DELETE",
+                    f"{endpoint}/labels/{quote(label, safe='')}",
+                ),
+                "Stop parent status remove",
+            )
+        if target is not None and target not in forge_labels:
+            self._run_json(
+                (
+                    "-X",
+                    "POST",
+                    f"{endpoint}/labels",
+                    "-f",
+                    f"labels[]={target}",
+                ),
+                "Stop parent needs-decision add",
+            )
+        after = self.get_stop_issue(repository, issue_number)
+        expected = () if target is None else (target,)
+        actual = tuple(label for label in after.labels if label in FORGE_STATUS_LABELS)
+        if actual != expected:
+            raise GateError("GitHub Stop parent status readback does not match")
+        unrelated = {
+            label for label in before.labels if label not in FORGE_STATUS_LABELS
+        }
+        if not unrelated.issubset(after.labels):
+            raise GateError("GitHub Stop cleanup lost an unrelated label")
+        return after
+
+    def ensure_stop_comment(
+        self,
+        repository: str,
+        issue_number: int,
+        stop_request_id: str,
+        body: str,
+    ) -> str:
+        """Create one marker-bound result comment, or verify its exact replay."""
+
+        repository = self._repository(repository)
+        issue_number = self._issue_number(issue_number)
+        if not _is_canonical_v2_request_id(stop_request_id):
+            raise GateError("GitHub Stop request ID is invalid")
+        marker = f"<!-- forge-task-stop:{stop_request_id} -->"
+        if not isinstance(body, str) or body.count(marker) != 1:
+            raise GateError("GitHub Stop comment marker is invalid")
+
+        def matching_comments() -> list[str]:
+            payload = self._run_json(
+                (
+                    "--paginate",
+                    "--slurp",
+                    f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
+                ),
+                "Stop parent comment list",
+            )
+            if not isinstance(payload, list) or any(
+                not isinstance(page, list) for page in payload
+            ):
+                raise GateError("GitHub paginated Stop comment response is invalid")
+            matches: list[str] = []
+            for page in payload:
+                for raw_comment in page:
+                    if not isinstance(raw_comment, dict):
+                        raise GateError("GitHub Stop comment is invalid")
+                    comment_body = raw_comment.get("body")
+                    if not isinstance(comment_body, str):
+                        raise GateError("GitHub Stop comment body is invalid")
+                    if marker in comment_body:
+                        matches.append(comment_body)
+            return matches
+
+        matches = matching_comments()
+        if len(matches) > 1:
+            raise GateError("GitHub Stop comment marker is duplicated")
+        if matches:
+            if matches[0] != body:
+                raise GateError("GitHub Stop comment marker body changed")
+            return matches[0]
+        self._run_json(
+            (
+                "-X",
+                "POST",
+                f"repos/{repository}/issues/{issue_number}/comments",
+                "-f",
+                f"body={body}",
+            ),
+            "Stop parent comment create",
+        )
+        matches = matching_comments()
+        if matches != [body]:
+            raise GateError("GitHub Stop comment readback does not match")
+        return body
+
+    def close_stop_issue_not_planned(
+        self,
+        repository: str,
+        issue_number: int,
+    ) -> TaskStopIssueState:
+        """Close only a cancelled parent and prove the not-planned reason."""
+
+        repository = self._repository(repository)
+        issue_number = self._issue_number(issue_number)
+        before = self.get_stop_issue(repository, issue_number)
+        if before.state == "closed" and before.state_reason == "not_planned":
+            return before
+        self._run_json(
+            (
+                "-X",
+                "PATCH",
+                f"repos/{repository}/issues/{issue_number}",
+                "-f",
+                "state=closed",
+                "-f",
+                "state_reason=not_planned",
+            ),
+            "Stop parent close",
+        )
+        after = self.get_stop_issue(repository, issue_number)
+        if after.state != "closed" or after.state_reason != "not_planned":
+            raise GateError("GitHub Stop parent close readback does not match")
+        return after
 
     def find_issue(
         self,

@@ -4,13 +4,35 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Iterable
+from enum import Enum
+from pathlib import Path
+from typing import Iterable, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from .github import (
+    PullRequestWriteState,
+    TaskStopIssueState,
+    parse_pull_request_url,
+)
+from .displayed_status import FORGE_STATUS_LABELS
+from .hermes import GateError
+from .kanban_stop import (
+    KanbanStopResult,
+    ProcessIdentityLookup,
+    archive_matching_cards,
+)
+from .process_identity import (
+    ProcessIdentity,
+    ProcessScopeBackend,
+    ProcessStopResult,
+    terminate_exact_process_tree,
+)
 from .surface_events import TrustedTurnContext
 from .task_database import TaskDatabase, TaskDatabaseError
+from .task_service import TaskServiceError, read_task_marker_v2
 from .task_settings_v2 import (
     TaskRequestV2,
     TaskSettingsV2,
@@ -46,6 +68,218 @@ class TaskStopOwnerHostMismatch(TaskStopError):
 
 class TaskStopUnsupported(TaskStopError):
     """Raised for a v1 Task that lacks the v2 identity and access boundary."""
+
+
+class StopCleanupOperation(str, Enum):
+    """The complete write authority granted to one exact Stop cleanup."""
+
+    RECONCILE_FORGE_STATUS = "reconcile_forge_status"
+    COMMENT_RESULT = "comment_result"
+    CLOSE_NOT_PLANNED = "close_not_planned"
+
+
+_STOP_CLEANUP_OPERATIONS = frozenset(StopCleanupOperation)
+
+
+@dataclass(frozen=True, slots=True)
+class StopCleanupAuthority:
+    """Verified, narrow authority for one unfinished durable Stop request."""
+
+    stop_request_id: str
+    request_id: str
+    task_settings_hash: str | None
+    management_repository: str
+    parent_issue_number: int | None
+    task_owner_host: str
+    state: str
+    allowed_operations: frozenset[StopCleanupOperation] = _STOP_CLEANUP_OPERATIONS
+
+    def __post_init__(self) -> None:
+        _canonical_uuid(self.stop_request_id, "stop_request_id")
+        _canonical_uuid(self.request_id, "request_id")
+        if self.task_settings_hash is not None:
+            _require_hash(self.task_settings_hash, "task_settings_hash")
+        _canonical_uuid(self.task_owner_host, "task_owner_host")
+        _require_optional_issue_number(self.parent_issue_number)
+        if self.state not in {"stopping", "cleanup_incomplete"}:
+            raise TaskStopError("Stop cleanup authority requires unfinished state")
+        if self.allowed_operations != _STOP_CLEANUP_OPERATIONS:
+            raise TaskStopError("Stop cleanup authority operations changed")
+
+    def require(self, operation: StopCleanupOperation | str) -> None:
+        """Reject every external write outside the three cleanup operations."""
+
+        try:
+            parsed = StopCleanupOperation(operation)
+        except (TypeError, ValueError):
+            raise TaskStopError(
+                "requested operation is not allowed for Stop cleanup"
+            ) from None
+        if parsed not in self.allowed_operations:
+            raise TaskStopError("requested operation is not allowed for Stop cleanup")
+
+
+@dataclass(frozen=True, slots=True)
+class StopProjectArtifact:
+    """Preserved recovery locations and remote identifiers for one Project."""
+
+    project_id: str
+    repository: str
+    state: str
+    branch_name: str | None
+    worktree_path: str | None
+    pr_url: str | None
+    head_commit: str | None
+    local_merge_commit: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StopReconcileReceipt:
+    """Durable current result of one Stop reconciliation attempt."""
+
+    stop_request_id: str
+    request_id: str
+    state: str
+    result: str | None
+    details_json: str
+
+    @property
+    def details(self) -> Mapping[str, object]:
+        value = _canonical_json(self.details_json, "Task Stop details")
+        if not isinstance(value, dict):
+            raise TaskStopError("Task Stop details must be an object")
+        return value
+
+
+class StopIssueClient(Protocol):
+    def find_stop_issue(
+        self, repository: str, request_id: str
+    ) -> TaskStopIssueState | None: ...
+
+    def get_stop_issue(
+        self, repository: str, issue_number: int
+    ) -> TaskStopIssueState: ...
+
+    def reconcile_stop_status(
+        self, repository: str, issue_number: int, *, target: str | None
+    ) -> TaskStopIssueState: ...
+
+    def ensure_stop_comment(
+        self,
+        repository: str,
+        issue_number: int,
+        stop_request_id: str,
+        body: str,
+    ) -> str: ...
+
+    def close_stop_issue_not_planned(
+        self, repository: str, issue_number: int
+    ) -> TaskStopIssueState: ...
+
+
+class StopPullRequestReader(Protocol):
+    def get_pr_write_state(self, pr_url: str) -> PullRequestWriteState: ...
+
+    def find_pr_write_state(
+        self, repository: str, branch_name: str
+    ) -> PullRequestWriteState | None: ...
+
+
+class StopKanbanController(Protocol):
+    def archive(self, authority: StopCleanupAuthority) -> KanbanStopResult: ...
+
+
+class StopProcessController(Protocol):
+    def stop(
+        self, identity: ProcessIdentity, *, current_host: str
+    ) -> ProcessStopResult: ...
+
+
+class HermesKanbanStopper:
+    """Bind Task Stop orchestration to Task14's atomic Hermes card archive."""
+
+    def __init__(
+        self,
+        database_path: str | Path,
+        *,
+        dispatcher_database_path: str | Path,
+        current_host: str,
+        identity_lookup: ProcessIdentityLookup | None = None,
+        claimer_host_name: str | None = None,
+    ) -> None:
+        self._database_path = Path(database_path)
+        self._dispatcher_database_path = Path(dispatcher_database_path)
+        self._current_host = _canonical_uuid(current_host, "current_host")
+        self._identity_lookup = identity_lookup
+        self._claimer_host_name = claimer_host_name
+
+    def archive(self, authority: StopCleanupAuthority) -> KanbanStopResult:
+        if not isinstance(authority, StopCleanupAuthority):
+            raise TaskStopError("authority must be StopCleanupAuthority")
+        if authority.task_settings_hash is None:
+            raise TaskStopError("prepared Task has no Kanban cleanup authority")
+        return archive_matching_cards(
+            self._database_path,
+            request_id=authority.request_id,
+            task_settings_hash=authority.task_settings_hash,
+            owner_host=authority.task_owner_host,
+            current_host=self._current_host,
+            dispatcher_database_path=self._dispatcher_database_path,
+            reason=f"Task Stop {authority.stop_request_id}",
+            identity_lookup=self._identity_lookup,
+            claimer_host_name=self._claimer_host_name,
+        )
+
+
+class ProcessTreeStopper:
+    """Bind reconciliation to Task14's exact process-tree terminator."""
+
+    def __init__(
+        self,
+        backend: ProcessScopeBackend,
+        *,
+        term_timeout_seconds: float = 5.0,
+        force_timeout_seconds: float = 5.0,
+        poll_interval_seconds: float = 0.1,
+    ) -> None:
+        self._backend = backend
+        self._term_timeout_seconds = term_timeout_seconds
+        self._force_timeout_seconds = force_timeout_seconds
+        self._poll_interval_seconds = poll_interval_seconds
+
+    def stop(
+        self,
+        identity: ProcessIdentity,
+        *,
+        current_host: str,
+    ) -> ProcessStopResult:
+        return terminate_exact_process_tree(
+            identity,
+            expected=identity.binding,
+            current_host=current_host,
+            backend=self._backend,
+            term_timeout_seconds=self._term_timeout_seconds,
+            force_timeout_seconds=self._force_timeout_seconds,
+            poll_interval_seconds=self._poll_interval_seconds,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _RemoteProject:
+    artifact: StopProjectArtifact
+    is_open: bool | None
+    is_merged: bool
+    head_commit: str | None
+    merged_commit: str | None
+    merged_base_commit: str | None
+    merged_head_commit: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _StopOutcome:
+    event_type: str
+    result: str
+    projects: tuple[_RemoteProject, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +545,182 @@ class TaskStopService:
             raise
         except TaskDatabaseError as error:
             raise TaskStopError("Task Stop selection could not be read") from error
+
+    def guard_stop_cleanup(self, stop_request_id: str) -> StopCleanupAuthority:
+        """Grant only Issue cleanup for one exact unfinished Stop request."""
+
+        stop_request_id = _canonical_uuid(stop_request_id, "stop_request_id")
+        try:
+            with self._database.read() as connection:
+                return self._guard_stop_cleanup_on_connection(
+                    connection,
+                    stop_request_id,
+                )
+        except TaskStopError:
+            raise
+        except (TaskDatabaseError, sqlite3.Error) as error:
+            raise TaskStopError(
+                "Task Stop cleanup authority could not be read"
+            ) from error
+
+    @staticmethod
+    def _guard_stop_cleanup_on_connection(
+        connection: sqlite3.Connection,
+        stop_request_id: str,
+    ) -> StopCleanupAuthority:
+        row = connection.execute(
+            """
+            SELECT stop.request_id, stop.task_settings_hash, stop.state,
+                   stop.details_json, request.management_repository,
+                   request.task_owner_host
+            FROM task_stop_requests AS stop
+            JOIN task_requests AS request ON request.request_id = stop.request_id
+            WHERE stop.stop_request_id = ?
+            """,
+            (stop_request_id,),
+        ).fetchone()
+        if row is None:
+            raise TaskStopError("Task Stop request does not exist")
+        request_id = _canonical_uuid(str(row[0]), "request_id")
+        settings_hash = (
+            None if row[1] is None else _require_hash(str(row[1]), "task_settings_hash")
+        )
+        state = str(row[2])
+        if state == "completed":
+            raise TaskStopError("completed Task Stop has no cleanup write authority")
+        if state not in {"stopping", "cleanup_incomplete"}:
+            raise TaskStopError("Task Stop is not ready for cleanup")
+        details = _canonical_json(str(row[3]), "Task Stop details")
+        if not isinstance(details, dict):
+            raise TaskStopError("Task Stop details must be an object")
+        required = {"management_repository", "parent_issue_number", "request_ids"}
+        if not required.issubset(details):
+            raise TaskStopError("Task Stop details are incomplete")
+        management_repository = str(row[4])
+        owner_host = _canonical_uuid(str(row[5]), "task_owner_host")
+        if details["management_repository"] != management_repository:
+            raise TaskStopError("Task Stop details changed management repository")
+        parent_issue_number = details["parent_issue_number"]
+        _require_optional_issue_number(parent_issue_number)
+        raw_request_ids = details["request_ids"]
+        if not isinstance(raw_request_ids, list) or not raw_request_ids:
+            raise TaskStopError("Task Stop details request_ids are invalid")
+        request_ids = tuple(
+            _canonical_uuid(value, "details request_id") for value in raw_request_ids
+        )
+        if (
+            tuple(sorted(set(request_ids))) != request_ids
+            or request_id not in request_ids
+        ):
+            raise TaskStopError("Task Stop details request_ids are not canonical")
+
+        request_bindings = connection.execute(
+            "SELECT request_id, management_repository, task_owner_host "
+            "FROM task_requests WHERE request_id IN ({}) ORDER BY request_id".format(
+                ",".join("?" for _ in request_ids)
+            ),
+            request_ids,
+        ).fetchall()
+        if len(request_bindings) != len(request_ids) or any(
+            tuple(binding) != (member_id, management_repository, owner_host)
+            for member_id, binding in zip(request_ids, request_bindings, strict=True)
+        ):
+            raise TaskStopError("Task Stop aggregate owner binding changed")
+        bound_numbers: set[int] = set()
+        for member_id in request_ids:
+            bound_events = connection.execute(
+                """
+                SELECT event_json FROM task_events
+                WHERE request_id = ? AND event_type = 'parent_issue_bound'
+                """,
+                (member_id,),
+            ).fetchall()
+            for bound_event in bound_events:
+                payload = _canonical_json(str(bound_event[0]), "parent Issue event")
+                if (
+                    not isinstance(payload, dict)
+                    or type(payload.get("parent_issue_number")) is not int
+                    or payload["parent_issue_number"] <= 0
+                ):
+                    raise TaskStopError("Task Stop parent Issue binding is invalid")
+                bound_numbers.add(payload["parent_issue_number"])
+        expected_parent = next(iter(bound_numbers), None)
+        if len(bound_numbers) > 1 or expected_parent != parent_issue_number:
+            raise TaskStopError("Task Stop parent Issue authority changed")
+
+        matching_stops = connection.execute(
+            "SELECT stop_request_id FROM task_stop_requests WHERE request_id IN ({})".format(
+                ",".join("?" for _ in request_ids)
+            ),
+            request_ids,
+        ).fetchall()
+        if [str(item[0]) for item in matching_stops] != [stop_request_id]:
+            raise TaskStopError(
+                "Task Stop cleanup does not have exact aggregate authority"
+            )
+
+        event_json = _json({"stop_request_id": stop_request_id})
+        for member_id in request_ids:
+            event = connection.execute(
+                """
+                SELECT project_id, event_type, event_json, occurred_at
+                FROM task_events
+                WHERE request_id = ? AND event_key = ?
+                """,
+                (member_id, f"stop_requested:{stop_request_id}"),
+            ).fetchone()
+            if (
+                event is None
+                or event[0] is not None
+                or str(event[1]) != "stop_requested"
+                or str(event[2]) != event_json
+            ):
+                raise TaskStopError("Task Stop cleanup barrier does not match")
+            _parse_timestamp(event[3], "Stop barrier time")
+        stopping = connection.execute(
+            """
+            SELECT project_id, event_type, event_json, occurred_at
+            FROM task_events
+            WHERE request_id = ? AND event_key = ?
+            """,
+            (request_id, f"stopping:{stop_request_id}"),
+        ).fetchone()
+        if (
+            stopping is None
+            or stopping[0] is not None
+            or str(stopping[1]) != "stopping"
+            or str(stopping[2]) != event_json
+        ):
+            raise TaskStopError("Task Stop cleanup stopping event does not match")
+        _parse_timestamp(stopping[3], "Stop barrier time")
+
+        if settings_hash is not None:
+            settings_row = connection.execute(
+                """
+                SELECT request_id, management_repository, parent_issue_number,
+                       task_owner_host
+                FROM task_settings_v2 WHERE task_settings_hash = ?
+                """,
+                (settings_hash,),
+            ).fetchone()
+            expected = (
+                request_id,
+                management_repository,
+                parent_issue_number,
+                owner_host,
+            )
+            if settings_row is None or tuple(settings_row) != expected:
+                raise TaskStopError("Task Stop cleanup settings authority changed")
+
+        return StopCleanupAuthority(
+            stop_request_id=stop_request_id,
+            request_id=request_id,
+            task_settings_hash=settings_hash,
+            management_repository=management_repository,
+            parent_issue_number=parent_issue_number,
+            task_owner_host=owner_host,
+            state=state,
+        )
 
     @staticmethod
     def _require_source_event(
@@ -809,6 +1219,857 @@ class TaskStopService:
         )
 
 
+class TaskStopReconciler:
+    """Converge one durable Stop to local and remote read-back truth."""
+
+    def __init__(
+        self,
+        database: TaskDatabase,
+        *,
+        issue_client: StopIssueClient,
+        pull_request_reader: StopPullRequestReader,
+        kanban_stopper: StopKanbanController | None,
+        process_stopper: StopProcessController | None,
+        current_host: str,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        if not isinstance(database, TaskDatabase):
+            raise TaskStopError("database must be TaskDatabase")
+        if not callable(clock):
+            raise TaskStopError("clock must be callable")
+        self._database = database
+        self._service = TaskStopService(database)
+        self._issues = issue_client
+        self._pull_requests = pull_request_reader
+        self._kanban = kanban_stopper
+        self._processes = process_stopper
+        self._current_host = _canonical_uuid(current_host, "current_host")
+        self._clock = clock
+
+    def list_reconcilable(self) -> tuple[str, ...]:
+        """List only unfinished requests; completed Stops are never replayed."""
+
+        try:
+            with self._database.read() as connection:
+                return tuple(
+                    str(row[0])
+                    for row in connection.execute(
+                        """
+                        SELECT stop_request_id FROM task_stop_requests
+                        WHERE state IN ('stopping', 'cleanup_incomplete')
+                        ORDER BY requested_at, stop_request_id
+                        """
+                    )
+                )
+        except (TaskDatabaseError, sqlite3.Error) as error:
+            raise TaskStopError("unfinished Task Stops could not be listed") from error
+
+    def reconcile(self, stop_request_id: str) -> StopReconcileReceipt:
+        """Run idempotent local cleanup, remote readback, and final commit."""
+
+        stop_request_id = _canonical_uuid(stop_request_id, "stop_request_id")
+        current = self._read_receipt(stop_request_id)
+        if current.state == "completed":
+            return current
+        authority = self._service.guard_stop_cleanup(stop_request_id)
+        if authority.task_owner_host != self._current_host:
+            raise TaskStopOwnerHostMismatch(authority.task_owner_host)
+        evidence: dict[str, object] = {}
+        try:
+            projects = self._load_projects(authority)
+            local = self._stop_local(authority, projects)
+            evidence["artifacts"] = self._artifact_details(projects)
+            evidence["local_cleanup"] = local
+
+            # A human may merge while cleanup is running. Two equal consecutive
+            # remote snapshots are required before the terminal DB transaction.
+            previous_signature: str | None = None
+            outcome: _StopOutcome | None = None
+            issue: TaskStopIssueState | None = None
+            for _attempt in range(3):
+                authority = self._service.guard_stop_cleanup(stop_request_id)
+                outcome = self._read_remote_projects(projects)
+                signature = self._outcome_signature(outcome)
+                issue = self._resolve_issue(authority)
+                issue = self._cleanup_issue(authority, outcome, issue)
+                verified = self._read_remote_projects(projects)
+                verified_signature = self._outcome_signature(verified)
+                if verified_signature == signature and (
+                    previous_signature is None or previous_signature == signature
+                ):
+                    outcome = verified
+                    break
+                previous_signature = verified_signature
+                outcome = verified
+            else:
+                raise TaskStopError("remote Project state did not stabilize")
+            assert outcome is not None
+            self._verify_issue_result(outcome, issue)
+            evidence["remote_projects"] = self._remote_details(outcome.projects)
+            evidence["parent_issue"] = self._issue_details(issue)
+            evidence["cleanup"] = {
+                "state": "completed",
+                "terminal_event": outcome.event_type,
+                "result": outcome.result,
+            }
+            return self._complete(authority, outcome, evidence)
+        except Exception as error:
+            # KeyboardInterrupt/SystemExit are BaseException and deliberately
+            # escape. A process crash leaves the durable barrier for the daemon.
+            return self._mark_cleanup_incomplete(
+                stop_request_id,
+                error,
+                evidence=evidence,
+            )
+
+    def _read_receipt(self, stop_request_id: str) -> StopReconcileReceipt:
+        try:
+            with self._database.read() as connection:
+                row = connection.execute(
+                    """
+                    SELECT request_id, state, result, details_json
+                    FROM task_stop_requests WHERE stop_request_id = ?
+                    """,
+                    (stop_request_id,),
+                ).fetchone()
+        except (TaskDatabaseError, sqlite3.Error) as error:
+            raise TaskStopError("Task Stop receipt could not be read") from error
+        if row is None:
+            raise TaskStopError("Task Stop request does not exist")
+        details_json = str(row[3])
+        _canonical_json(details_json, "Task Stop details")
+        return StopReconcileReceipt(
+            stop_request_id=stop_request_id,
+            request_id=_canonical_uuid(str(row[0]), "request_id"),
+            state=str(row[1]),
+            result=None if row[2] is None else str(row[2]),
+            details_json=details_json,
+        )
+
+    def _load_projects(
+        self,
+        authority: StopCleanupAuthority,
+    ) -> tuple[StopProjectArtifact, ...]:
+        try:
+            with self._database.read() as connection:
+                request_row = connection.execute(
+                    "SELECT request_json FROM task_requests WHERE request_id = ?",
+                    (authority.request_id,),
+                ).fetchone()
+                project_rows = connection.execute(
+                    """
+                    SELECT project_id, task_settings_hash, project_json, state,
+                           branch_name, worktree_path, pr_url, head_commit,
+                           merge_commit
+                    FROM task_projects WHERE request_id = ? ORDER BY project_id
+                    """,
+                    (authority.request_id,),
+                ).fetchall()
+        except (TaskDatabaseError, sqlite3.Error) as error:
+            raise TaskStopError(
+                "Task Stop Project registry could not be read"
+            ) from error
+        if request_row is None:
+            raise TaskStopError("Task Stop request disappeared")
+        try:
+            request = TaskRequestV2.from_json(str(request_row[0]))
+        except TaskSettingsV2Error as error:
+            raise TaskStopError("Task Stop request JSON is invalid") from error
+        if request.request_id != authority.request_id:
+            raise TaskStopError("Task Stop request identity changed")
+        raw_projects = {
+            str(item["project_id"]): _json(item)
+            for item in json.loads(request.to_json())["projects"]
+        }
+        if len(project_rows) != len(raw_projects):
+            raise TaskStopError("Task Stop Project registry count changed")
+        artifacts: list[StopProjectArtifact] = []
+        for row in project_rows:
+            project_id = _require_hash(str(row[0]), "project_id")
+            project = next(
+                (item for item in request.projects if item.project_id == project_id),
+                None,
+            )
+            if (
+                project is None
+                or str(row[2]) != raw_projects.get(project_id)
+                or row[1] != authority.task_settings_hash
+            ):
+                raise TaskStopError("Task Stop Project registry changed")
+            if project.host_id != authority.task_owner_host:
+                raise TaskStopError("Task Stop Project owner host changed")
+            artifacts.append(
+                StopProjectArtifact(
+                    project_id=project_id,
+                    repository=project.repository,
+                    state=str(row[3]),
+                    branch_name=_optional_text(row[4], "branch_name"),
+                    worktree_path=_optional_text(row[5], "worktree_path"),
+                    pr_url=_optional_text(row[6], "pr_url"),
+                    head_commit=_optional_hash(row[7], "head_commit"),
+                    local_merge_commit=_optional_hash(row[8], "merge_commit"),
+                )
+            )
+        return tuple(artifacts)
+
+    def _stop_local(
+        self,
+        authority: StopCleanupAuthority,
+        projects: tuple[StopProjectArtifact, ...],
+    ) -> dict[str, object]:
+        if authority.task_settings_hash is None:
+            if self._active_runtime_identities(authority, projects):
+                raise TaskStopError("prepared Task has an unexpected active worker")
+            return {
+                "archived_card_ids": [],
+                "preserved_card_ids": [],
+                "processes": [],
+            }
+        if self._kanban is None:
+            raise TaskStopError("active Task Stop requires a Kanban controller")
+        archived: set[str] = set()
+        preserved: set[str] = set()
+        process_details: dict[str, dict[str, object]] = {}
+        for _attempt in range(3):
+            authority = self._service.guard_stop_cleanup(authority.stop_request_id)
+            runtime_identities = self._active_runtime_identities(authority, projects)
+            cards = self._kanban.archive(authority)
+            if cards.request_id != authority.request_id or not cards.all_cards_terminal:
+                raise TaskStopError("Task Stop cards did not become terminal")
+            archived.update(cards.archived_card_ids)
+            preserved.update(cards.preserved_card_ids)
+            identities = {
+                identity.to_json(): identity for identity in runtime_identities
+            }
+            for captured in cards.captured_runs:
+                if captured.process_identity is not None:
+                    captured_json = captured.process_identity.to_json()
+                    if captured_json not in identities:
+                        raise TaskStopError(
+                            "Kanban worker has no durable Task runtime identity"
+                        )
+            if identities and self._processes is None:
+                raise TaskStopError("active Task Stop requires a process controller")
+            for identity_json, identity in sorted(identities.items()):
+                if (
+                    identity.binding.request_id != authority.request_id
+                    or identity.binding.task_settings_hash
+                    != authority.task_settings_hash
+                    or identity.binding.host_id != authority.task_owner_host
+                    or identity.binding.project_id
+                    not in {project.project_id for project in projects}
+                ):
+                    raise TaskStopError("recorded process is outside Stop authority")
+                assert self._processes is not None
+                result = self._processes.stop(
+                    identity,
+                    current_host=self._current_host,
+                )
+                if not isinstance(result, ProcessStopResult) or not result.completed:
+                    raise TaskStopError("recorded process descendants remain alive")
+                process_details[identity_json] = {
+                    "already_stopped": result.already_stopped,
+                    "forced": result.forced,
+                    "run_id": identity.binding.run_id,
+                    "term_sent": result.term_sent,
+                }
+                self._mark_runtime_stopped(authority, identity)
+            if not self._active_runtime_identities(authority, projects):
+                return {
+                    "archived_card_ids": sorted(archived),
+                    "preserved_card_ids": sorted(preserved),
+                    "processes": [
+                        process_details[key] for key in sorted(process_details)
+                    ],
+                }
+        raise TaskStopError("late worker remained after the Stop barrier")
+
+    def _active_runtime_identities(
+        self,
+        authority: StopCleanupAuthority,
+        projects: tuple[StopProjectArtifact, ...],
+    ) -> tuple[ProcessIdentity, ...]:
+        if authority.task_settings_hash is None:
+            return ()
+        try:
+            with self._database.read() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT run_id, project_id, host_id, worker_task_id,
+                           process_identity_json
+                    FROM task_runtime_runs
+                    WHERE request_id = ? AND task_settings_hash = ?
+                      AND state IN ('starting', 'running', 'stopping')
+                    ORDER BY run_id
+                    """,
+                    (authority.request_id, authority.task_settings_hash),
+                ).fetchall()
+        except (TaskDatabaseError, sqlite3.Error) as error:
+            raise TaskStopError(
+                "Task Stop runtime registry could not be read"
+            ) from error
+        project_ids = {project.project_id for project in projects}
+        identities: list[ProcessIdentity] = []
+        for row in rows:
+            try:
+                identity = ProcessIdentity.from_json(str(row[4]))
+            except (TypeError, ValueError) as error:
+                raise TaskStopError(
+                    "Task Stop runtime process identity is invalid"
+                ) from error
+            expected = (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+                str(row[3]),
+            )
+            actual = (
+                identity.binding.run_id,
+                identity.binding.project_id,
+                identity.binding.host_id,
+                identity.binding.task_id,
+            )
+            if (
+                actual != expected
+                or identity.binding.request_id != authority.request_id
+                or identity.binding.task_settings_hash != authority.task_settings_hash
+                or identity.binding.project_id not in project_ids
+            ):
+                raise TaskStopError("Task Stop runtime process binding changed")
+            identities.append(identity)
+        return tuple(identities)
+
+    def _mark_runtime_stopped(
+        self,
+        authority: StopCleanupAuthority,
+        identity: ProcessIdentity,
+    ) -> None:
+        occurred_at = _timestamp(self._clock())
+        try:
+            with self._database.transaction() as connection:
+                self._service._guard_stop_cleanup_on_connection(
+                    connection,
+                    authority.stop_request_id,
+                )
+                connection.execute(
+                    """
+                    UPDATE task_runtime_runs
+                    SET state = 'stopped', ended_at = ?
+                    WHERE run_id = ? AND request_id = ?
+                      AND task_settings_hash = ? AND project_id = ?
+                      AND host_id = ?
+                      AND state IN ('starting', 'running', 'stopping')
+                    """,
+                    (
+                        occurred_at,
+                        identity.binding.run_id,
+                        authority.request_id,
+                        authority.task_settings_hash,
+                        identity.binding.project_id,
+                        authority.task_owner_host,
+                    ),
+                )
+        except (TaskDatabaseError, sqlite3.Error) as error:
+            raise TaskStopError(
+                "Task Stop runtime result could not be stored"
+            ) from error
+
+    def _read_remote_projects(
+        self,
+        projects: tuple[StopProjectArtifact, ...],
+    ) -> _StopOutcome:
+        remote: list[_RemoteProject] = []
+        for project in projects:
+            state: PullRequestWriteState | None = None
+            if project.pr_url is None and project.branch_name is not None:
+                try:
+                    state = self._pull_requests.find_pr_write_state(
+                        project.repository,
+                        project.branch_name,
+                    )
+                except (GateError, RuntimeError, KeyError) as error:
+                    raise TaskStopError(
+                        "Project PR recovery readback failed"
+                    ) from error
+                if state is not None:
+                    project = replace(project, pr_url=state.pr_url)
+            if project.pr_url is None and state is None:
+                if project.local_merge_commit is not None or project.state == "merged":
+                    raise TaskStopError("merged Project has no remote PR identity")
+                remote.append(
+                    _RemoteProject(
+                        artifact=project,
+                        is_open=None,
+                        is_merged=False,
+                        head_commit=None,
+                        merged_commit=None,
+                        merged_base_commit=None,
+                        merged_head_commit=None,
+                    )
+                )
+                continue
+            if state is None:
+                assert project.pr_url is not None
+                try:
+                    state = self._pull_requests.get_pr_write_state(project.pr_url)
+                except (GateError, RuntimeError, KeyError) as error:
+                    raise TaskStopError("Project PR remote readback failed") from error
+            if not isinstance(state, PullRequestWriteState):
+                raise TaskStopError("Project PR remote readback type is invalid")
+            assert project.pr_url is not None
+            repository, _number = parse_pull_request_url(project.pr_url)
+            if (
+                repository != project.repository
+                or state.pr_url != project.pr_url
+                or state.repository != repository
+            ):
+                raise TaskStopError("Project PR remote identity changed")
+            _git_hash(state.base_commit, "remote base commit")
+            _git_hash(state.head_commit, "remote head commit")
+            if state.is_merged:
+                if state.is_open:
+                    raise TaskStopError("remote PR is both open and merged")
+                _git_hash(state.merged_commit, "remote merge commit")
+                _git_hash(state.merged_base_commit, "remote merged base")
+                _git_hash(state.merged_head_commit, "remote merged head")
+            elif any(
+                value is not None
+                for value in (
+                    state.merged_commit,
+                    state.merged_base_commit,
+                    state.merged_head_commit,
+                )
+            ):
+                raise TaskStopError("unmerged remote PR contains merge commits")
+            if not state.is_merged and (
+                project.local_merge_commit is not None or project.state == "merged"
+            ):
+                raise TaskStopError("local merged Project conflicts with remote PR")
+            if (
+                state.is_merged
+                and project.local_merge_commit is not None
+                and project.local_merge_commit != state.merged_commit
+            ):
+                raise TaskStopError("local and remote merge commits differ")
+            remote.append(
+                _RemoteProject(
+                    artifact=project,
+                    is_open=state.is_open,
+                    is_merged=state.is_merged,
+                    head_commit=state.head_commit,
+                    merged_commit=state.merged_commit,
+                    merged_base_commit=state.merged_base_commit,
+                    merged_head_commit=state.merged_head_commit,
+                )
+            )
+        merged_count = sum(project.is_merged for project in remote)
+        if merged_count == 0:
+            event_type, result = "cancelled", "cancelled"
+        elif merged_count == len(remote):
+            event_type, result = "merged", "completed_before_stop"
+        else:
+            event_type, result = (
+                "partially_merged",
+                "completed_with_partial_merge",
+            )
+        return _StopOutcome(event_type, result, tuple(remote))
+
+    def _resolve_issue(
+        self,
+        authority: StopCleanupAuthority,
+    ) -> TaskStopIssueState | None:
+        try:
+            if authority.parent_issue_number is None:
+                issue = self._issues.find_stop_issue(
+                    authority.management_repository,
+                    authority.request_id,
+                )
+            else:
+                issue = self._issues.get_stop_issue(
+                    authority.management_repository,
+                    authority.parent_issue_number,
+                )
+        except (GateError, RuntimeError) as error:
+            raise TaskStopError("parent Issue remote readback failed") from error
+        if issue is None:
+            if authority.parent_issue_number is not None:
+                raise TaskStopError("bound parent Issue is missing")
+            return None
+        if authority.parent_issue_number is not None and (
+            issue.number != authority.parent_issue_number
+        ):
+            raise TaskStopError("parent Issue number changed")
+        try:
+            marker = read_task_marker_v2(issue.body)
+        except TaskServiceError as error:
+            raise TaskStopError("parent Issue Task marker is invalid") from error
+        if marker.get("request_id") != authority.request_id:
+            raise TaskStopError("parent Issue belongs to another Task")
+        return issue
+
+    def _cleanup_issue(
+        self,
+        authority: StopCleanupAuthority,
+        outcome: _StopOutcome,
+        issue: TaskStopIssueState | None,
+    ) -> TaskStopIssueState | None:
+        if issue is None:
+            return None
+        target = (
+            "forge:needs-decision"
+            if outcome.result == "completed_with_partial_merge"
+            else None
+        )
+        authority = self._service.guard_stop_cleanup(authority.stop_request_id)
+        authority.require(StopCleanupOperation.RECONCILE_FORGE_STATUS)
+        try:
+            issue = self._issues.reconcile_stop_status(
+                authority.management_repository,
+                issue.number,
+                target=target,
+            )
+        except (GateError, RuntimeError) as error:
+            raise TaskStopError("parent Issue status cleanup failed") from error
+        body = self._comment_body(authority, outcome)
+        authority = self._service.guard_stop_cleanup(authority.stop_request_id)
+        authority.require(StopCleanupOperation.COMMENT_RESULT)
+        try:
+            self._issues.ensure_stop_comment(
+                authority.management_repository,
+                issue.number,
+                authority.stop_request_id,
+                body,
+            )
+        except (GateError, RuntimeError) as error:
+            raise TaskStopError("parent Issue Stop comment failed") from error
+        if outcome.result == "cancelled":
+            authority = self._service.guard_stop_cleanup(authority.stop_request_id)
+            authority.require(StopCleanupOperation.CLOSE_NOT_PLANNED)
+            try:
+                issue = self._issues.close_stop_issue_not_planned(
+                    authority.management_repository,
+                    issue.number,
+                )
+            except (GateError, RuntimeError) as error:
+                raise TaskStopError("parent Issue close failed") from error
+        return issue
+
+    @staticmethod
+    def _verify_issue_result(
+        outcome: _StopOutcome,
+        issue: TaskStopIssueState | None,
+    ) -> None:
+        if issue is None:
+            return
+        forge_labels = tuple(
+            label for label in issue.labels if label in FORGE_STATUS_LABELS
+        )
+        if outcome.result == "cancelled":
+            if (
+                issue.state != "closed"
+                or issue.state_reason != "not_planned"
+                or forge_labels
+            ):
+                raise TaskStopError("cancelled parent Issue readback is incomplete")
+        elif outcome.result == "completed_with_partial_merge":
+            if issue.state != "open" or forge_labels != ("forge:needs-decision",):
+                raise TaskStopError("partial parent Issue readback is incomplete")
+        elif forge_labels:
+            raise TaskStopError(
+                "completed parent Issue still has an active Forge status"
+            )
+
+    def _complete(
+        self,
+        authority: StopCleanupAuthority,
+        outcome: _StopOutcome,
+        evidence: dict[str, object],
+    ) -> StopReconcileReceipt:
+        completed_at = _timestamp(self._clock())
+        details_json = _json(
+            {
+                "management_repository": authority.management_repository,
+                "parent_issue_number": authority.parent_issue_number,
+                "request_ids": self._request_ids(authority.stop_request_id),
+                **evidence,
+            }
+        )
+        try:
+            with self._database.transaction() as connection:
+                authority = self._service._guard_stop_cleanup_on_connection(
+                    connection,
+                    authority.stop_request_id,
+                )
+                active_run = connection.execute(
+                    """
+                    SELECT 1 FROM task_runtime_runs
+                    WHERE request_id = ?
+                      AND state IN ('starting', 'running', 'stopping')
+                    LIMIT 1
+                    """,
+                    (authority.request_id,),
+                ).fetchone()
+                if active_run is not None:
+                    raise TaskStopError("late worker crossed the Stop barrier")
+                for project in outcome.projects:
+                    target_state = "merged" if project.is_merged else "cancelled"
+                    target_merge = project.merged_commit if project.is_merged else None
+                    updated = connection.execute(
+                        """
+                        UPDATE task_projects
+                        SET state = ?, pr_url = ?, head_commit = ?,
+                            merge_commit = ?, updated_at = ?
+                        WHERE request_id = ? AND project_id = ?
+                          AND task_settings_hash IS ?
+                        """,
+                        (
+                            target_state,
+                            project.artifact.pr_url,
+                            project.head_commit,
+                            target_merge,
+                            completed_at,
+                            authority.request_id,
+                            project.artifact.project_id,
+                            authority.task_settings_hash,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise TaskStopError("Task Stop Project finalization changed")
+                terminal_payload = {
+                    "merged_projects": [
+                        {
+                            "merge_commit": project.merged_commit,
+                            "pr_url": project.artifact.pr_url,
+                            "project_id": project.artifact.project_id,
+                        }
+                        for project in outcome.projects
+                        if project.is_merged
+                    ],
+                    "remaining_projects": [
+                        {
+                            "pr_url": project.artifact.pr_url,
+                            "project_id": project.artifact.project_id,
+                        }
+                        for project in outcome.projects
+                        if not project.is_merged
+                    ],
+                    "stop_request_id": authority.stop_request_id,
+                }
+                requested_at = connection.execute(
+                    "SELECT requested_at FROM task_stop_requests WHERE stop_request_id = ?",
+                    (authority.stop_request_id,),
+                ).fetchone()
+                if requested_at is None:
+                    raise TaskStopError("Task Stop request disappeared")
+                event_time = str(requested_at[0])
+                _parse_timestamp(event_time, "Task Stop request time")
+                existing_terminal = connection.execute(
+                    """
+                    SELECT event_type, event_key, event_json
+                    FROM task_events
+                    WHERE request_id = ? AND event_type IN (
+                        'cancelled', 'expired', 'merged', 'replaced',
+                        'partially_merged'
+                    )
+                    ORDER BY event_id
+                    """,
+                    (authority.request_id,),
+                ).fetchall()
+                expected_key = f"{outcome.event_type}:{authority.stop_request_id}"
+                if existing_terminal and [tuple(row) for row in existing_terminal] != [
+                    (outcome.event_type, expected_key, _json(terminal_payload))
+                ]:
+                    raise TaskStopError("Task terminal event won before Stop cleanup")
+                self._service._ensure_task_event(
+                    connection,
+                    request_id=authority.request_id,
+                    settings_hash=authority.task_settings_hash,
+                    event_type=outcome.event_type,
+                    event_key=expected_key,
+                    payload=terminal_payload,
+                    occurred_at=event_time,
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE task_stop_requests
+                    SET state = 'completed', result = ?, details_json = ?,
+                        updated_at = ?, completed_at = ?
+                    WHERE stop_request_id = ?
+                      AND state IN ('stopping', 'cleanup_incomplete')
+                      AND result IS NULL AND completed_at IS NULL
+                    """,
+                    (
+                        outcome.result,
+                        details_json,
+                        completed_at,
+                        completed_at,
+                        authority.stop_request_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise TaskStopError("Task Stop completion did not commit")
+        except TaskStopError:
+            raise
+        except (TaskDatabaseError, sqlite3.Error) as error:
+            raise TaskStopError("Task Stop completion transaction failed") from error
+        return self._read_receipt(authority.stop_request_id)
+
+    def _mark_cleanup_incomplete(
+        self,
+        stop_request_id: str,
+        error: Exception,
+        *,
+        evidence: dict[str, object],
+    ) -> StopReconcileReceipt:
+        current = self._read_receipt(stop_request_id)
+        if current.state == "completed":
+            return current
+        base = dict(current.details)
+        base.update(evidence)
+        base["cleanup"] = {
+            "error": {
+                "message": str(error)[:1000] or error.__class__.__name__,
+                "type": error.__class__.__name__,
+            },
+            "state": "incomplete",
+        }
+        occurred_at = _timestamp(self._clock())
+        try:
+            with self._database.transaction() as connection:
+                row = connection.execute(
+                    "SELECT state FROM task_stop_requests WHERE stop_request_id = ?",
+                    (stop_request_id,),
+                ).fetchone()
+                if row is None:
+                    raise TaskStopError("Task Stop request disappeared")
+                if row[0] != "completed":
+                    self._service._guard_stop_cleanup_on_connection(
+                        connection,
+                        stop_request_id,
+                    )
+                    updated = connection.execute(
+                        """
+                        UPDATE task_stop_requests
+                        SET state = 'cleanup_incomplete', details_json = ?, updated_at = ?
+                        WHERE stop_request_id = ?
+                          AND state IN ('stopping', 'cleanup_incomplete')
+                          AND result IS NULL AND completed_at IS NULL
+                        """,
+                        (_json(base), occurred_at, stop_request_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise TaskStopError("Task Stop incomplete state did not commit")
+        except TaskStopError:
+            raise
+        except (TaskDatabaseError, sqlite3.Error) as database_error:
+            raise TaskStopError(
+                "Task Stop incomplete state could not be stored"
+            ) from database_error
+        return self._read_receipt(stop_request_id)
+
+    def _request_ids(self, stop_request_id: str) -> list[str]:
+        with self._database.read() as connection:
+            row = connection.execute(
+                "SELECT details_json FROM task_stop_requests WHERE stop_request_id = ?",
+                (stop_request_id,),
+            ).fetchone()
+        if row is None:
+            raise TaskStopError("Task Stop request disappeared")
+        details = _canonical_json(str(row[0]), "Task Stop details")
+        if not isinstance(details, dict) or not isinstance(
+            details.get("request_ids"), list
+        ):
+            raise TaskStopError("Task Stop details request_ids are invalid")
+        return list(details["request_ids"])
+
+    @staticmethod
+    def _outcome_signature(outcome: _StopOutcome) -> str:
+        return _json(
+            {
+                "event_type": outcome.event_type,
+                "projects": TaskStopReconciler._remote_details(outcome.projects),
+                "result": outcome.result,
+            }
+        )
+
+    @staticmethod
+    def _artifact_details(
+        projects: tuple[StopProjectArtifact, ...],
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "branch_name": project.branch_name,
+                "project_id": project.project_id,
+                "pr_url": project.pr_url,
+                "repository": project.repository,
+                "worktree_path": project.worktree_path,
+            }
+            for project in projects
+        ]
+
+    @staticmethod
+    def _remote_details(
+        projects: tuple[_RemoteProject, ...],
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "is_merged": project.is_merged,
+                "is_open": project.is_open,
+                "head_commit": project.head_commit,
+                "merged_base_commit": project.merged_base_commit,
+                "merged_commit": project.merged_commit,
+                "merged_head_commit": project.merged_head_commit,
+                "pr_url": project.artifact.pr_url,
+                "project_id": project.artifact.project_id,
+                "repository": project.artifact.repository,
+            }
+            for project in projects
+        ]
+
+    @staticmethod
+    def _issue_details(issue: TaskStopIssueState | None) -> object:
+        if issue is None:
+            return None
+        return {
+            "labels": list(issue.labels),
+            "number": issue.number,
+            "state": issue.state,
+            "state_reason": issue.state_reason,
+        }
+
+    @staticmethod
+    def _comment_body(
+        authority: StopCleanupAuthority,
+        outcome: _StopOutcome,
+    ) -> str:
+        merged = [
+            f"- `{project.artifact.repository}`: `{project.merged_commit}`"
+            for project in outcome.projects
+            if project.is_merged
+        ]
+        remaining = [
+            f"- `{project.artifact.repository}`: "
+            f"{f'[{project.artifact.pr_url}]({project.artifact.pr_url})' if project.artifact.pr_url else 'PR 없음'}"
+            for project in outcome.projects
+            if not project.is_merged
+        ]
+        lines = [
+            "## Task Stop result",
+            "",
+            f"- result: `{outcome.result}`",
+            f"- stop_request_id: `{authority.stop_request_id}`",
+            "",
+            "### Merged Projects",
+            *(merged or ["- 없음"]),
+            "",
+            "### Remaining Projects",
+            *(remaining or ["- 없음"]),
+            "",
+            f"<!-- forge-task-stop:{authority.stop_request_id} -->",
+        ]
+        return "\n".join(lines)
+
+
 def _related_request_ids(
     rows: dict[str, tuple[object, ...]],
     seeds: set[str],
@@ -911,6 +2172,33 @@ def _require_hash(value: object, field_name: str) -> str:
     return value
 
 
+def _git_hash(value: object, field_name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 40
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise TaskStopError(f"{field_name} must be a lowercase Git commit")
+    return value
+
+
+def _optional_hash(value: object, field_name: str) -> str | None:
+    return None if value is None else _git_hash(value, field_name)
+
+
+def _optional_text(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\x00" in value
+    ):
+        raise TaskStopError(f"{field_name} is invalid")
+    return value
+
+
 def _timestamp(value: datetime) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise TaskStopError("Stop time must include a timezone")
@@ -950,11 +2238,22 @@ def _canonical_json(value: str, label: str) -> object:
 
 
 __all__ = [
+    "StopCleanupAuthority",
+    "StopCleanupOperation",
+    "StopIssueClient",
+    "HermesKanbanStopper",
+    "ProcessTreeStopper",
+    "StopKanbanController",
+    "StopProcessController",
+    "StopProjectArtifact",
+    "StopPullRequestReader",
+    "StopReconcileReceipt",
     "StopReceipt",
     "StoppableTask",
     "TaskStopAccessDenied",
     "TaskStopError",
     "TaskStopOwnerHostMismatch",
     "TaskStopService",
+    "TaskStopReconciler",
     "TaskStopUnsupported",
 ]

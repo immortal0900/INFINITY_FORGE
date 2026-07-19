@@ -16,6 +16,7 @@ from forge.ops.task_revisions import TaskRevisionService
 from forge.ops.task_settings import TaskContent
 from forge.ops.task_settings_v2 import TaskRequestV2, TaskSettingsV2
 from forge.ops.task_stop import (
+    StopCleanupOperation,
     TaskStopAccessDenied,
     TaskStopError,
     TaskStopOwnerHostMismatch,
@@ -792,3 +793,97 @@ def test_orphan_stop_barrier_fails_closed_instead_of_looking_active(
 
     with pytest.raises(TaskStopError, match="Stop barrier.*durable"):
         TaskStopService(database).get_stoppable(_context())
+
+
+def test_guard_stop_cleanup_grants_only_the_exact_stop_cleanup_operations(
+    tmp_path: Path,
+) -> None:
+    database = TaskDatabase(tmp_path / "tasks.sqlite3")
+    request = _request(tmp_path)
+    settings = _seed_request(database, request, issue_number=21, active=True)
+    assert settings is not None
+    _grant(database, request.request_id)
+    context = _context(source_event_id="cli:cleanup-authority")
+    source = SurfaceEventStore(database, clock=lambda: NOW).receive(
+        context,
+        "forge stop #21",
+        at=NOW,
+    )
+    receipt = TaskStopService(database).request_stop(
+        request.request_id,
+        context,
+        payload_hash=source.payload_hash,
+        at=NOW,
+    )
+
+    authority = TaskStopService(database).guard_stop_cleanup(receipt.stop_request_id)
+
+    assert authority.stop_request_id == receipt.stop_request_id
+    assert authority.request_id == request.request_id
+    assert authority.task_settings_hash == settings.task_settings_hash
+    assert authority.management_repository == "management/forge"
+    assert authority.parent_issue_number == 21
+    assert authority.task_owner_host == OWNER_HOST
+    assert authority.allowed_operations == frozenset(
+        {
+            StopCleanupOperation.RECONCILE_FORGE_STATUS,
+            StopCleanupOperation.COMMENT_RESULT,
+            StopCleanupOperation.CLOSE_NOT_PLANNED,
+        }
+    )
+    with pytest.raises(TaskStopError, match="not allowed"):
+        authority.require("delete_pull_request")
+
+
+def test_guard_stop_cleanup_rejects_a_tampered_or_completed_stop(
+    tmp_path: Path,
+) -> None:
+    database = TaskDatabase(tmp_path / "tasks.sqlite3")
+    request = _request(tmp_path)
+    _seed_request(database, request, issue_number=21, active=True)
+    _grant(database, request.request_id)
+    context = _context(source_event_id="cli:cleanup-tamper")
+    source = SurfaceEventStore(database, clock=lambda: NOW).receive(
+        context,
+        "forge stop #21",
+        at=NOW,
+    )
+    receipt = TaskStopService(database).request_stop(
+        request.request_id,
+        context,
+        payload_hash=source.payload_hash,
+        at=NOW,
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE task_stop_requests SET details_json = '{}' WHERE stop_request_id = ?",
+            (receipt.stop_request_id,),
+        )
+
+    with pytest.raises(TaskStopError, match="details"):
+        TaskStopService(database).guard_stop_cleanup(receipt.stop_request_id)
+
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE task_stop_requests
+            SET details_json = ?, state = 'completed', result = 'cancelled',
+                completed_at = ?, updated_at = ?
+            WHERE stop_request_id = ?
+            """,
+            (
+                _json(
+                    {
+                        "management_repository": "management/forge",
+                        "parent_issue_number": 21,
+                        "request_ids": [request.request_id],
+                    }
+                ),
+                NOW_TEXT,
+                NOW_TEXT,
+                receipt.stop_request_id,
+            ),
+        )
+
+    with pytest.raises(TaskStopError, match="completed"):
+        TaskStopService(database).guard_stop_cleanup(receipt.stop_request_id)
