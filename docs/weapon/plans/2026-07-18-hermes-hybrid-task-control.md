@@ -299,20 +299,20 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
   access/surface_events/runtime_runs
 - Provides: shared `BEGIN IMMEDIATE` transaction facade
 
-- [ ] **Step 1: seeded v1 DB readback·hash 불변 test 작성**
+- [x] **Step 1: seeded v1 DB readback·hash 불변 test 작성**
 
   migration 전후 v1 row, lifecycle event, public get API byte-equivalent 결과를 확인한다.
 
-- [ ] **Step 2: DDL 중간 실패 rollback·재실행 RED test 작성**
+- [x] **Step 2: DDL 중간 실패 rollback·재실행 RED test 작성**
 
   object exact set 검증, permissions 0600/owner ACL, SQLite quick_check와 backup restore도 포함한다.
 
-- [ ] **Step 3: one-transaction migration 구현**
+- [x] **Step 3: one-transaction migration 구현**
 
   `RISK(breaking)`과 `RISK(data-loss)` 주석을 migration/restore 경계에 둔다. v1
   `task_outbox.py`는 손대지 않는다.
 
-- [ ] **Step 4: test 통과 후 commit**
+- [x] **Step 4: test 통과 후 commit**
 
   Run: `python -m pytest tests/ops/test_task_database.py tests/ops/test_task_settings.py tests/ops/test_task_outbox.py -q`
 
@@ -333,19 +333,19 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 - Idempotency key: `request_id + project_id + step`
 - Produces: central parent plus Project execution registry
 
-- [ ] **Step 1: Management repo와 Project repo가 다른 RED test 작성**
+- [x] **Step 1: Management repo와 Project repo가 다른 RED test 작성**
 
   partial Issue/card failure 뒤 재시도해 parent·Project item이 중복되지 않는 test를 포함한다.
 
-- [ ] **Step 2: immutable marker와 mutable progress section을 분리**
+- [x] **Step 2: immutable marker와 mutable progress section을 분리**
 
   v1 전체 body 검증은 보존하고 v2만 Forge-owned progress section을 exact 재생성한다.
 
-- [ ] **Step 3: bound와 active settings를 원자 활성화**
+- [x] **Step 3: bound와 active settings를 원자 활성화**
 
   모든 Project root card ID가 bind된 뒤에만 `dispatch_ready`를 한 transaction으로 연다.
 
-- [ ] **Step 4: 관련 test와 commit**
+- [x] **Step 4: 관련 test와 commit**
 
   Run: `python -m pytest tests/ops/test_task_service.py tests/ops/test_task_issue_adapter.py -q`
 
