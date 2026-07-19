@@ -32,6 +32,17 @@ class TaskWorktree:
     base_commit: str
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkspaceIdentity:
+    """Live filesystem and Git identity held across one inspection."""
+
+    root_device: int
+    root_inode: int
+    common_git_dir: Path
+    common_device: int
+    common_inode: int
+
+
 def task_branch_name(request_id: str, project_id: str) -> str:
     """Return the stable branch name owned by one request and Project."""
 
@@ -75,6 +86,20 @@ class TaskWorktreeManager:
         self._require_path_within_root(destination)
         return destination
 
+    def plan(self, request_id: str, project: TaskProject) -> TaskWorktree:
+        """Calculate one deterministic binding without reading or changing Git."""
+
+        if not isinstance(project, TaskProject):
+            raise TypeError("project must be a TaskProject")
+        branch = task_branch_name(request_id, project.project_id)
+        if _BRANCH.fullmatch(branch) is None:
+            raise TaskWorktreeError("task branch name is invalid")
+        return TaskWorktree(
+            branch,
+            self.worktree_path(request_id, project),
+            project.base_commit,
+        )
+
     def prepare(
         self,
         request_id: str,
@@ -92,6 +117,7 @@ class TaskWorktreeManager:
         workspace = Path(project.workspace)
         if planned.worktree_path.is_dir():
             return planned
+        workspace_identity = self._require_workspace(workspace)
         before = self._git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
         try:
             existing_branch = self._branch_commit(workspace, planned.branch_name)
@@ -122,6 +148,8 @@ class TaskWorktreeManager:
                 expected_head_commit or project.base_commit,
             )
         finally:
+            if self._require_workspace(workspace) != workspace_identity:
+                raise TaskWorktreeError("Project workspace identity changed")
             after = self._git(
                 workspace,
                 "status",
@@ -143,6 +171,39 @@ class TaskWorktreeManager:
 
         if not isinstance(project, TaskProject):
             raise TypeError("project must be a TaskProject")
+        return self._inspect(
+            request_id,
+            project,
+            expected_head_commit=(
+                project.base_commit
+                if expected_head_commit is None
+                else expected_head_commit
+            ),
+        )
+
+    def inspect_active(
+        self,
+        request_id: str,
+        project: TaskProject,
+    ) -> TaskWorktree:
+        """Validate an active worker binding without requiring a safe-point HEAD."""
+
+        planned = self._inspect(request_id, project, expected_head_commit=None)
+        if not planned.worktree_path.is_dir():
+            raise TaskWorktreeError("active task worktree is not registered")
+        return planned
+
+    def _inspect(
+        self,
+        request_id: str,
+        project: TaskProject,
+        *,
+        expected_head_commit: str | None,
+    ) -> TaskWorktree:
+        """Perform the shared read-only Project and worktree validation."""
+
+        if not isinstance(project, TaskProject):
+            raise TypeError("project must be a TaskProject")
         workspace = Path(project.workspace)
         if expected_head_commit is not None and (
             not isinstance(expected_head_commit, str)
@@ -151,13 +212,12 @@ class TaskWorktreeManager:
             raise TaskWorktreeError(
                 "expected_head_commit must be a lowercase 40-hex commit"
             )
-        branch = task_branch_name(request_id, project.project_id)
-        if _BRANCH.fullmatch(branch) is None:
-            raise TaskWorktreeError("task branch name is invalid")
-        destination = self.worktree_path(request_id, project)
+        planned = self.plan(request_id, project)
+        branch = planned.branch_name
+        destination = planned.worktree_path
+        workspace_identity = self._require_workspace(workspace)
         before = self._git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
         try:
-            self._require_workspace(workspace)
             self._require_remote(project, workspace)
             self._require_confirmed_base(project, workspace)
             legacy_branch = (
@@ -199,9 +259,11 @@ class TaskWorktreeManager:
                     destination,
                     branch,
                     project.base_commit,
-                    expected_head_commit or project.base_commit,
+                    expected_head_commit,
                 )
         finally:
+            if self._require_workspace(workspace) != workspace_identity:
+                raise TaskWorktreeError("Project workspace identity changed")
             after = self._git(
                 workspace,
                 "status",
@@ -210,14 +272,43 @@ class TaskWorktreeManager:
             )
             if after != before:
                 raise TaskWorktreeError("original checkout state changed")
-        return TaskWorktree(branch, destination, project.base_commit)
+        return planned
 
-    def _require_workspace(self, workspace: Path) -> None:
+    def _require_workspace(self, workspace: Path) -> _WorkspaceIdentity:
+        lexical_root = workspace.absolute()
+        try:
+            resolved_root = workspace.resolve(strict=True)
+            root_stat = workspace.stat()
+        except (OSError, RuntimeError) as error:
+            raise TaskWorktreeError("Project workspace does not exist") from error
+        if lexical_root != resolved_root:
+            raise TaskWorktreeError(
+                "Project workspace path is a link or reparse point"
+            )
         if not workspace.is_dir():
             raise TaskWorktreeError("Project workspace does not exist")
-        root = Path(self._git(workspace, "rev-parse", "--show-toplevel")).resolve()
-        if root != workspace.resolve():
+        git_root = Path(
+            self._git(workspace, "rev-parse", "--show-toplevel")
+        ).absolute()
+        if git_root != lexical_root or git_root.resolve() != resolved_root:
             raise TaskWorktreeError("Project workspace is not the exact Git root")
+        common_git_dir = self._git_path(
+            workspace,
+            self._git(workspace, "rev-parse", "--git-common-dir"),
+        )
+        try:
+            common_stat = common_git_dir.stat()
+        except OSError as error:
+            raise TaskWorktreeError("Project Git identity does not exist") from error
+        if not common_git_dir.is_dir():
+            raise TaskWorktreeError("Project Git identity is not a directory")
+        return _WorkspaceIdentity(
+            root_device=root_stat.st_dev,
+            root_inode=root_stat.st_ino,
+            common_git_dir=common_git_dir,
+            common_device=common_stat.st_dev,
+            common_inode=common_stat.st_ino,
+        )
 
     def _require_remote(self, project: TaskProject, workspace: Path) -> None:
         try:
@@ -284,7 +375,7 @@ class TaskWorktreeManager:
         destination: Path,
         branch: str,
         base_commit: str,
-        expected_head_commit: str,
+        expected_head_commit: str | None,
     ) -> None:
         self._require_path_within_root(destination)
         if not destination.is_dir():
@@ -313,11 +404,19 @@ class TaskWorktreeManager:
             root != destination.resolve()
             or current_branch != branch
             or ancestry.returncode != 0
-            or current_commit != expected_head_commit
-            or status
+            or (
+                expected_head_commit is not None
+                and (
+                    current_commit != expected_head_commit
+                    or bool(status)
+                )
+            )
             or source_common != destination_common
         ):
-            if current_commit != expected_head_commit:
+            if (
+                expected_head_commit is not None
+                and current_commit != expected_head_commit
+            ):
                 raise TaskWorktreeError(
                     "task worktree does not match recorded result HEAD"
                 )

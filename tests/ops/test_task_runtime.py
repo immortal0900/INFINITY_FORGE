@@ -37,6 +37,7 @@ from forge.ops.task_service import (
 )
 from forge.ops.task_settings import TaskContent, TaskSettingsStore
 from forge.ops.task_settings_v2 import TaskRequestV2, TaskSettingsV2
+from forge.ops.task_worktrees import task_branch_name
 
 
 NOW = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
@@ -1386,6 +1387,66 @@ def test_v2_worker_dry_run_does_not_create_worktrees_or_update_registry(
             (request.request_id,),
         ).fetchall()
     assert rows == [("ready", None, None), ("ready", None, None)]
+
+
+def test_v2_worker_preflights_every_project_before_any_persistent_write(
+    tmp_path: Path,
+) -> None:
+    settings_db, hermes_db, request, _settings = _activated_v2(tmp_path)
+    ordered = sorted(request.projects, key=lambda project: project.project_id)
+    rejected_workspace = Path(ordered[1].workspace)
+    worktree_root = tmp_path / "worktrees"
+    calls: list[tuple[str, ...]] = []
+    database_before = settings_db.read_bytes()
+
+    def remote_repository(workspace: Path, _remote: str) -> str:
+        if workspace == rejected_workspace:
+            return "other/wrong-project"
+        return next(
+            project.repository
+            for project in request.projects
+            if Path(project.workspace) == workspace
+        )
+
+    with pytest.raises(GateError, match="remote repository"):
+        run_project_task_flow_worker(
+            settings_db=settings_db,
+            hermes_db=hermes_db,
+            hermes_path="hermes",
+            github=FakeGitHub(),
+            worktree_root=worktree_root,
+            create_card=lambda argv: calls.append(tuple(argv)),
+            remote_repository=remote_repository,
+        )
+
+    assert calls == []
+    assert not worktree_root.exists()
+    assert settings_db.read_bytes() == database_before
+    for suffix in ("-journal", "-wal", "-shm"):
+        assert not Path(f"{settings_db}{suffix}").exists()
+    with sqlite3.connect(settings_db) as connection:
+        rows = connection.execute(
+            """
+            SELECT state, branch_name, worktree_path FROM task_projects
+            WHERE request_id = ? ORDER BY project_id
+            """,
+            (request.request_id,),
+        ).fetchall()
+    assert rows == [("ready", None, None), ("ready", None, None)]
+    for project in request.projects:
+        branch_readback = subprocess.run(
+            [
+                "git",
+                "-C",
+                project.workspace,
+                "show-ref",
+                "--verify",
+                f"refs/heads/{task_branch_name(request.request_id, project.project_id)}",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        assert branch_readback.returncode != 0
 
 
 def test_v2_worker_rejects_missing_project_row_before_any_write(

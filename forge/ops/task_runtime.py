@@ -1676,6 +1676,14 @@ class _ProjectReplay:
     expected_head_commit: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ProjectPreflight:
+    original: ProjectRuntimeSnapshot
+    snapshot: ProjectRuntimeSnapshot
+    worktree: TaskWorktree
+    replay: _ProjectReplay
+
+
 def _project_cards(
     cards: Sequence[HermesTaskCard],
     snapshot: ProjectRuntimeSnapshot,
@@ -1894,23 +1902,38 @@ def _read_project_worktree(
     request_id: str,
     project: TaskProject,
     *,
-    expected_head_commit: str,
+    expected_head_commit: str | None,
     dry_run: bool,
 ) -> TaskWorktree:
     """Translate worktree identity failures into the worker gate contract."""
 
     try:
         if dry_run:
+            if expected_head_commit is None:
+                return manager.inspect_active(request_id, project)
             return manager.inspect(
                 request_id,
                 project,
                 expected_head_commit=expected_head_commit,
             )
+        if expected_head_commit is None:
+            raise GateError("active Project worktree has no safe-point HEAD")
         return manager.prepare(
             request_id,
             project,
             expected_head_commit=expected_head_commit,
         )
+    except TaskWorktreeError as error:
+        raise GateError(str(error)) from error
+
+
+def _plan_project_worktree(
+    manager: TaskWorktreeManager,
+    request_id: str,
+    project: TaskProject,
+) -> TaskWorktree:
+    try:
+        return manager.plan(request_id, project)
     except TaskWorktreeError as error:
         raise GateError(str(error)) from error
 
@@ -1928,8 +1951,8 @@ def run_project_task_flow_worker(
 ) -> tuple[ProjectWorkerReport, ...]:
     """Prepare and dispatch every active v2 Project independently."""
 
-    registry = _ProjectRuntimeRegistry(settings_db, read_only=dry_run)
-    snapshots = registry.list_active()
+    read_registry = _ProjectRuntimeRegistry(settings_db, read_only=True)
+    snapshots = read_registry.list_active()
     store = HermesStore(_require_existing_file(hermes_db, "Hermes"))
     all_cards = store.list_project_runtime_cards()
     create = create_card or HermesCreateCommand(hermes_path)
@@ -1937,82 +1960,101 @@ def run_project_task_flow_worker(
         worktree_root,
         remote_repository=remote_repository,
     )
-    pending: list[
-        tuple[
-            ProjectRuntimeSnapshot,
-            TaskWorktree | None,
-            _ProjectReplay,
-            ProjectTaskCardSpec | None,
-        ]
-    ] = []
-    reports: list[ProjectWorkerReport] = []
+
+    preflight: list[_ProjectPreflight] = []
     for original in snapshots:
+        planned = _plan_project_worktree(
+            worktrees,
+            original.request.request_id,
+            original.project,
+        )
+        branch_missing = original.branch_name is None
+        worktree_missing = original.worktree_path is None
+        if branch_missing != worktree_missing:
+            raise GateError("Project worktree registry binding is incomplete")
         snapshot = original
-        prepared: TaskWorktree | None = None
-        if snapshot.branch_name is None or snapshot.worktree_path is None:
-            if dry_run:
-                with registry.guard(original):
-                    prepared = _read_project_worktree(
-                        worktrees,
-                        snapshot.request.request_id,
-                        snapshot.project,
-                        expected_head_commit=snapshot.project.base_commit,
-                        dry_run=True,
-                    )
-                    snapshot = replace(
-                        snapshot,
-                        branch_name=prepared.branch_name,
-                        worktree_path=prepared.worktree_path.as_posix(),
-                    )
-            else:
-                with registry.guard(snapshot) as connection:
-                    prepared = _read_project_worktree(
-                        worktrees,
-                        snapshot.request.request_id,
-                        snapshot.project,
-                        expected_head_commit=snapshot.project.base_commit,
-                        dry_run=False,
-                    )
-                    snapshot = registry.record_worktree(connection, snapshot, prepared)
+        if branch_missing:
+            snapshot = replace(
+                original,
+                branch_name=planned.branch_name,
+                worktree_path=planned.worktree_path.as_posix(),
+            )
+        elif (
+            original.branch_name != planned.branch_name
+            or original.worktree_path != planned.worktree_path.as_posix()
+        ):
+            raise GateError("Project worktree registry is not deterministic")
         project_cards = _project_cards(all_cards, snapshot)
-        with registry.guard(original if dry_run else snapshot):
+        with read_registry.guard(original):
             replay = _replay_project_flow(
                 snapshot,
                 project_cards,
                 hermes=store,
                 github=github,
             )
-        spec = replay.next_spec
-        if replay.expected_head_commit is not None:
-            if dry_run:
-                with registry.guard(original):
+        if replay.expected_head_commit is None and branch_missing:
+            raise GateError("active Project card has no recorded worktree")
+        with read_registry.guard(original):
+            verified = _read_project_worktree(
+                worktrees,
+                snapshot.request.request_id,
+                snapshot.project,
+                expected_head_commit=replay.expected_head_commit,
+                dry_run=True,
+            )
+        if verified != planned:
+            raise GateError("Project worktree readback changed")
+        preflight.append(_ProjectPreflight(original, snapshot, verified, replay))
+
+    registry: _ProjectRuntimeRegistry | None = None
+    materialized: list[
+        tuple[ProjectRuntimeSnapshot, TaskWorktree, _ProjectReplay]
+    ] = []
+    if dry_run:
+        materialized.extend(
+            (item.snapshot, item.worktree, item.replay) for item in preflight
+        )
+    else:
+        registry = _ProjectRuntimeRegistry(settings_db)
+        if registry.list_active() != snapshots:
+            raise GateError("v2 Project registry changed after preflight")
+        for item in preflight:
+            snapshot = item.snapshot
+            prepared = item.worktree
+            if item.original.branch_name is None:
+                with registry.guard(item.original) as connection:
                     prepared = _read_project_worktree(
                         worktrees,
                         snapshot.request.request_id,
                         snapshot.project,
-                        expected_head_commit=replay.expected_head_commit,
-                        dry_run=True,
-                    )
-            else:
-                with registry.guard(snapshot):
-                    prepared = _read_project_worktree(
-                        worktrees,
-                        snapshot.request.request_id,
-                        snapshot.project,
-                        expected_head_commit=replay.expected_head_commit,
+                        expected_head_commit=item.replay.expected_head_commit,
                         dry_run=False,
                     )
-            if (
-                prepared.branch_name != snapshot.branch_name
-                or prepared.worktree_path.as_posix() != snapshot.worktree_path
-            ):
-                raise GateError("Project worktree readback changed")
-        pending.append((snapshot, prepared, replay, spec))
+                    if prepared != item.worktree:
+                        raise GateError("Project worktree changed after preflight")
+                    snapshot = registry.record_worktree(
+                        connection,
+                        item.original,
+                        prepared,
+                    )
+            else:
+                with registry.guard(item.original):
+                    prepared = _read_project_worktree(
+                        worktrees,
+                        snapshot.request.request_id,
+                        snapshot.project,
+                        expected_head_commit=item.replay.expected_head_commit,
+                        dry_run=True,
+                    )
+                if prepared != item.worktree:
+                    raise GateError("Project worktree changed after preflight")
+            materialized.append((snapshot, prepared, item.replay))
 
-    for snapshot, prepared, replay, spec in pending:
+    reports: list[ProjectWorkerReport] = []
+    for snapshot, prepared, replay in materialized:
+        spec = replay.next_spec
         if spec is not None and not dry_run:
-            if prepared is None:
-                raise GateError("Project card cannot start without exact worktree HEAD")
+            assert registry is not None
             with registry.guard(snapshot):
                 if not store.has_project_idempotency_key(spec.idempotency_key):
                     create(build_project_create_argv(spec, prepared.worktree_path))

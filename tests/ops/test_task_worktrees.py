@@ -144,6 +144,47 @@ def test_prepare_rejects_wrong_remote_repository_before_git_write(
     assert not manager.worktree_path(REQUEST_ID, project).exists()
 
 
+def test_prepare_rejects_workspace_replaced_by_directory_link(
+    tmp_path: Path,
+) -> None:
+    _remote, workspace, project = _project_repo(tmp_path)
+    moved_workspace = tmp_path / "moved-workspace"
+    workspace.rename(moved_workspace)
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(workspace), str(moved_workspace)],
+            check=True,
+            capture_output=True,
+        )
+    else:
+        os.symlink(moved_workspace, workspace, target_is_directory=True)
+    manager = _manager(tmp_path)
+    branch = task_branch_name(REQUEST_ID, project.project_id)
+    try:
+        with pytest.raises(TaskWorktreeError, match="workspace.*link"):
+            manager.prepare(REQUEST_ID, project)
+
+        assert not manager.worktree_path(REQUEST_ID, project).exists()
+        branch_readback = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(moved_workspace),
+                "show-ref",
+                "--verify",
+                f"refs/heads/{branch}",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        assert branch_readback.returncode != 0
+    finally:
+        if os.name == "nt":
+            os.rmdir(workspace)
+        else:
+            workspace.unlink()
+
+
 def test_inspect_validates_without_creating_branch_or_worktree(tmp_path: Path) -> None:
     _remote, workspace, project = _project_repo(tmp_path)
     manager = _manager(tmp_path)
