@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,7 +13,11 @@ import pytest
 
 import forge.ops.task_runtime as task_runtime_module
 from forge.ops.github import PullRequestWriteState
-from forge.ops.contracts import parse_build_result, source_result_hash
+from forge.ops.contracts import (
+    parse_build_result,
+    parse_review_result,
+    source_result_hash,
+)
 from forge.ops.github_merge import BranchRefreshResult
 from forge.ops.hermes import GateError, task_card_key
 from forge.ops.task_options import MergeMode, TaskFlow
@@ -37,6 +42,7 @@ from forge.ops.task_service import (
 )
 from forge.ops.task_settings import TaskContent, TaskSettingsStore
 from forge.ops.task_settings_v2 import TaskRequestV2, TaskSettingsV2
+from forge.ops.task_flow import TaskStep
 from forge.ops.task_worktrees import task_branch_name
 
 
@@ -1515,6 +1521,29 @@ def _insert_v2_root(
     )
 
 
+def _insert_v2_call(
+    hermes_db: Path,
+    call: tuple[str, ...],
+    *,
+    task_id: str,
+    parent_id: str | None,
+    summary: dict[str, object] | None,
+    run_id: int = 1,
+) -> None:
+    _insert_card(
+        hermes_db,
+        task_id=task_id,
+        title=call[2],
+        body=call[call.index("--body") + 1],
+        assignee=call[call.index("--assignee") + 1],
+        key=call[call.index("--idempotency-key") + 1],
+        skill=call[call.index("--skill") + 1],
+        parent_id=parent_id,
+        summary=summary,
+        run_id=run_id,
+    )
+
+
 def _v2_build_summary(
     settings: TaskSettingsV2,
     project: TaskProject,
@@ -1550,6 +1579,268 @@ def _commit_v2_worktree(
     _git_v2(worktree, "add", filename)
     _git_v2(worktree, "commit", "-m", f"add {filename}")
     return _git_v2(worktree, "rev-parse", "HEAD")
+
+
+def _v2_call_for(
+    calls: list[tuple[str, ...]],
+    project: TaskProject,
+    step: str,
+) -> tuple[str, ...]:
+    return next(
+        call
+        for call in calls
+        if (
+            (body := json.loads(call[call.index("--body") + 1]))["project"]
+            ["project_id"]
+            == project.project_id
+            and body["step"] == step
+        )
+    )
+
+
+def _v2_pr(project: TaskProject, head_commit: str) -> PullRequestWriteState:
+    return PullRequestWriteState(
+        pr_url=f"https://github.com/{project.repository}/pull/7",
+        repository=project.repository,
+        pr_number=7,
+        base_commit=project.base_commit,
+        base_ref=project.base_branch,
+        head_commit=head_commit,
+        is_open=True,
+        is_merged=False,
+        merged_commit=None,
+        merged_base_commit=None,
+        merged_head_commit=None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _V2FixReplay:
+    settings_db: Path
+    hermes_db: Path
+    project: TaskProject
+    worker_kwargs: dict[str, object]
+    github: FakeGitHub
+    fix_call: tuple[str, ...]
+    fix_task_id: str
+    fixed_head: str
+
+
+def _prepare_v2_fix_replay(tmp_path: Path) -> _V2FixReplay:
+    settings_db, hermes_db, request, settings = _activated_v2(
+        tmp_path,
+        flow=TaskFlow.BUILD_REVIEW,
+    )
+    worker_kwargs: dict[str, object] = {
+        "settings_db": settings_db,
+        "hermes_db": hermes_db,
+        "hermes_path": "hermes",
+        "worktree_root": tmp_path / "worktrees",
+        "remote_repository": (
+            lambda workspace, _remote: f"example/{workspace.name}"
+        ),
+    }
+    initial_calls: list[tuple[str, ...]] = []
+    run_project_task_flow_worker(
+        **worker_kwargs,
+        github=FakeGitHub(),
+        create_card=lambda argv: initial_calls.append(tuple(argv)),
+    )
+    project = request.projects[0]
+    root_call = _v2_call_for(initial_calls, project, TaskStep.BUILD.value)
+    built_head = _commit_v2_worktree(root_call, filename="initial-build.txt")
+    build_summary = _v2_build_summary(
+        settings,
+        project,
+        built_commit=built_head,
+    )
+    root_task_id = "fix-chain-root"
+    for index, call in enumerate(initial_calls, start=1):
+        body = json.loads(call[call.index("--body") + 1])
+        is_target = body["project"]["project_id"] == project.project_id
+        _insert_v2_call(
+            hermes_db,
+            call,
+            task_id=(root_task_id if is_target else f"waiting-root-{index}"),
+            parent_id=None,
+            summary=(build_summary if is_target else None),
+            run_id=101,
+        )
+
+    github = FakeGitHub()
+    pr_url = str(build_summary["pr_url"])
+    github.prs[pr_url] = _v2_pr(project, built_head)
+    review_calls: list[tuple[str, ...]] = []
+    run_project_task_flow_worker(
+        **worker_kwargs,
+        github=github,
+        create_card=lambda argv: review_calls.append(tuple(argv)),
+    )
+    review_call = _v2_call_for(review_calls, project, TaskStep.REVIEW.value)
+    fix_notes = "Handle the missing edge case."
+    review_summary: dict[str, object] = {
+        "format_version": "forge-review-result/v1",
+        "task_settings_hash": settings.task_settings_hash,
+        "result": "changes_needed",
+        "source_result_hash": source_result_hash(parse_build_result(build_summary)),
+        "pr_url": pr_url,
+        "reviewed_commit": built_head,
+        "change_check": {
+            "confirmed_work": ["initial-build.txt"],
+            "problems": [fix_notes],
+        },
+        "requirements_check": {
+            "completed": [],
+            "missing": ["Each Project gets its own PR."],
+        },
+        "fix_notes": fix_notes,
+    }
+    review_task_id = "fix-chain-review"
+    _insert_v2_call(
+        hermes_db,
+        review_call,
+        task_id=review_task_id,
+        parent_id=root_task_id,
+        summary=review_summary,
+        run_id=102,
+    )
+
+    fix_calls: list[tuple[str, ...]] = []
+    run_project_task_flow_worker(
+        **worker_kwargs,
+        github=github,
+        create_card=lambda argv: fix_calls.append(tuple(argv)),
+    )
+    fix_call = _v2_call_for(fix_calls, project, TaskStep.FIX.value)
+    fixed_head = _commit_v2_worktree(fix_call, filename="fixed.txt")
+    fix_task_id = "fix-chain-fix"
+    proof = {
+        "format_version": "forge-step-proof/v1",
+        "tested_commit": fixed_head,
+        "pr_url": pr_url,
+        "fix_notes": fix_notes,
+        "source_result_hash": source_result_hash(
+            parse_review_result(review_summary)
+        ),
+        "source_run_id": 102,
+        "source_task_id": review_task_id,
+        "task_settings_hash": settings.task_settings_hash,
+    }
+    _insert_v2_call(
+        hermes_db,
+        fix_call,
+        task_id=fix_task_id,
+        parent_id=review_task_id,
+        summary=proof,
+        run_id=103,
+    )
+    github.prs[pr_url] = _v2_pr(project, fixed_head)
+    return _V2FixReplay(
+        settings_db=settings_db,
+        hermes_db=hermes_db,
+        project=project,
+        worker_kwargs=worker_kwargs,
+        github=github,
+        fix_call=fix_call,
+        fix_task_id=fix_task_id,
+        fixed_head=fixed_head,
+    )
+
+
+def test_v2_fix_proof_replay_creates_new_build_at_proven_head(
+    tmp_path: Path,
+) -> None:
+    chain = _prepare_v2_fix_replay(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    run_project_task_flow_worker(
+        **chain.worker_kwargs,
+        github=chain.github,
+        create_card=lambda argv: calls.append(tuple(argv)),
+    )
+
+    new_build = _v2_call_for(calls, chain.project, TaskStep.BUILD.value)
+    body = json.loads(new_build[new_build.index("--body") + 1])
+    assert new_build[new_build.index("--parent") + 1] == chain.fix_task_id
+    assert body["head_commit"] == chain.fixed_head
+    assert body["source_task_id"] == chain.fix_task_id
+    assert (
+        Path(new_build[new_build.index("--workspace") + 1].removeprefix("dir:"))
+        == Path(chain.fix_call[chain.fix_call.index("--workspace") + 1].removeprefix("dir:"))
+    )
+
+
+def test_v2_fix_build_response_loss_replays_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    chain = _prepare_v2_fix_replay(tmp_path)
+    lost_keys: list[str] = []
+
+    def create_then_lose_response(argv: Sequence[str]) -> None:
+        call = tuple(argv)
+        key = call[call.index("--idempotency-key") + 1]
+        lost_keys.append(key)
+        _insert_v2_call(
+            chain.hermes_db,
+            call,
+            task_id="response-lost-build",
+            parent_id=chain.fix_task_id,
+            summary=None,
+        )
+        raise RuntimeError("simulated Hermes response loss")
+
+    with pytest.raises(RuntimeError, match="response loss"):
+        run_project_task_flow_worker(
+            **chain.worker_kwargs,
+            github=chain.github,
+            create_card=create_then_lose_response,
+        )
+
+    replay_writes: list[tuple[str, ...]] = []
+    reports = run_project_task_flow_worker(
+        **chain.worker_kwargs,
+        github=chain.github,
+        create_card=lambda argv: replay_writes.append(tuple(argv)),
+    )
+
+    assert len(lost_keys) == 1
+    assert replay_writes == []
+    target = next(
+        report
+        for report in reports
+        if report.project_id == chain.project.project_id
+    )
+    assert target.status == "waiting"
+    with sqlite3.connect(chain.hermes_db) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
+            (lost_keys[0],),
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_v2_fix_replay_rejects_unrecorded_descendant_before_any_write(
+    tmp_path: Path,
+) -> None:
+    chain = _prepare_v2_fix_replay(tmp_path)
+    injected_head = _commit_v2_worktree(
+        chain.fix_call,
+        filename="unrecorded-after-fix.txt",
+    )
+    pr_url = f"https://github.com/{chain.project.repository}/pull/7"
+    chain.github.prs[pr_url] = _v2_pr(chain.project, injected_head)
+    database_before = chain.settings_db.read_bytes()
+    writes: list[tuple[str, ...]] = []
+
+    with pytest.raises(GateError, match="pull request"):
+        run_project_task_flow_worker(
+            **chain.worker_kwargs,
+            github=chain.github,
+            create_card=lambda argv: writes.append(tuple(argv)),
+        )
+
+    assert writes == []
+    assert chain.settings_db.read_bytes() == database_before
 
 
 def test_v2_worker_rejects_pull_request_for_another_project_repository(

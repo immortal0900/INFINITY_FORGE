@@ -1735,6 +1735,21 @@ def _require_project_pr(
     return pr
 
 
+def _require_project_pr_at_state(
+    snapshot: ProjectRuntimeSnapshot,
+    github: TaskRuntimeGitHub,
+    state: TaskFlowState,
+) -> None:
+    """Require the live PR to match the final replayed safe point exactly."""
+
+    pr = _require_project_pr(snapshot, github, state.pr_url)
+    if (
+        pr.base_commit != state.current_base_commit
+        or pr.head_commit != state.current_commit
+    ):
+        raise GateError("Project pull request changed during flow replay")
+
+
 def _replay_project_flow(
     snapshot: ProjectRuntimeSnapshot,
     cards: Sequence[HermesTaskCard],
@@ -1782,21 +1797,22 @@ def _replay_project_flow(
         result = parse_task_result(TaskStep.BUILD.value, runs[0].summary)
     except Exception as error:
         raise GateError("Hermes Project Build result is invalid") from error
-    pr = _require_project_pr(snapshot, github, result.pr_url)
-    if (
-        pr.base_commit != result.built_base_commit
-        or pr.head_commit != result.built_commit
-    ):
-        raise GateError("pull request evidence does not match Project settings")
+    _require_project_pr(snapshot, github, result.pr_url)
+    if result.built_base_commit != snapshot.project.base_commit:
+        raise GateError("Project Build base does not match confirmed base")
     state = start_task_flow(
         snapshot.settings.task_flow,
         task_settings_hash=snapshot.settings.task_settings_hash,
-        pr_url=pr.pr_url,
-        current_base_commit=pr.base_commit,
-        current_commit=pr.head_commit,
+        pr_url=result.pr_url,
+        current_base_commit=result.built_base_commit,
+        current_commit=result.built_commit,
     )
     try:
-        state = record_task_result(state, result, current_commit=pr.head_commit)
+        state = record_task_result(
+            state,
+            result,
+            current_commit=result.built_commit,
+        )
     except Exception as error:
         raise GateError("Project Build result does not match current settings") from error
     last_task_id = root.task_id
@@ -1821,6 +1837,7 @@ def _replay_project_flow(
         if not children:
             if len(visited) != len(cards):
                 raise GateError("Hermes Project flow contains an orphan card")
+            _require_project_pr_at_state(snapshot, github, state)
             return _ProjectReplay("running", expected_spec, state.current_commit)
         if len(children) != 1:
             raise GateError("Hermes Project card has more than one child")
@@ -1848,21 +1865,22 @@ def _replay_project_flow(
         if child.status != "done":
             raise GateError("Hermes Project card has a result but is not done")
         child_run = child_runs[0]
-        current_pr = _require_project_pr(snapshot, github, state.pr_url)
-        if (
-            current_pr.base_commit != state.current_base_commit
-            or current_pr.head_commit != state.current_commit
-        ):
-            raise GateError("Project pull request changed during flow replay")
         step = next_task_action(state)
         assert step is not None
         try:
             if step is TaskStep.FIX:
                 proof = parse_step_proof(child_run.summary)
+                if (
+                    proof.source_task_id != last_run.task_id
+                    or proof.source_run_id != last_run.run_id
+                ):
+                    raise GateError(
+                        "Project Fix proof source does not match parent result"
+                    )
                 state = record_fix_proof(
                     state,
                     proof,
-                    current_commit=current_pr.head_commit,
+                    current_commit=proof.tested_commit,
                 )
                 child_source_hash = _canonical_hash(child_run.summary)
             else:
@@ -1870,10 +1888,16 @@ def _replay_project_flow(
                 child_repository, _number = parse_pull_request_url(child_result.pr_url)
                 if child_repository != snapshot.project.repository:
                     raise GateError("pull request does not match Project repository")
+                if step is TaskStep.BUILD:
+                    result_commit = child_result.built_commit
+                elif step is TaskStep.REVIEW:
+                    result_commit = child_result.reviewed_commit
+                else:
+                    result_commit = child_result.tested_commit
                 state = record_task_result(
                     state,
                     child_result,
-                    current_commit=current_pr.head_commit,
+                    current_commit=result_commit,
                 )
                 child_source_hash = source_result_hash(child_result)
         except GateError:
@@ -1886,6 +1910,7 @@ def _replay_project_flow(
         last_source_hash = child_source_hash
     if len(visited) != len(cards):
         raise GateError("Hermes Project flow has cards after terminal state")
+    _require_project_pr_at_state(snapshot, github, state)
     return _ProjectReplay(state.status.value, None, state.current_commit)
 
 
