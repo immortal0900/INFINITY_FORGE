@@ -4,6 +4,7 @@ import json
 import runpy
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -18,8 +19,10 @@ from forge.ops.github import (
 )
 from forge.ops.kanban_stop import KanbanStopResult
 from forge.ops.process_identity import (
+    PosixProcessBackend,
     ProcessBinding,
     ProcessIdentity,
+    ProcessIdentityError,
     ProcessMemberIdentity,
     ProcessScopeKind,
 )
@@ -162,6 +165,33 @@ def test_stop_comment_is_marker_idempotent_after_a_lost_write_response() -> None
     assert first == replay == body
     assert all("--paginate" in call and "--slurp" in call for call in runner.calls)
     assert all("POST" not in call for call in runner.calls)
+
+
+def test_stop_comment_updates_only_its_exact_marker_after_outcome_changes() -> None:
+    marker = f"<!-- forge-task-stop:{STOP_ID} -->"
+    old_body = f"Task Stop result: cancelled\n\n{marker}"
+    new_body = f"Task Stop result: completed_before_stop\n\n{marker}"
+    unrelated = {"id": 8, "body": "human note"}
+    runner = Runner(
+        [
+            [[unrelated, {"id": 7, "body": old_body}]],
+            {},
+            [[unrelated, {"id": 7, "body": new_body}]],
+        ]
+    )
+
+    result = GitHubTaskIssueClientV2("gh", runner=runner).ensure_stop_comment(
+        "owner/forge",
+        21,
+        STOP_ID,
+        new_body,
+    )
+
+    assert result == new_body
+    patch_calls = [call for call in runner.calls if "PATCH" in call]
+    assert len(patch_calls) == 1
+    assert "repos/owner/forge/issues/comments/7" in patch_calls[0]
+    assert all("comments/8" not in argument for call in runner.calls for argument in call)
 
 
 def test_pr_reader_recovers_exact_branch_after_ambiguous_create() -> None:
@@ -439,6 +469,21 @@ class FakePullRequests:
 
     def find_pr_write_state(self, repository: str, branch_name: str):
         return self.recovered.get((repository, branch_name))
+
+
+class SnapshotPullRequests(FakePullRequests):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshots: list[dict[str, PullRequestWriteState]] = []
+        self.read_count = 0
+
+    def get_pr_write_state(self, pr_url: str) -> PullRequestWriteState:
+        if not self.snapshots:
+            return super().get_pr_write_state(pr_url)
+        width = len(self.snapshots[0])
+        snapshot_index = min(self.read_count // width, len(self.snapshots) - 1)
+        self.read_count += 1
+        return self.snapshots[snapshot_index][pr_url]
 
 
 class FakeIssues:
@@ -719,6 +764,48 @@ def test_reconcile_partial_merge_keeps_parent_open_needs_decision(
         )
 
 
+@pytest.mark.parametrize(
+    ("project_count", "expected_result"),
+    (
+        (1, "completed_before_stop"),
+        (2, "completed_with_partial_merge"),
+    ),
+)
+def test_reconcile_stabilizes_zero_to_merged_before_any_outcome_write(
+    tmp_path: Path,
+    project_count: int,
+    expected_result: str,
+) -> None:
+    database, request, stop_id = _seed_stop(tmp_path, project_count=project_count)
+    prs = SnapshotPullRequests()
+    urls = tuple(
+        _set_pr(database, request, index, merged=False, reader=prs)
+        for index in range(project_count)
+    )
+    before = dict(prs.states)
+    after = dict(before)
+    first = before[urls[0]]
+    after[urls[0]] = replace(
+        first,
+        is_open=False,
+        is_merged=True,
+        merged_commit="f" * 40,
+        merged_base_commit=first.base_commit,
+        merged_head_commit=first.head_commit,
+    )
+    prs.snapshots = [before, after]
+    issues = FakeIssues(request)
+
+    result = _reconciler(database, issues, prs, FakeCards()).reconcile(stop_id)
+
+    assert result.state == "completed"
+    assert result.result == expected_result
+    assert issues.issue is not None and issues.issue.state == "open"
+    assert "close" not in issues.calls
+    assert len(issues.comments) == 1
+    assert expected_result in issues.comments[stop_id]
+
+
 def test_cleanup_failure_is_the_only_incomplete_state_and_retry_converges(
     tmp_path: Path,
 ) -> None:
@@ -934,6 +1021,123 @@ def test_process_tree_stopper_accepts_already_dead_and_forces_term_ignoring_work
     assert forced_result.completed is True
     assert forced_result.forced is True
     assert ignoring.signals == [False, True]
+
+
+class RecapturingPosixBackend(PosixProcessBackend):
+    def __init__(self, identity: ProcessIdentity) -> None:
+        super().__init__(boot_id="test-boot")
+        self.identity = identity
+        self.capture_calls: list[tuple[ProcessBinding, int]] = []
+
+    def capture_process_group(
+        self,
+        binding: ProcessBinding,
+        *,
+        pid: int,
+    ) -> ProcessIdentity:
+        self.capture_calls.append((binding, pid))
+        return self.identity
+
+
+def _durable_process_identity(
+    database: TaskDatabase,
+    request: TaskRequestV2,
+) -> ProcessIdentity:
+    with database.read() as connection:
+        settings_hash = str(
+            connection.execute(
+                "SELECT task_settings_hash FROM task_settings_v2 WHERE request_id = ?",
+                (request.request_id,),
+            ).fetchone()[0]
+        )
+    member = ProcessMemberIdentity(pid=901, start_identity="boot:10")
+    return ProcessIdentity(
+        binding=ProcessBinding(
+            request_id=request.request_id,
+            task_settings_hash=settings_hash,
+            project_id=request.projects[0].project_id,
+            task_id="card-1",
+            run_id="durable-run",
+            host_id=OWNER_HOST,
+        ),
+        platform="posix",
+        pid=member.pid,
+        start_identity=member.start_identity,
+        scope_kind=ProcessScopeKind.PROCESS_GROUP,
+        scope_id=str(member.pid),
+        control_group_id=None,
+        members=(member,),
+    )
+
+
+def _insert_runtime_identity(
+    database: TaskDatabase,
+    identity: ProcessIdentity,
+    *,
+    row_run_id: str,
+    raw_identity: str,
+) -> None:
+    binding = identity.binding
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO task_runtime_runs (
+                run_id, request_id, task_settings_hash, project_id, host_id,
+                worker_task_id, runtime_name, process_identity_json,
+                message_packet_hash, state, result_hash, started_at, ended_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'test', ?, ?, 'running', NULL, ?, NULL)
+            """,
+            (
+                row_run_id,
+                binding.request_id,
+                binding.task_settings_hash,
+                binding.project_id,
+                binding.host_id,
+                binding.task_id,
+                raw_identity,
+                "e" * 64,
+                NOW_TEXT,
+            ),
+        )
+
+
+@pytest.mark.parametrize("stored", ("missing", "malformed", "ambiguous"))
+def test_reconcile_identity_lookup_never_recaptures_a_live_posix_pid(
+    tmp_path: Path,
+    stored: str,
+) -> None:
+    database, request, _stop_id = _seed_stop(tmp_path)
+    identity = _durable_process_identity(database, request)
+    if stored == "malformed":
+        _insert_runtime_identity(
+            database,
+            identity,
+            row_run_id="malformed-row",
+            raw_identity="{}",
+        )
+    elif stored == "ambiguous":
+        for index in range(2):
+            _insert_runtime_identity(
+                database,
+                identity,
+                row_run_id=f"ambiguous-row-{index}",
+                raw_identity=identity.to_json(),
+            )
+    backend = RecapturingPosixBackend(identity)
+    script = runpy.run_path(
+        str(
+            Path(__file__).resolve().parents[2]
+            / "forge"
+            / "scripts"
+            / "task-stop-reconcile.py"
+        )
+    )
+    lookup = script["_stored_identity_lookup"](database, backend)
+
+    with pytest.raises(ProcessIdentityError, match="durable exact"):
+        lookup(identity.binding, identity.pid)
+
+    assert backend.capture_calls == []
 
 
 def test_reconciler_lists_only_unfinished_stop_requests(tmp_path: Path) -> None:

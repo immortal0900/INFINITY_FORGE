@@ -1282,21 +1282,26 @@ class TaskStopReconciler:
             evidence["local_cleanup"] = local
 
             # A human may merge while cleanup is running. Two equal consecutive
-            # remote snapshots are required before the terminal DB transaction.
+            # remote snapshots are required before any outcome-dependent write,
+            # then one more readback must still match before the terminal DB
+            # transaction.
             previous_signature: str | None = None
             outcome: _StopOutcome | None = None
             issue: TaskStopIssueState | None = None
-            for _attempt in range(3):
+            for _attempt in range(6):
                 authority = self._service.guard_stop_cleanup(stop_request_id)
-                outcome = self._read_remote_projects(projects)
-                signature = self._outcome_signature(outcome)
+                candidate = self._read_remote_projects(projects)
+                signature = self._outcome_signature(candidate)
+                if previous_signature != signature:
+                    previous_signature = signature
+                    outcome = candidate
+                    continue
+                outcome = candidate
                 issue = self._resolve_issue(authority)
                 issue = self._cleanup_issue(authority, outcome, issue)
                 verified = self._read_remote_projects(projects)
                 verified_signature = self._outcome_signature(verified)
-                if verified_signature == signature and (
-                    previous_signature is None or previous_signature == signature
-                ):
+                if verified_signature == signature:
                     outcome = verified
                     break
                 previous_signature = verified_signature

@@ -57,7 +57,7 @@ def _stored_identity_lookup(
         with database.read() as connection:
             rows = connection.execute(
                 """
-                SELECT process_identity_json
+                SELECT run_id, worker_task_id, process_identity_json
                 FROM task_runtime_runs
                 WHERE request_id = ? AND task_settings_hash = ?
                   AND project_id = ? AND host_id = ?
@@ -71,16 +71,33 @@ def _stored_identity_lookup(
                     binding.host_id,
                 ),
             ).fetchall()
+        matches: list[ProcessIdentity] = []
         for row in rows:
             try:
-                identity = ProcessIdentity.from_json(str(row[0]))
-            except (TypeError, ValueError):
-                continue
-            if identity.binding == binding and identity.pid == pid:
-                return identity
-        if isinstance(backend, PosixProcessBackend):
-            return backend.capture_process_group(binding, pid=pid)
-        raise ProcessIdentityError("Windows worker has no durable exact Job identity")
+                identity = ProcessIdentity.from_json(str(row[2]))
+            except (TypeError, ValueError) as error:
+                raise ProcessIdentityError(
+                    "durable exact process identity is malformed"
+                ) from error
+            stored_binding = identity.binding
+            if (
+                stored_binding.request_id != binding.request_id
+                or stored_binding.task_settings_hash != binding.task_settings_hash
+                or stored_binding.project_id != binding.project_id
+                or stored_binding.host_id != binding.host_id
+                or stored_binding.run_id != row[0]
+                or stored_binding.task_id != row[1]
+            ):
+                raise ProcessIdentityError(
+                    "durable exact process identity does not match its runtime row"
+                )
+            if stored_binding == binding and identity.pid == pid:
+                matches.append(identity)
+        if len(matches) != 1:
+            raise ProcessIdentityError(
+                "durable exact process identity is missing or ambiguous"
+            )
+        return matches[0]
 
     return lookup
 

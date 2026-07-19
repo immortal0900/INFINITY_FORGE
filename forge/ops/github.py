@@ -1415,7 +1415,7 @@ class GitHubTaskIssueClientV2:
         stop_request_id: str,
         body: str,
     ) -> str:
-        """Create one marker-bound result comment, or verify its exact replay."""
+        """Create or converge one exact marker-bound Forge result comment."""
 
         repository = self._repository(repository)
         issue_number = self._issue_number(issue_number)
@@ -1425,7 +1425,7 @@ class GitHubTaskIssueClientV2:
         if not isinstance(body, str) or body.count(marker) != 1:
             raise GateError("GitHub Stop comment marker is invalid")
 
-        def matching_comments() -> list[str]:
+        def matching_comments() -> list[tuple[int, str]]:
             payload = self._run_json(
                 (
                     "--paginate",
@@ -1438,7 +1438,7 @@ class GitHubTaskIssueClientV2:
                 not isinstance(page, list) for page in payload
             ):
                 raise GateError("GitHub paginated Stop comment response is invalid")
-            matches: list[str] = []
+            matches: list[tuple[int, str]] = []
             for page in payload:
                 for raw_comment in page:
                     if not isinstance(raw_comment, dict):
@@ -1447,16 +1447,38 @@ class GitHubTaskIssueClientV2:
                     if not isinstance(comment_body, str):
                         raise GateError("GitHub Stop comment body is invalid")
                     if marker in comment_body:
-                        matches.append(comment_body)
+                        comment_id = raw_comment.get("id")
+                        if (
+                            type(comment_id) is not int
+                            or comment_id <= 0
+                            or comment_body.count(marker) != 1
+                        ):
+                            raise GateError(
+                                "GitHub Stop comment marker binding is invalid"
+                            )
+                        matches.append((comment_id, comment_body))
             return matches
 
         matches = matching_comments()
         if len(matches) > 1:
             raise GateError("GitHub Stop comment marker is duplicated")
         if matches:
-            if matches[0] != body:
-                raise GateError("GitHub Stop comment marker body changed")
-            return matches[0]
+            comment_id, existing_body = matches[0]
+            if existing_body == body:
+                return existing_body
+            self._run_json(
+                (
+                    "-X",
+                    "PATCH",
+                    f"repos/{repository}/issues/comments/{comment_id}",
+                    "-f",
+                    f"body={body}",
+                ),
+                "Stop parent comment update",
+            )
+            if matching_comments() != [(comment_id, body)]:
+                raise GateError("GitHub Stop comment update readback does not match")
+            return body
         self._run_json(
             (
                 "-X",
@@ -1468,7 +1490,7 @@ class GitHubTaskIssueClientV2:
             "Stop parent comment create",
         )
         matches = matching_comments()
-        if matches != [body]:
+        if len(matches) != 1 or matches[0][1] != body:
             raise GateError("GitHub Stop comment readback does not match")
         return body
 
