@@ -2,5 +2,11 @@ name: infinity-forge
 version: 1.0.0
 description: "Choose Chat or a fully specified Infinity Forge Task before a Hermes user turn."
 author: "Infinity Forge"
+kind: backend
+provides_tools:
+  - list_tasks
+  - task_status
+  - send_to_task
+  - stop_task
 hooks:
   - pre_user_turn

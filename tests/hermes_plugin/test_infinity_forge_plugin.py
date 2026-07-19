@@ -21,6 +21,7 @@ from forge.ops.task_service import TaskCreationRequest
 from forge.ops.task_setup import SETUP_TIMEOUT, TaskSetupContext
 from forge.ops.task_settings import TaskContent
 from forge.ops.task_stop import StopReceipt, StoppableTask
+from forge.ops.surface_events import TrustedTurnContext, surface_event_payload_hash
 
 
 REPOSITORY = "owner/repo"
@@ -46,6 +47,15 @@ def _reset_plugin_state(monkeypatch) -> None:
     set_stop_backend = getattr(plugin, "set_task_stop_backend", None)
     if callable(set_stop_backend):
         set_stop_backend(None)
+    set_tool_service = getattr(plugin, "set_forge_tool_service", None)
+    if callable(set_tool_service):
+        set_tool_service(None)
+    set_reconcile_trigger = getattr(plugin, "set_task_stop_reconcile_trigger", None)
+    if callable(set_reconcile_trigger):
+        set_reconcile_trigger(None)
+    pending_tools = getattr(plugin, "_pending_tool_envelopes", None)
+    if pending_tools is not None:
+        pending_tools.set({})
 
 
 OWNER_HOST = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -86,8 +96,11 @@ def _v2_context(
 
 @dataclass
 class FakePluginContext:
+    profile_name: str = "default"
     hooks: dict[str, Any] = field(default_factory=dict)
     commands: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    middleware: dict[str, Any] = field(default_factory=dict)
 
     def register_hook(self, name: str, handler: Any) -> None:
         self.hooks[name] = handler
@@ -105,6 +118,12 @@ class FakePluginContext:
             "args_hint": args_hint,
         }
 
+    def register_tool(self, **values: Any) -> None:
+        self.tools[values["name"]] = values
+
+    def register_middleware(self, name: str, handler: Any) -> None:
+        self.middleware[name] = handler
+
 
 def test_registers_hook_and_slash_commands_with_hermes_signature() -> None:
     context = FakePluginContext()
@@ -113,10 +132,121 @@ def test_registers_hook_and_slash_commands_with_hermes_signature() -> None:
 
     assert context.hooks["pre_user_turn"] is plugin.before_user_turn
     assert set(context.commands) == {"task", "cancel"}
+    assert set(context.tools) == {
+        "list_tasks",
+        "task_status",
+        "send_to_task",
+        "stop_task",
+    }
+    assert {tool["toolset"] for tool in context.tools.values()} == {"forge"}
+    assert set(context.middleware) == {"tool_request", "tool_execution"}
     assert context.commands["task"]["args_hint"] == ""
     assert context.commands["cancel"]["args_hint"] == ""
     assert "session context" in context.commands["task"]["handler"]("").lower()
     assert "session context" in context.commands["cancel"]["handler"]("").lower()
+
+
+@pytest.mark.parametrize(
+    "profile_name",
+    ["builder", "reviewer", "deep_checker", "fix"],
+)
+def test_worker_profiles_expose_no_chooser_commands_or_forge_tools(
+    profile_name: str,
+) -> None:
+    context = FakePluginContext(profile_name=profile_name)
+
+    plugin.register(context)
+
+    assert context.hooks == {}
+    assert context.commands == {}
+    assert context.tools == {}
+    assert context.middleware == {}
+
+
+def test_tool_pipeline_binds_system_context_and_ignores_forged_model_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = FakePluginContext()
+    plugin.register(context)
+    trusted_context = TrustedTurnContext(
+        owner_host=OWNER_HOST,
+        subject_id="alice",
+        session_id="session-1",
+        surface="desktop",
+        source_event_id="desktop:event-1",
+        working_directory="C:/trusted",
+    )
+    raw_turn = "작업자에게 이 문장을 전달해"
+    trusted = {
+        **trusted_context.as_mapping(),
+        "source_payload": raw_turn,
+        "source_payload_hash": surface_event_payload_hash(
+            trusted_context,
+            raw_turn,
+        ),
+    }
+    seen: list[object] = []
+
+    class FakeService:
+        def send_to_task(self, envelope, **values):
+            seen.append((envelope, values))
+            return {"status": "sent", "task_number": values["task_number"]}
+
+    monkeypatch.setattr(plugin, "_forge_tool_service", FakeService())
+    request_result = context.middleware["tool_request"](
+        tool_name="send_to_task",
+        args={
+            "task_number": 21,
+            "owner_host": "forged-host",
+            "source_payload": "forged payload",
+            "source_payload_hash": "f" * 64,
+        },
+        trusted_turn_context=trusted,
+        tool_call_id="tool-1",
+    )
+
+    assert request_result["args"] == {"task_number": 21}
+    result = context.middleware["tool_execution"](
+        tool_name="send_to_task",
+        args={
+            **request_result["args"],
+            "subject_id": "reinserted-by-later-middleware",
+            "source_payload": "reinserted payload",
+        },
+        tool_call_id="tool-1",
+        next_call=lambda args: context.tools["send_to_task"]["handler"](args),
+    )
+
+    assert json.loads(result) == {"status": "sent", "task_number": 21}
+    envelope, values = seen[0]
+    assert envelope.context == trusted_context
+    assert envelope.source_payload == raw_turn
+    assert envelope.source_payload_hash == trusted["source_payload_hash"]
+    assert values == {"message_hint": None, "task_number": 21}
+
+
+def test_tool_handler_fails_closed_without_final_dispatch_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = FakePluginContext()
+    plugin.register(context)
+    calls: list[object] = []
+
+    class FakeService:
+        def list_tasks(self, envelope):
+            calls.append(envelope)
+            return {"status": "ok"}
+
+    monkeypatch.setattr(plugin, "_forge_tool_service", FakeService())
+
+    result = json.loads(
+        context.tools["list_tasks"]["handler"](
+            {"_forge_trusted_context": {"owner_host": OWNER_HOST}}
+        )
+    )
+
+    assert "error" in result
+    assert calls == []
 
 
 def test_hook_serializes_handled_replace_and_continue_results(monkeypatch) -> None:

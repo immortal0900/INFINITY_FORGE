@@ -14,6 +14,9 @@ LOCAL_DEPLOY = ROOT / "forge" / "scripts" / "deploy.ps1"
 WINDOWS_DEPLOY = ROOT / "forge" / "scripts" / "deploy-windows.ps1"
 HERMES_INSTALLER = ROOT / "forge" / "hermes_change" / "installer.py"
 HERMES_TARGETS = ROOT / "forge" / "hermes_change" / "targets.json"
+HERMES_PLUGIN_MANIFEST = (
+    ROOT / "forge" / "hermes_plugin" / "infinity_forge" / "plugin.yaml"
+)
 
 
 def test_eval_is_the_single_stable_ruleset_context() -> None:
@@ -22,6 +25,15 @@ def test_eval_is_the_single_stable_ruleset_context() -> None:
     assert re.findall(r"(?m)^  eval:\s*$", workflow) == ["  eval:"]
     assert "ruleset required status context" in workflow
     assert "private/free" not in workflow
+
+
+def test_infinity_forge_manifest_declares_only_the_four_main_task_tools() -> None:
+    manifest = HERMES_PLUGIN_MANIFEST.read_text(encoding="utf-8")
+
+    assert "kind: backend" in manifest
+    assert manifest.count("provides_tools:") == 1
+    declared = re.findall(r"(?m)^  - (list_tasks|task_status|send_to_task|stop_task)$", manifest)
+    assert declared == ["list_tasks", "task_status", "send_to_task", "stop_task"]
 
 
 def test_eval_runs_pytest_through_the_configured_python() -> None:
@@ -328,7 +340,7 @@ def test_all_deployments_use_the_exact_hermes_change_target_manifest() -> None:
     server_deploy = DEPLOY.read_text(encoding="utf-8")
     windows_deploy = WINDOWS_DEPLOY.read_text(encoding="utf-8")
 
-    assert len(targets) == 19
+    assert len(targets) == 23
     assert len(targets) == len(set(targets))
     assert all("\\" not in target and not Path(target).is_absolute() for target in targets)
     assert "_load_change_targets" in installer

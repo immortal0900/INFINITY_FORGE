@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import isfinite
@@ -118,6 +119,13 @@ from forge.ops.task_setup import (
     TurnResult,
 )
 from forge.ops.task_stop import StopReceipt, StoppableTask, TaskStopService
+from forge.ops.forge_tools import (
+    FORGE_RESERVED_ARGUMENTS,
+    FORGE_TOOL_NAMES,
+    ForgeToolError,
+    ForgeToolService,
+    TrustedToolEnvelope,
+)
 
 
 _CHOICE_LABELS = {
@@ -145,6 +153,7 @@ _HOST_ID_ENV = "INFINITY_FORGE_HOST_ID"
 _TASK_SETTINGS_DB_ENV = "INFINITY_FORGE_TASK_SETTINGS_DB"
 _GH_PATH_ENV = "INFINITY_FORGE_GH_PATH"
 _MAX_GITHUB_RESPONSE_BYTES = 1_000_000
+_MAX_BOUND_TOOL_CALLS = 256
 
 TaskServiceCallback = Callable[[TaskCreationRequest], str]
 StateKey = tuple[str, str, str]
@@ -559,6 +568,16 @@ _task_context_factory: Callable[[str | None], TaskSetupContext | None] = (
 )
 _task_service: TaskServiceCallback = _default_task_service
 _task_stop_backend: TaskStopBackend | None = None
+_forge_tool_service: ForgeToolService | None = None
+_task_stop_reconcile_trigger: Callable[[StopReceipt], None] | None = None
+_pending_tool_envelopes: ContextVar[dict[str, TrustedToolEnvelope]] = ContextVar(
+    "infinity_forge_pending_tool_envelopes",
+    default={},
+)
+_active_tool_envelope: ContextVar[TrustedToolEnvelope | None] = ContextVar(
+    "infinity_forge_active_tool_envelope",
+    default=None,
+)
 _failed_inputs: dict[StateKey, _FailedInput] = {}
 _pending_tasks: dict[StateKey, _PendingTask] = {}
 _pending_stops: dict[StateKey, _PendingStop] = {}
@@ -576,9 +595,29 @@ def set_task_service(callback: TaskServiceCallback | None) -> None:
 def set_task_stop_backend(backend: TaskStopBackend | None) -> None:
     """Install a Stop backend, or restore lazy local construction."""
 
-    global _task_stop_backend
+    global _forge_tool_service, _task_stop_backend
     with _state_lock:
         _task_stop_backend = backend
+        _forge_tool_service = None
+
+
+def set_forge_tool_service(service: ForgeToolService | None) -> None:
+    """Install a test/application service, or restore lazy local construction."""
+
+    global _forge_tool_service
+    with _state_lock:
+        _forge_tool_service = service
+
+
+def set_task_stop_reconcile_trigger(
+    callback: Callable[[StopReceipt], None] | None,
+) -> None:
+    """Inject the Task15 cleanup wake-up called after a durable Stop barrier."""
+
+    global _forge_tool_service, _task_stop_reconcile_trigger
+    with _state_lock:
+        _task_stop_reconcile_trigger = callback
+        _forge_tool_service = None
 
 
 def _stop_backend() -> TaskStopBackend:
@@ -589,6 +628,19 @@ def _stop_backend() -> TaskStopBackend:
                 _required_environment(_TASK_SETTINGS_DB_ENV)
             )
         return _task_stop_backend
+
+
+def _tool_service() -> ForgeToolService:
+    global _forge_tool_service
+    with _state_lock:
+        if _forge_tool_service is None:
+            database = TaskDatabase(_required_environment(_TASK_SETTINGS_DB_ENV))
+            _forge_tool_service = ForgeToolService(
+                database,
+                stop_backend=_stop_backend(),
+                reconcile_trigger=_task_stop_reconcile_trigger,
+            )
+        return _forge_tool_service
 
 
 def _hook_result(result: TurnResult) -> dict[str, object]:
@@ -1491,9 +1543,187 @@ def _slash_command_without_context(raw_args: str) -> str:
     )
 
 
+def _sanitize_forge_tool_args(args: object) -> dict[str, object]:
+    if not isinstance(args, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in args.items()
+        if isinstance(key, str) and key not in FORGE_RESERVED_ARGUMENTS
+    }
+
+
+def _copy_tool_args(args: object) -> dict[str, object]:
+    if not isinstance(args, Mapping):
+        return {}
+    return {str(key): value for key, value in args.items() if isinstance(key, str)}
+
+
+def _forge_tool_request_middleware(**values: object) -> dict[str, object]:
+    """Capture host-owned context by call ID without putting it in tool args."""
+
+    tool_name = values.get("tool_name")
+    if tool_name not in FORGE_TOOL_NAMES:
+        return {"args": _copy_tool_args(values.get("args"))}
+    args = _sanitize_forge_tool_args(values.get("args"))
+    tool_call_id = values.get("tool_call_id")
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return {
+            "args": args,
+            "reason": "authenticated Task call ID is unavailable",
+            "source": "infinity-forge",
+        }
+    try:
+        envelope = TrustedToolEnvelope.from_mapping(
+            values.get("trusted_turn_context")
+        )
+    except ForgeToolError:
+        envelope = None
+    with _state_lock:
+        pending = dict(_pending_tool_envelopes.get())
+        pending.pop(tool_call_id, None)
+        if envelope is not None:
+            while len(pending) >= _MAX_BOUND_TOOL_CALLS:
+                pending.pop(next(iter(pending)))
+            pending[tool_call_id] = envelope
+        _pending_tool_envelopes.set(pending)
+    return {
+        "args": args,
+        "reason": "bind authenticated Task turn outside model arguments",
+        "source": "infinity-forge",
+    }
+
+
+def _forge_tool_execution_middleware(**values: object) -> object:
+    """Bind one captured envelope only around the final registry dispatch."""
+
+    next_call = values.get("next_call")
+    if not callable(next_call):
+        raise RuntimeError("Forge tool execution middleware needs next_call")
+    tool_name = values.get("tool_name")
+    if tool_name not in FORGE_TOOL_NAMES:
+        return next_call(_copy_tool_args(values.get("args")))
+    args = _sanitize_forge_tool_args(values.get("args"))
+    tool_call_id = values.get("tool_call_id")
+    envelope: TrustedToolEnvelope | None = None
+    if isinstance(tool_call_id, str) and tool_call_id:
+        with _state_lock:
+            pending = _pending_tool_envelopes.get()
+            envelope = pending.pop(tool_call_id, None)
+    token = _active_tool_envelope.set(envelope)
+    try:
+        return next_call(args)
+    finally:
+        _active_tool_envelope.reset(token)
+
+
+def _tool_task_number(args: Mapping[str, object]) -> int | None:
+    task_number = args.get("task_number")
+    if task_number is None:
+        return None
+    if type(task_number) is not int or task_number <= 0:
+        raise ForgeToolError("task_number must be a positive integer")
+    return task_number
+
+
+def _run_forge_tool(tool_name: str, args: object) -> str:
+    """Dispatch with the final ContextVar and return canonical JSON."""
+
+    try:
+        envelope = _active_tool_envelope.get()
+        if envelope is None:
+            raise ForgeToolError("authenticated Task context is unavailable")
+        clean_args = _sanitize_forge_tool_args(args)
+        task_number = _tool_task_number(clean_args)
+        service = _tool_service()
+        if tool_name == "list_tasks":
+            result = service.list_tasks(envelope)
+        elif tool_name == "task_status":
+            result = service.task_status(envelope, task_number=task_number)
+        elif tool_name == "send_to_task":
+            message_hint = clean_args.get("message_hint")
+            if message_hint is not None and not isinstance(message_hint, str):
+                raise ForgeToolError("message_hint must be text")
+            result = service.send_to_task(
+                envelope,
+                task_number=task_number,
+                message_hint=message_hint,
+            )
+        elif tool_name == "stop_task":
+            result = service.stop_task(envelope, task_number=task_number)
+        else:  # pragma: no cover - registration is a closed tuple.
+            raise ForgeToolError("unknown Forge tool")
+        return json.dumps(result, ensure_ascii=False, sort_keys=True)
+    except ForgeToolError as error:
+        return json.dumps(
+            {"error": str(error)},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    except Exception:
+        return json.dumps(
+            {"error": "Forge tool is unavailable"},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+
+_TASK_NUMBER_PROPERTY = {
+    "description": "Optional parent Task number, for example 21.",
+    "minimum": 1,
+    "type": "integer",
+}
+_FORGE_TOOL_SCHEMAS: dict[str, dict[str, object]] = {
+    "list_tasks": {
+        "description": "List current Tasks accessible in this conversation.",
+        "parameters": {
+            "additionalProperties": False,
+            "properties": {},
+            "type": "object",
+        },
+    },
+    "task_status": {
+        "description": "Read parent and project status for an accessible Task.",
+        "parameters": {
+            "additionalProperties": False,
+            "properties": {"task_number": _TASK_NUMBER_PROPERTY},
+            "type": "object",
+        },
+    },
+    "send_to_task": {
+        "description": (
+            "Send the exact current user turn to one Task. message_hint is "
+            "optional guidance only and is never stored as the user message."
+        ),
+        "parameters": {
+            "additionalProperties": False,
+            "properties": {
+                "message_hint": {
+                    "description": "Optional short routing hint.",
+                    "type": "string",
+                },
+                "task_number": _TASK_NUMBER_PROPERTY,
+            },
+            "type": "object",
+        },
+    },
+    "stop_task": {
+        "description": "Request the durable Stop barrier for an accessible Task.",
+        "parameters": {
+            "additionalProperties": False,
+            "properties": {"task_number": _TASK_NUMBER_PROPERTY},
+            "type": "object",
+        },
+    },
+}
+
+
 def register(ctx: Any) -> None:
     """Register the generic user-turn hook and discoverable slash commands."""
 
+    profile_name = getattr(ctx, "profile_name", "default")
+    if profile_name not in {"default", "main"}:
+        return
     ctx.register_hook("pre_user_turn", before_user_turn)
     ctx.register_command(
         "task",
@@ -1505,12 +1735,28 @@ def register(ctx: Any) -> None:
         handler=_slash_command_without_context,
         description="Cancel the current Infinity Forge Task setup",
     )
+    ctx.register_middleware("tool_request", _forge_tool_request_middleware)
+    ctx.register_middleware("tool_execution", _forge_tool_execution_middleware)
+    for tool_name in FORGE_TOOL_NAMES:
+        ctx.register_tool(
+            name=tool_name,
+            toolset="forge",
+            schema=_FORGE_TOOL_SCHEMAS[tool_name],
+            handler=lambda args, _name=tool_name, **_kwargs: _run_forge_tool(
+                _name,
+                args,
+            ),
+            description=str(_FORGE_TOOL_SCHEMAS[tool_name]["description"]),
+            emoji="⚒️",
+        )
 
 
 __all__ = [
     "TaskSetup",
     "before_user_turn",
     "register",
+    "set_forge_tool_service",
     "set_task_service",
     "set_task_stop_backend",
+    "set_task_stop_reconcile_trigger",
 ]
