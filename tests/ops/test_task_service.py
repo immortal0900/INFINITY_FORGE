@@ -8,12 +8,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Barrier, BrokenBarrierError, Event, Lock
+from threading import Barrier, BrokenBarrierError, Event, Lock, Thread
 from time import sleep
 from uuid import uuid4
 
 import pytest
 
+from forge.ops.surface_events import SurfaceEventStore, TrustedTurnContext
 from forge.ops.task_database import TaskDatabase
 from forge.ops.task_options import MergeMode, TaskFlow
 from forge.ops.task_outbox import TaskOutbox
@@ -41,6 +42,7 @@ from forge.ops.task_service import (
     verify_task_issue_v2_content,
 )
 from forge.ops.task_settings_v2 import TaskRequestV2, TaskSettingsV2
+from forge.ops.task_stop import TaskStopService
 from forge.ops.task_settings import (
     TaskContent,
     TaskSettings,
@@ -364,7 +366,78 @@ def _service_v2(
     items: FakeProjectItems,
 ) -> tuple[TaskServiceV2, TaskDatabase]:
     database = TaskDatabase(tmp_path / "task-v2.db")
-    return TaskServiceV2(database, issues, items, clock=lambda: NOW), database
+    return (
+        _AuthorizedTaskServiceV2(
+            database,
+            issues,
+            items,
+            clock=lambda: NOW,
+        ),
+        database,
+    )
+
+
+def _v2_access(
+    database: TaskDatabase,
+    request: TaskRequestV2,
+    *,
+    source_event_id: str | None = None,
+    subject_id: str | None = None,
+    session_id: str | None = None,
+    surface: str = "desktop",
+    payload: str = "confirm",
+) -> tuple[TrustedTurnContext, str]:
+    context = TrustedTurnContext(
+        owner_host=request.task_owner_host,
+        subject_id=subject_id or request.confirmed_by,
+        session_id=session_id or f"session-{request.request_id}",
+        surface=surface,
+        source_event_id=source_event_id or f"desktop:create:{request.request_id}",
+        working_directory=None,
+    )
+    receipt = SurfaceEventStore(database).receive(context, payload, at=NOW)
+    return context, receipt.payload_hash
+
+
+class _AuthorizedTaskServiceV2(TaskServiceV2):
+    """Keep behavior tests terse while production keeps authorization required."""
+
+    def __init__(self, database: TaskDatabase, *args, **kwargs) -> None:
+        super().__init__(database, *args, **kwargs)
+        self._test_database = database
+
+    def create_task(
+        self,
+        request: TaskRequestV2,
+        *,
+        context: TrustedTurnContext | None = None,
+        source_payload_hash: str | None = None,
+    ) -> CreatedTaskV2:
+        if context is None and source_payload_hash is None:
+            context, source_payload_hash = _v2_access(
+                self._test_database,
+                request,
+            )
+        if context is None or source_payload_hash is None:
+            raise AssertionError("test authorization must be complete")
+        return super().create_task(
+            request,
+            context=context,
+            source_payload_hash=source_payload_hash,
+        )
+
+
+def _create_v2(
+    service: TaskServiceV2,
+    database: TaskDatabase,
+    request: TaskRequestV2,
+) -> CreatedTaskV2:
+    context, payload_hash = _v2_access(database, request)
+    return service.create_task(
+        request,
+        context=context,
+        source_payload_hash=payload_hash,
+    )
 
 
 def _event_types(database: TaskDatabase, request_id: str) -> tuple[str, ...]:
@@ -971,7 +1044,8 @@ def test_v2_creates_parent_only_in_management_and_roots_for_each_project(
     service, database = _service_v2(tmp_path, issues, items)
     request = _request_v2(tmp_path)
 
-    created = service.create_task(request)
+    created = _create_v2(service, database, request)
+    stop_context, creation_payload_hash = _v2_access(database, request)
 
     assert isinstance(created, CreatedTaskV2)
     assert isinstance(created.settings, TaskSettingsV2)
@@ -1009,11 +1083,278 @@ def test_v2_creates_parent_only_in_management_and_roots_for_each_project(
             """,
             (request.request_id,),
         ).fetchall()
+        access = connection.execute(
+            """
+            SELECT surface, subject_id, role, granted_by, revoked_at
+            FROM task_access WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+        binding = connection.execute(
+            """
+            SELECT surface, subject_id, session_id, parent_issue_number
+            FROM task_session_bindings WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+        prepared_payload = json.loads(
+            connection.execute(
+                """
+                SELECT event_json FROM task_events
+                WHERE request_id = ? AND event_key = 'request_prepared'
+                """,
+                (request.request_id,),
+            ).fetchone()[0]
+        )
     assert {row[0] for row in project_rows} == {
         project.project_id for project in request.projects
     }
     assert all(row[1] == created.settings.task_settings_hash for row in project_rows)
     assert all(row[2] == "ready" and row[3] for row in project_rows)
+    assert tuple(access) == (
+        "desktop",
+        request.confirmed_by,
+        "owner",
+        request.confirmed_by,
+        None,
+    )
+    assert tuple(binding) == (
+        "desktop",
+        request.confirmed_by,
+        f"session-{request.request_id}",
+        created.parent_issue.number,
+    )
+    assert prepared_payload == {
+        "request_hash": request.request_hash,
+        "source_event_id": f"desktop:create:{request.request_id}",
+        "source_payload_hash": creation_payload_hash,
+    }
+    stoppable = TaskStopService(database).get_stoppable(stop_context)
+    assert [(task.request_id, task.parent_issue_number) for task in stoppable] == [
+        (request.request_id, created.parent_issue.number)
+    ]
+
+
+def test_v2_creation_requires_an_exact_recorded_source_receipt(
+    tmp_path: Path,
+) -> None:
+    issues = FakeParentIssuesV2()
+    items = FakeProjectItems()
+    database = TaskDatabase(tmp_path / "task-v2.db")
+    service = TaskServiceV2(database, issues, items, clock=lambda: NOW)
+    request = _request_v2(tmp_path)
+
+    with pytest.raises(TypeError, match="context"):
+        service.create_task(request)  # type: ignore[call-arg]
+
+    context, payload_hash = _v2_access(database, request)
+    wrong_session = TrustedTurnContext(
+        owner_host=context.owner_host,
+        subject_id=context.subject_id,
+        session_id="another-session",
+        surface=context.surface,
+        source_event_id=context.source_event_id,
+        working_directory=context.working_directory,
+    )
+    with pytest.raises(TaskServiceError, match="source receipt"):
+        service.create_task(
+            request,
+            context=wrong_session,
+            source_payload_hash=payload_hash,
+        )
+    with pytest.raises(TaskServiceError, match="source receipt"):
+        service.create_task(
+            request,
+            context=context,
+            source_payload_hash="f" * 64,
+        )
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE surface_events SET state = 'expired' WHERE source_event_id = ?",
+            (context.source_event_id,),
+        )
+    with pytest.raises(TaskServiceError, match="source receipt"):
+        service.create_task(
+            request,
+            context=context,
+            source_payload_hash=payload_hash,
+        )
+
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM task_requests").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM task_access").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM task_session_bindings").fetchone()[0]
+            == 0
+        )
+    assert issues.calls == []
+    assert items.calls == []
+
+
+def test_v2_prepare_grants_access_but_binds_session_only_with_parent(
+    tmp_path: Path,
+) -> None:
+    issues = FakeParentIssuesV2()
+    issues.fail_create_after_write = True
+    items = FakeProjectItems()
+    service, database = _service_v2(tmp_path, issues, items)
+    request = _request_v2(tmp_path)
+
+    with pytest.raises(TaskServiceError, match="parent issue creation failed"):
+        service.create_task(request)
+
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM task_requests").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM task_access").fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT count(*) FROM task_session_bindings").fetchone()[0]
+            == 0
+        )
+        assert connection.execute(
+            """
+            SELECT count(*) FROM task_events
+            WHERE request_id = ? AND event_type = 'parent_issue_bound'
+            """,
+            (request.request_id,),
+        ).fetchone()[0] == 0
+
+    created = service.create_task(request)
+    with database.read() as connection:
+        binding = connection.execute(
+            """
+            SELECT parent_issue_number FROM task_session_bindings
+            WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+    assert binding[0] == created.parent_issue.number
+
+
+def test_v2_access_and_parent_binding_roll_back_with_their_registry_events(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    issues = FakeParentIssuesV2()
+    items = FakeProjectItems()
+    service, database = _service_v2(tmp_path, issues, items)
+    request = _request_v2(tmp_path)
+    original_access = service._registry._ensure_owner_access
+
+    def fail_after_access(*args, **kwargs) -> None:
+        original_access(*args, **kwargs)
+        raise TaskServiceError("injected access rollback")
+
+    monkeypatch.setattr(service._registry, "_ensure_owner_access", fail_after_access)
+    with pytest.raises(TaskServiceError, match="access rollback"):
+        service.create_task(request)
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM task_requests").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM task_access").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM task_events").fetchone()[0] == 0
+
+    monkeypatch.setattr(service._registry, "_ensure_owner_access", original_access)
+    original_binding = service._registry._ensure_session_binding
+
+    def fail_after_binding(*args, **kwargs) -> None:
+        original_binding(*args, **kwargs)
+        raise TaskServiceError("injected binding rollback")
+
+    monkeypatch.setattr(
+        service._registry,
+        "_ensure_session_binding",
+        fail_after_binding,
+    )
+    with pytest.raises(TaskServiceError, match="binding rollback"):
+        service.create_task(request)
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM task_access").fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT count(*) FROM task_session_bindings").fetchone()[0]
+            == 0
+        )
+        assert connection.execute(
+            """
+            SELECT count(*) FROM task_events
+            WHERE request_id = ? AND event_type = 'parent_issue_bound'
+            """,
+            (request.request_id,),
+        ).fetchone()[0] == 0
+
+
+def test_v2_creation_source_cannot_authorize_another_request(
+    tmp_path: Path,
+) -> None:
+    issues = FakeParentIssuesV2()
+    items = FakeProjectItems()
+    database = TaskDatabase(tmp_path / "task-v2.db")
+    service = TaskServiceV2(database, issues, items, clock=lambda: NOW)
+    first = _request_v2(tmp_path)
+    context, payload_hash = _v2_access(
+        database,
+        first,
+        source_event_id="desktop:one-confirmation",
+        session_id="shared-session",
+    )
+    service.create_task(
+        first,
+        context=context,
+        source_payload_hash=payload_hash,
+    )
+    calls_before = (len(issues.calls), len(items.calls))
+    second = _request_v2(
+        tmp_path,
+        request_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    )
+
+    with pytest.raises(TaskServiceError, match="another request"):
+        service.create_task(
+            second,
+            context=context,
+            source_payload_hash=payload_hash,
+        )
+
+    with database.read() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM task_requests WHERE request_id = ?",
+            (second.request_id,),
+        ).fetchone()[0] == 0
+    assert (len(issues.calls), len(items.calls)) == calls_before
+
+
+def test_v2_replay_rejects_revoked_access_or_missing_session_binding(
+    tmp_path: Path,
+) -> None:
+    issues = FakeParentIssuesV2()
+    items = FakeProjectItems()
+    service, database = _service_v2(tmp_path, issues, items)
+    request = _request_v2(tmp_path)
+    service.create_task(request)
+    calls_before = (len(issues.calls), len(items.calls))
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE task_access SET revoked_at = ?
+            WHERE request_id = ?
+            """,
+            ("2026-07-16T10:01:00Z", request.request_id),
+        )
+
+    with pytest.raises(TaskServiceError, match="owner access"):
+        service.create_task(request)
+    assert (len(issues.calls), len(items.calls)) == calls_before
+
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE task_access SET revoked_at = NULL WHERE request_id = ?",
+            (request.request_id,),
+        )
+        connection.execute(
+            "DELETE FROM task_session_bindings WHERE request_id = ?",
+            (request.request_id,),
+        )
+    with pytest.raises(TaskServiceError, match="session binding"):
+        service.create_task(request)
+    assert (len(issues.calls), len(items.calls)) == calls_before
 
 
 def test_v2_partial_project_create_retries_without_duplicates_or_early_activation(
@@ -1183,13 +1524,13 @@ def test_v2_concurrent_replay_across_services_creates_one_parent_and_roots(
     items = FakeProjectItems()
     database_path = tmp_path / "task-v2.db"
     services = (
-        TaskServiceV2(
+        _AuthorizedTaskServiceV2(
             TaskDatabase(database_path),
             issues,
             items,
             clock=lambda: NOW,
         ),
-        TaskServiceV2(
+        _AuthorizedTaskServiceV2(
             TaskDatabase(database_path),
             issues,
             items,
@@ -1268,7 +1609,7 @@ def test_v2_parent_find_create_bind_guard_blocks_another_process(
 
     issues = CrossProcessProbeIssues()
     items = FakeProjectItems()
-    service = TaskServiceV2(
+    service = _AuthorizedTaskServiceV2(
         database,
         issues,
         items,
@@ -1410,8 +1751,9 @@ def test_v2_duplicate_or_mismatched_project_item_key_fails_closed(
 
     other_root = tmp_path / "mismatch"
     other_root.mkdir()
-    service = TaskServiceV2(
-        TaskDatabase(other_root / "task-v2.db"),
+    mismatch_database = TaskDatabase(other_root / "task-v2.db")
+    service = _AuthorizedTaskServiceV2(
+        mismatch_database,
         FakeParentIssuesV2(),
         MismatchedItems(),
         clock=lambda: NOW,
@@ -1778,6 +2120,10 @@ def test_v2_stop_after_partial_bind_prevents_remaining_root_creation(
 def test_v2_stop_during_first_release_blocks_remaining_releases_and_success(
     tmp_path: Path,
 ) -> None:
+    stop_attempted = Event()
+    stop_committed = Event()
+    writers: list[Thread] = []
+
     class StopOnFirstReleaseItems(FakeProjectItems):
         stopped = False
 
@@ -1789,18 +2135,154 @@ def test_v2_stop_during_first_release_blocks_remaining_releases_and_success(
             released = super().release_item(management_repository, item_id)
             if not self.stopped:
                 self.stopped = True
-                _append_v2_lifecycle_event(database, request, "stop_requested")
+                writer = Thread(target=self._request_stop)
+                writers.append(writer)
+                writer.start()
+                assert stop_attempted.wait(timeout=5)
+                assert not stop_committed.wait(timeout=0.2)
             return released
+
+        @staticmethod
+        def _request_stop() -> None:
+            stop_attempted.set()
+            _append_v2_lifecycle_event(database, request, "stop_requested")
+            stop_committed.set()
 
     issues = FakeParentIssuesV2()
     items = StopOnFirstReleaseItems()
     service, database = _service_v2(tmp_path, issues, items)
     request = _request_v2(tmp_path)
 
+    try:
+        service.create_task(request)
+    except TaskServiceError as error:
+        assert "lifecycle barrier" in str(error)
+    for writer in writers:
+        writer.join(timeout=10)
+
+    assert stop_committed.is_set()
+    release_count = sum(call[0] == "release" for call in items.calls)
+    update_count = sum(call[0] == "update" for call in issues.calls)
+
     with pytest.raises(TaskServiceError, match="lifecycle barrier"):
         service.create_task(request)
 
-    assert sum(call[0] == "release" for call in items.calls) == 1
-    assert [item.state for _, item in items.items.values()].count("ready") == 1
-    assert [item.state for _, item in items.items.values()].count("blocked") == 1
-    assert sum(call[0] == "update" for call in issues.calls) == 0
+    assert sum(call[0] == "release" for call in items.calls) == release_count
+    assert sum(call[0] == "update" for call in issues.calls) == update_count
+
+
+def test_v2_release_holds_the_database_write_permit_across_external_write(
+    tmp_path: Path,
+) -> None:
+    stop_attempted = Event()
+    stop_committed = Event()
+    writer_threads: list[Thread] = []
+
+    class RacingStopItems(FakeProjectItems):
+        permit_held_during_release: bool | None = None
+
+        def release_item(
+            self,
+            management_repository: str,
+            item_id: str,
+        ) -> ProjectExecutionItem:
+            def request_stop() -> None:
+                stop_attempted.set()
+                _append_v2_lifecycle_event(database, request, "stop_requested")
+                stop_committed.set()
+
+            writer = Thread(target=request_stop)
+            writer_threads.append(writer)
+            writer.start()
+            assert stop_attempted.wait(timeout=5)
+            self.permit_held_during_release = not stop_committed.wait(timeout=0.2)
+            return super().release_item(management_repository, item_id)
+
+    issues = FakeParentIssuesV2()
+    items = RacingStopItems()
+    service, database = _service_v2(tmp_path, issues, items)
+    original = _request_v2(tmp_path)
+    request = TaskRequestV2.create(
+        request_id=original.request_id,
+        management_repository=original.management_repository,
+        task_content=original.task_content,
+        task_flow=original.task_flow,
+        merge_mode=original.merge_mode,
+        merge_order=None,
+        projects=(original.projects[0],),
+        task_owner_host=original.task_owner_host,
+        confirmed_by=original.confirmed_by,
+        confirmed_at=original.confirmed_at,
+        auto_merge_expires_at=original.auto_merge_expires_at,
+    )
+
+    try:
+        service.create_task(request)
+    except TaskServiceError:
+        pass
+    for writer in writer_threads:
+        writer.join(timeout=10)
+
+    assert items.permit_held_during_release is True
+    assert stop_committed.is_set()
+
+
+def test_v2_progress_holds_the_database_write_permit_across_external_write(
+    tmp_path: Path,
+) -> None:
+    stop_attempted = Event()
+    stop_committed = Event()
+    writer_threads: list[Thread] = []
+
+    class RacingStopIssues(FakeParentIssuesV2):
+        permit_held_during_update: bool | None = None
+
+        def update_issue(
+            self,
+            repository: str,
+            issue_number: int,
+            *,
+            title: str,
+            body: str,
+        ) -> TaskParentIssue:
+            def request_stop() -> None:
+                stop_attempted.set()
+                _append_v2_lifecycle_event(database, request, "stop_requested")
+                stop_committed.set()
+
+            writer = Thread(target=request_stop)
+            writer_threads.append(writer)
+            writer.start()
+            assert stop_attempted.wait(timeout=5)
+            self.permit_held_during_update = not stop_committed.wait(timeout=0.2)
+            return super().update_issue(
+                repository,
+                issue_number,
+                title=title,
+                body=body,
+            )
+
+    issues = RacingStopIssues()
+    items = FakeProjectItems()
+    service, database = _service_v2(tmp_path, issues, items)
+    original = _request_v2(tmp_path)
+    request = TaskRequestV2.create(
+        request_id=original.request_id,
+        management_repository=original.management_repository,
+        task_content=original.task_content,
+        task_flow=original.task_flow,
+        merge_mode=original.merge_mode,
+        merge_order=None,
+        projects=(original.projects[0],),
+        task_owner_host=original.task_owner_host,
+        confirmed_by=original.confirmed_by,
+        confirmed_at=original.confirmed_at,
+        auto_merge_expires_at=original.auto_merge_expires_at,
+    )
+
+    service.create_task(request)
+    for writer in writer_threads:
+        writer.join(timeout=10)
+
+    assert issues.permit_held_during_update is True
+    assert stop_committed.is_set()

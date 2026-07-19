@@ -30,6 +30,7 @@ from .task_settings_v2 import (
     TaskSettingsV2,
     TaskSettingsV2Error,
 )
+from .surface_events import TrustedTurnContext
 
 
 TASK_REQUEST_FORMAT = "forge-task-request/v1"
@@ -1003,6 +1004,23 @@ def _require_v2_event_time(value: object) -> str:
     return value
 
 
+def _require_surface_event_time(value: object) -> str:
+    if type(value) is not str or not value.endswith("Z"):
+        raise TaskServiceError("Task creation source time is not canonical UTC")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise TaskServiceError(
+            "Task creation source time is not canonical UTC"
+        ) from error
+    canonical = parsed.astimezone(UTC).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+    if canonical != value:
+        raise TaskServiceError("Task creation source time is not canonical UTC")
+    return value
+
+
 def _is_v2_item_id(value: object) -> bool:
     return (
         type(value) is str
@@ -1068,7 +1086,12 @@ class _TaskRegistryV2:
                 f"Task external write is blocked by lifecycle barrier {barrier[0]}"
             )
 
-    def prepare(self, request: TaskRequestV2) -> None:
+    def prepare(
+        self,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> None:
         request_payload = json.loads(request.to_json())
         project_json = _request_project_json(request)
         confirmed_at = str(request_payload["confirmed_at"])
@@ -1084,6 +1107,12 @@ class _TaskRegistryV2:
             request.replaces_request_id,
         )
         with self._database.transaction() as connection:
+            self._require_creation_source(
+                connection,
+                request,
+                context,
+                source_payload_hash,
+            )
             existing = connection.execute(
                 """
                 SELECT request_id, format_version, request_json, request_hash,
@@ -1134,10 +1163,233 @@ class _TaskRegistryV2:
                 request=request,
                 event_key="request_prepared",
                 event_type="request_prepared",
-                event_json=_v2_json({"request_hash": request.request_hash}),
+                event_json=self._creation_event_json(
+                    request,
+                    context,
+                    source_payload_hash,
+                ),
                 occurred_at=confirmed_at,
             )
-            self._require_request_prepared_event(connection, request)
+            self._require_request_prepared_event(
+                connection,
+                request,
+                context,
+                source_payload_hash,
+            )
+            self._ensure_owner_access(
+                connection,
+                request,
+                context,
+                granted_at=confirmed_at,
+            )
+
+    @staticmethod
+    def _creation_event_json(
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> str:
+        return _v2_json(
+            {
+                "request_hash": request.request_hash,
+                "source_event_id": context.source_event_id,
+                "source_payload_hash": source_payload_hash,
+            }
+        )
+
+    @staticmethod
+    def _require_creation_source(
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> None:
+        if not isinstance(context, TrustedTurnContext):
+            raise TaskServiceError(
+                "v2 Task creation requires a trusted turn context"
+            )
+        if context.owner_host != request.task_owner_host:
+            raise TaskServiceError("Task creation owner host changed")
+        if context.subject_id != request.confirmed_by:
+            raise TaskServiceError("Task confirmer does not match trusted subject")
+        if (
+            not isinstance(source_payload_hash, str)
+            or _SHA256_PATTERN.fullmatch(source_payload_hash) is None
+        ):
+            raise TaskServiceError(
+                "Task creation source payload hash must be a lowercase SHA-256"
+            )
+        source = connection.execute(
+            """
+            SELECT subject_id, session_id, surface, payload_hash, state,
+                   received_at
+            FROM surface_events
+            WHERE source_event_id = ?
+            """,
+            (context.source_event_id,),
+        ).fetchone()
+        expected_identity = (
+            context.subject_id,
+            context.session_id,
+            context.surface,
+            source_payload_hash,
+        )
+        if (
+            source is None
+            or tuple(source[:4]) != expected_identity
+            or source[4] not in {"received", "handled", "responded"}
+        ):
+            raise TaskServiceError(
+                "Task creation source receipt does not match trusted context"
+            )
+        _require_surface_event_time(source[5])
+
+        for row in connection.execute(
+            """
+            SELECT request_id, event_json
+            FROM task_events
+            WHERE event_type = 'request_prepared'
+            """
+        ):
+            raw_payload = str(row[1])
+            try:
+                payload = json.loads(raw_payload)
+            except (json.JSONDecodeError, RecursionError):
+                raise TaskServiceError(
+                    "stored Task creation event is invalid"
+                ) from None
+            if not isinstance(payload, dict) or _v2_json(payload) != raw_payload:
+                raise TaskServiceError("stored Task creation event is invalid")
+            fields = set(payload)
+            if fields == {"request_hash"}:
+                continue
+            if fields != {
+                "request_hash",
+                "source_event_id",
+                "source_payload_hash",
+            }:
+                raise TaskServiceError("stored Task creation event is invalid")
+            if (
+                payload.get("source_event_id") == context.source_event_id
+                and str(row[0]) != request.request_id
+            ):
+                raise TaskServiceError(
+                    "Task creation source receipt is already bound to another request"
+                )
+
+    @staticmethod
+    def _ensure_owner_access(
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        *,
+        granted_at: str,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT role, granted_by, granted_at, revoked_at
+            FROM task_access
+            WHERE request_id = ? AND surface = ? AND subject_id = ?
+            """,
+            (request.request_id, context.surface, context.subject_id),
+        ).fetchone()
+        expected = ("owner", context.subject_id, granted_at, None)
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO task_access (
+                    request_id, surface, subject_id, role, granted_by,
+                    granted_at, revoked_at
+                ) VALUES (?, ?, ?, 'owner', ?, ?, NULL)
+                """,
+                (
+                    request.request_id,
+                    context.surface,
+                    context.subject_id,
+                    context.subject_id,
+                    granted_at,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT role, granted_by, granted_at, revoked_at
+                FROM task_access
+                WHERE request_id = ? AND surface = ? AND subject_id = ?
+                """,
+                (request.request_id, context.surface, context.subject_id),
+            ).fetchone()
+        if row is None or tuple(row) != expected:
+            raise TaskServiceError("Task owner access does not match confirmation")
+
+    @staticmethod
+    def _require_owner_access(
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+    ) -> None:
+        granted_at = json.loads(request.to_json())["confirmed_at"]
+        row = connection.execute(
+            """
+            SELECT role, granted_by, granted_at, revoked_at
+            FROM task_access
+            WHERE request_id = ? AND surface = ? AND subject_id = ?
+            """,
+            (request.request_id, context.surface, context.subject_id),
+        ).fetchone()
+        if row is None or tuple(row) != (
+            "owner",
+            context.subject_id,
+            granted_at,
+            None,
+        ):
+            raise TaskServiceError("Task owner access does not match confirmation")
+
+    @staticmethod
+    def _ensure_session_binding(
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        *,
+        issue_number: int,
+        bound_at: str,
+    ) -> None:
+        key = (
+            context.surface,
+            context.subject_id,
+            context.session_id,
+            request.request_id,
+        )
+        row = connection.execute(
+            """
+            SELECT parent_issue_number, bound_at
+            FROM task_session_bindings
+            WHERE surface = ? AND subject_id = ? AND session_id = ?
+              AND request_id = ?
+            """,
+            key,
+        ).fetchone()
+        expected = (issue_number, bound_at)
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO task_session_bindings (
+                    surface, subject_id, session_id, request_id,
+                    parent_issue_number, bound_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (*key, issue_number, bound_at),
+            )
+            row = connection.execute(
+                """
+                SELECT parent_issue_number, bound_at
+                FROM task_session_bindings
+                WHERE surface = ? AND subject_id = ? AND session_id = ?
+                  AND request_id = ?
+                """,
+                key,
+            ).fetchone()
+        if row is None or tuple(row) != expected:
+            raise TaskServiceError("Task session binding does not match parent")
 
     def parent_issue_number(
         self,
@@ -1187,9 +1439,24 @@ class _TaskRegistryV2:
         request: TaskRequestV2,
         issue_number: int,
         occurred_at: str,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
     ) -> None:
         if type(issue_number) is not int or issue_number <= 0:
             raise TaskServiceError("parent issue number is invalid")
+        self._require_creation_source(
+            connection,
+            request,
+            context,
+            source_payload_hash,
+        )
+        self._require_request_prepared_event(
+            connection,
+            request,
+            context,
+            source_payload_hash,
+        )
+        self._require_owner_access(connection, request, context)
         self._ensure_event(
             connection,
             request=request,
@@ -1205,6 +1472,65 @@ class _TaskRegistryV2:
         )
         if self.parent_issue_number(connection, request) != issue_number:
             raise TaskServiceError("parent issue binding readback failed")
+        self._ensure_session_binding(
+            connection,
+            request,
+            context,
+            issue_number=issue_number,
+            bound_at=occurred_at,
+        )
+
+    def require_creation_binding(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+        issue_number: int,
+    ) -> None:
+        """Recheck the exact creation receipt and its durable owner binding."""
+
+        self._require_creation_source(
+            connection,
+            request,
+            context,
+            source_payload_hash,
+        )
+        self._require_request_prepared_event(
+            connection,
+            request,
+            context,
+            source_payload_hash,
+        )
+        self._require_owner_access(connection, request, context)
+        parent = connection.execute(
+            """
+            SELECT occurred_at
+            FROM task_events
+            WHERE request_id = ? AND event_type = 'parent_issue_bound'
+              AND event_key = 'parent_issue_bound'
+            """,
+            (request.request_id,),
+        ).fetchone()
+        if parent is None:
+            raise TaskServiceError("parent issue binding is missing")
+        bound_at = _require_v2_event_time(parent[0])
+        row = connection.execute(
+            """
+            SELECT parent_issue_number, bound_at
+            FROM task_session_bindings
+            WHERE surface = ? AND subject_id = ? AND session_id = ?
+              AND request_id = ?
+            """,
+            (
+                context.surface,
+                context.subject_id,
+                context.session_id,
+                request.request_id,
+            ),
+        ).fetchone()
+        if row is None or tuple(row) != (issue_number, bound_at):
+            raise TaskServiceError("Task session binding does not match parent")
 
     def project_binding(
         self,
@@ -1423,40 +1749,60 @@ class _TaskRegistryV2:
         """Fail closed unless the exact active registry still permits writes."""
 
         with self.guard(request) as connection:
-            self.require_no_lifecycle_barrier(connection, request)
-            parent_issue_number = self.parent_issue_number(connection, request)
-            if parent_issue_number is None:
-                raise TaskServiceError("parent issue is not bound")
-            expected = TaskSettingsV2.create(
-                request=request,
-                parent_issue_number=parent_issue_number,
+            self._require_active_external_write_on_connection(connection, request)
+
+    @contextmanager
+    def active_external_write(
+        self,
+        request: TaskRequestV2,
+    ) -> Iterator[None]:
+        """Hold the shared write permit across one exact external mutation."""
+
+        with self.guard(request) as connection:
+            self._require_active_external_write_on_connection(connection, request)
+            # RISK(race): Stop and revision writers use this same database write
+            # permit. Keep it until the external mutation and readback finish.
+            yield
+
+    def _require_active_external_write_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+    ) -> None:
+        self.require_no_lifecycle_barrier(connection, request)
+        parent_issue_number = self.parent_issue_number(connection, request)
+        if parent_issue_number is None:
+            raise TaskServiceError("parent issue is not bound")
+        expected = TaskSettingsV2.create(
+            request=request,
+            parent_issue_number=parent_issue_number,
+        )
+        self._require_settings_readback(connection, request, expected)
+        root_ids: list[str] = []
+        for project in request.projects:
+            state, root_card_id, settings_hash = self.project_binding(
+                connection,
+                request,
+                project.project_id,
             )
-            self._require_settings_readback(connection, request, expected)
-            root_ids: list[str] = []
-            for project in request.projects:
-                state, root_card_id, settings_hash = self.project_binding(
-                    connection,
-                    request,
-                    project.project_id,
+            if (
+                state != "ready"
+                or root_card_id is None
+                or settings_hash != expected.task_settings_hash
+            ):
+                raise TaskServiceError(
+                    "Project registry is not active for external write"
                 )
-                if (
-                    state != "ready"
-                    or root_card_id is None
-                    or settings_hash != expected.task_settings_hash
-                ):
-                    raise TaskServiceError(
-                        "Project registry is not active for external write"
-                    )
-                self._require_project_binding_event(
-                    connection,
-                    request,
-                    project.project_id,
-                    root_card_id,
-                )
-                root_ids.append(root_card_id)
-            if len(root_ids) != len(set(root_ids)):
-                raise TaskServiceError("Project roots contain duplicate card IDs")
-            self._require_activation_events(connection, request, expected)
+            self._require_project_binding_event(
+                connection,
+                request,
+                project.project_id,
+                root_card_id,
+            )
+            root_ids.append(root_card_id)
+        if len(root_ids) != len(set(root_ids)):
+            raise TaskServiceError("Project roots contain duplicate card IDs")
+        self._require_activation_events(connection, request, expected)
 
     def root_card_ids(self, request: TaskRequestV2) -> tuple[str, ...]:
         with self._database.read() as connection:
@@ -1624,10 +1970,13 @@ class _TaskRegistryV2:
         ):
             raise TaskServiceError("Project item binding event does not match")
 
-    @staticmethod
+    @classmethod
     def _require_request_prepared_event(
+        cls,
         connection: sqlite3.Connection,
         request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
     ) -> None:
         rows = connection.execute(
             """
@@ -1644,7 +1993,11 @@ class _TaskRegistryV2:
                 "request_prepared",
                 None,
                 None,
-                _v2_json({"request_hash": request.request_hash}),
+                cls._creation_event_json(
+                    request,
+                    context,
+                    source_payload_hash,
+                ),
             )
         ):
             raise TaskServiceError("request_prepared event does not match")
@@ -1766,7 +2119,13 @@ class TaskServiceV2:
         self._project_items = project_items
         self._clock = clock or _utc_now
 
-    def create_task(self, request: TaskRequestV2) -> CreatedTaskV2:
+    def create_task(
+        self,
+        request: TaskRequestV2,
+        *,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> CreatedTaskV2:
         if not isinstance(request, TaskRequestV2):
             raise TaskServiceError("request must be TaskRequestV2")
         if request.replaces_request_id is not None:
@@ -1780,10 +2139,15 @@ class TaskServiceV2:
         }
         initial_body = build_task_issue_body_v2(request, blocked_states)
         try:
-            self._registry.prepare(request)
+            self._registry.prepare(request, context, source_payload_hash)
         except TaskDatabaseError as error:
             raise TaskServiceError("Task request preparation failed") from error
-        parent = self._ensure_parent(request, initial_body)
+        parent = self._ensure_parent(
+            request,
+            initial_body,
+            context,
+            source_payload_hash,
+        )
         for project in request.projects:
             self._ensure_project_item(request, parent, project)
         try:
@@ -1811,6 +2175,8 @@ class TaskServiceV2:
         self,
         request: TaskRequestV2,
         initial_body: str,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
     ) -> TaskParentIssue:
         try:
             with self._registry.guard(request) as connection:
@@ -1840,8 +2206,17 @@ class TaskServiceV2:
                         request,
                         readback.number,
                         self._now(),
+                        context,
+                        source_payload_hash,
                     )
                     return readback
+                self._registry.require_creation_binding(
+                    connection,
+                    request,
+                    context,
+                    source_payload_hash,
+                    issue_number,
+                )
                 issue = self._get_parent(request, issue_number)
                 self._require_parent(issue, request)
                 return issue
@@ -1944,23 +2319,31 @@ class TaskServiceV2:
         root_card_id: str,
     ) -> ProjectExecutionItem:
         key = root_project_item_key(request.request_id, project.project_id)
-        item = self._get_project_item(request, root_card_id)
-        self._require_project_item(
-            item,
-            parent,
-            project.repository,
-            key,
-            allowed_states={"blocked", "ready"},
-        )
-        if item.state == "blocked":
-            self._registry.require_active_external_write(request)
-            try:
-                item = self._project_items.release_item(
-                    request.management_repository,
-                    item.item_id,
+        with self._registry.active_external_write(request):
+            item = self._get_project_item(request, root_card_id)
+            self._require_project_item(
+                item,
+                parent,
+                project.repository,
+                key,
+                allowed_states={"blocked", "ready"},
+            )
+            if item.state == "blocked":
+                try:
+                    item = self._project_items.release_item(
+                        request.management_repository,
+                        item.item_id,
+                    )
+                except Exception as error:
+                    raise TaskServiceError("Project item release failed") from error
+                self._require_project_item(
+                    item,
+                    parent,
+                    project.repository,
+                    key,
+                    allowed_states={"ready"},
                 )
-            except Exception as error:
-                raise TaskServiceError("Project item release failed") from error
+                item = self._get_project_item(request, item.item_id)
             self._require_project_item(
                 item,
                 parent,
@@ -1968,47 +2351,37 @@ class TaskServiceV2:
                 key,
                 allowed_states={"ready"},
             )
-            item = self._get_project_item(request, item.item_id)
-        self._registry.require_active_external_write(request)
-        self._require_project_item(
-            item,
-            parent,
-            project.repository,
-            key,
-            allowed_states={"ready"},
-        )
-        return item
+            return item
 
     def _project_parent_progress(
         self,
         request: TaskRequestV2,
         parent: TaskParentIssue,
     ) -> TaskParentIssue:
-        issue = self._get_parent(request, parent.number)
-        self._require_parent(issue, request)
-        expected_body = replace_task_progress_v2(
-            issue.body,
-            request,
-            {project.project_id: "ready" for project in request.projects},
-        )
-        if issue.body != expected_body:
-            self._registry.require_active_external_write(request)
-            try:
-                updated = self._issues.update_issue(
-                    request.management_repository,
-                    issue.number,
-                    title=request.task_content.title,
-                    body=expected_body,
-                )
-            except Exception as error:
-                raise TaskServiceError("parent progress update failed") from error
-            self._require_parent(updated, request)
-            issue = self._get_parent(request, issue.number)
-        self._require_parent(issue, request)
-        if issue.body != expected_body:
-            raise TaskServiceError("parent progress readback does not match")
-        self._registry.require_active_external_write(request)
-        return issue
+        with self._registry.active_external_write(request):
+            issue = self._get_parent(request, parent.number)
+            self._require_parent(issue, request)
+            expected_body = replace_task_progress_v2(
+                issue.body,
+                request,
+                {project.project_id: "ready" for project in request.projects},
+            )
+            if issue.body != expected_body:
+                try:
+                    updated = self._issues.update_issue(
+                        request.management_repository,
+                        issue.number,
+                        title=request.task_content.title,
+                        body=expected_body,
+                    )
+                except Exception as error:
+                    raise TaskServiceError("parent progress update failed") from error
+                self._require_parent(updated, request)
+                issue = self._get_parent(request, issue.number)
+            self._require_parent(issue, request)
+            if issue.body != expected_body:
+                raise TaskServiceError("parent progress readback does not match")
+            return issue
 
     def _find_parent(self, request: TaskRequestV2) -> TaskParentIssue | None:
         try:

@@ -20,6 +20,7 @@ from forge.ops.task_projects import TaskProject
 from forge.ops.task_service import TaskCreationRequest
 from forge.ops.task_setup import SETUP_TIMEOUT, TaskSetupContext
 from forge.ops.task_settings import TaskContent
+from forge.ops.task_stop import StopReceipt, StoppableTask
 
 
 REPOSITORY = "owner/repo"
@@ -39,6 +40,12 @@ def _reset_plugin_state(monkeypatch) -> None:
     if pending is not None:
         pending.clear()
     plugin.set_task_service(None)
+    pending_stops = getattr(plugin, "_pending_stops", None)
+    if pending_stops is not None:
+        pending_stops.clear()
+    set_stop_backend = getattr(plugin, "set_task_stop_backend", None)
+    if callable(set_stop_backend):
+        set_stop_backend(None)
 
 
 OWNER_HOST = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -1842,3 +1849,252 @@ def test_confirm_uses_fresh_context_validator_not_entry_validator(
     ]
     assert entry_validations == 0
     assert confirm_validations == 1
+
+
+@dataclass
+class FakeStopBackend:
+    tasks: tuple[StoppableTask, ...]
+    get_calls: list[tuple[object, ...]] = field(default_factory=list)
+    stop_calls: list[tuple[object, ...]] = field(default_factory=list)
+
+    def get_stoppable(self, context, issue_number=None):
+        self.get_calls.append((context, issue_number))
+        return tuple(
+            task
+            for task in self.tasks
+            if issue_number is None or task.parent_issue_number == issue_number
+        )
+
+    def request_stop(self, request_id, context, payload, *, at=None):
+        self.stop_calls.append((request_id, context, payload, at))
+        task = next(task for task in self.tasks if task.request_id == request_id)
+        return StopReceipt(
+            stop_request_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            request_id=task.request_id,
+            management_repository=task.management_repository,
+            parent_issue_number=task.parent_issue_number,
+            task_settings_hash=task.task_settings_hash,
+            state="stopping",
+        )
+
+
+def _stoppable(
+    issue_number: int,
+    request_id: str,
+) -> StoppableTask:
+    return StoppableTask(
+        request_id=request_id,
+        management_repository="management/forge",
+        parent_issue_number=issue_number,
+        task_owner_host=OWNER_HOST,
+        task_settings_hash="a" * 64,
+        state="active",
+        title=f"Task {issue_number}",
+    )
+
+
+def _trusted_stop_turn(
+    text: str,
+    *,
+    source_event_id: str = "cli:stop-event",
+) -> dict[str, object]:
+    return {
+        "session_id": "stop-session",
+        "user_id": "u1",
+        "subject_id": "u1",
+        "surface": "cli",
+        "owner_host": OWNER_HOST,
+        "source_event_id": source_event_id,
+        "text": text,
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "forge stop",
+        "forge stop #21",
+        "#21 실행 중단",
+        "#21 작업 중단해",
+        "현재 Task 멈춰",
+    ),
+)
+def test_exact_stop_commands_bypass_task_setup_and_model(
+    monkeypatch,
+    command: str,
+) -> None:
+    task = _stoppable(21, "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    backend = FakeStopBackend((task,))
+    plugin.set_task_stop_backend(backend)
+
+    class ForbiddenSetup:
+        def handle(self, *args, **kwargs):
+            raise AssertionError("an exact Stop command must bypass Task setup")
+
+    monkeypatch.setattr(plugin, "_task_setup", ForbiddenSetup())
+
+    result = plugin.before_user_turn(**_trusted_stop_turn(command))
+
+    assert result["action"] == "handled"
+    assert "stop requested" in result["text"].lower()
+    assert len(backend.stop_calls) == 1
+    assert backend.stop_calls[0][0] == task.request_id
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "forge stop?",
+        "forge stop 하지 마",
+        "`forge stop`",
+        "> forge stop",
+        "설명: #21 실행 중단",
+        "Forge stop",
+        "forge  stop",
+        "forge stop\n",
+    ),
+)
+def test_non_exact_stop_text_stays_on_the_normal_conversation_path(
+    text: str,
+) -> None:
+    backend = FakeStopBackend(
+        (_stoppable(21, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),)
+    )
+    plugin.set_task_stop_backend(backend)
+
+    result = plugin.before_user_turn(
+        session_id="normal-session",
+        user_id="u1",
+        text=text,
+    )
+
+    assert result["action"] == "handled"
+    assert [choice["id"] for choice in result["choices"]] == ["chat", "task"]
+    assert backend.get_calls == []
+    assert backend.stop_calls == []
+
+
+def test_multiple_stoppable_tasks_show_direction_key_chooser_before_any_write() -> None:
+    tasks = (
+        _stoppable(21, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        _stoppable(22, "dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+    )
+    backend = FakeStopBackend(tasks)
+    plugin.set_task_stop_backend(backend)
+
+    shown = plugin.before_user_turn(**_trusted_stop_turn("forge stop"))
+
+    assert shown["action"] == "handled"
+    assert shown["choice_mode"] == "single"
+    assert shown["min_choices"] == shown["max_choices"] == 1
+    assert [choice["id"] for choice in shown["choices"]] == [
+        tasks[0].request_id,
+        tasks[1].request_id,
+        "cancel",
+    ]
+    assert backend.stop_calls == []
+
+    stopped = plugin.before_user_turn(
+        **_trusted_stop_turn("ignored", source_event_id="cli:choice-event"),
+        choice_prompt_id=shown["choice_prompt_id"],
+        selected_choice_ids=[tasks[1].request_id],
+    )
+
+    assert stopped["action"] == "handled"
+    assert backend.stop_calls[0][0] == tasks[1].request_id
+
+
+def test_stop_chooser_cancel_and_wrong_prompt_never_call_stop() -> None:
+    tasks = (
+        _stoppable(21, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        _stoppable(22, "dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+    )
+    backend = FakeStopBackend(tasks)
+    plugin.set_task_stop_backend(backend)
+    shown = plugin.before_user_turn(**_trusted_stop_turn("forge stop"))
+
+    wrong = plugin.before_user_turn(
+        **_trusted_stop_turn("ignored", source_event_id="cli:wrong-choice"),
+        choice_prompt_id="ffffffff-ffff-4fff-8fff-ffffffffffff",
+        selected_choice_ids=[tasks[0].request_id],
+    )
+    cancelled = plugin.before_user_turn(
+        **_trusted_stop_turn("ignored", source_event_id="cli:cancel-choice"),
+        choice_prompt_id=shown["choice_prompt_id"],
+        selected_choice_ids=["cancel"],
+    )
+
+    assert wrong["action"] == "handled"
+    assert wrong["choice_prompt_id"] == shown["choice_prompt_id"]
+    assert cancelled["action"] == "handled"
+    assert backend.stop_calls == []
+
+
+def test_stop_chooser_accepts_prompt_bound_plain_fallback() -> None:
+    tasks = (
+        _stoppable(21, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        _stoppable(22, "dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+    )
+    backend = FakeStopBackend(tasks)
+    plugin.set_task_stop_backend(backend)
+    shown = plugin.before_user_turn(**_trusted_stop_turn("forge stop"))
+
+    stopped = plugin.before_user_turn(
+        **_trusted_stop_turn(
+            (
+                f"choose {shown['choice_prompt_id']} "
+                f"{tasks[0].request_id}"
+            ),
+            source_event_id="cli:plain-choice",
+        )
+    )
+
+    assert stopped["action"] == "handled"
+    assert backend.stop_calls[0][0] == tasks[0].request_id
+
+
+def test_stop_without_candidates_or_trusted_source_is_handled_fail_closed() -> None:
+    empty = FakeStopBackend(())
+    plugin.set_task_stop_backend(empty)
+    no_task = plugin.before_user_turn(**_trusted_stop_turn("forge stop"))
+
+    assert no_task == {
+        "action": "handled",
+        "text": "No running Task can be stopped.",
+    }
+
+    task = _stoppable(21, "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    backend = FakeStopBackend((task,))
+    plugin.set_task_stop_backend(backend)
+    missing_source = _trusted_stop_turn("forge stop")
+    missing_source["source_event_id"] = ""
+    blocked = plugin.before_user_turn(**missing_source)
+
+    assert blocked["action"] == "handled"
+    assert "source event" in blocked["text"].lower()
+    assert backend.get_calls == []
+    assert backend.stop_calls == []
+
+
+def test_user_envelope_cannot_supply_stop_authorization_fields() -> None:
+    backend = FakeStopBackend(
+        (_stoppable(21, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),)
+    )
+    plugin.set_task_stop_backend(backend)
+
+    result = plugin.before_user_turn(
+        {
+            "session_id": "s1",
+            "user_id": "u1",
+            "subject_id": "u1",
+            "surface": "cli",
+            "owner_host": OWNER_HOST,
+            "source_event_id": "forged-source",
+            "text": "forge stop",
+        }
+    )
+
+    assert result["action"] == "handled"
+    assert "trusted" in result["text"].lower()
+    assert backend.get_calls == []
+    assert backend.stop_calls == []

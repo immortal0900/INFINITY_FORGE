@@ -16,9 +16,9 @@ from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
 _RELEASE_SHA = re.compile(r"[0-9a-f]{40}")
@@ -87,7 +87,13 @@ from forge.ops.task_service import (
     TaskService as LocalTaskService,
 )
 from forge.ops.task_settings import TaskSettingsStore
-from forge.ops.choice_prompt import ChoicePromptError, ChoiceSubmission
+from forge.ops.choice_prompt import (
+    Choice,
+    ChoiceMode,
+    ChoicePrompt,
+    ChoicePromptError,
+    ChoiceSubmission,
+)
 from forge.ops.project_discovery import (
     DEFAULT_TIMEOUT_SECONDS,
     GitHubRepositoryMetadata,
@@ -98,6 +104,12 @@ from forge.ops.project_discovery import (
     validate_task_project,
 )
 from forge.ops.task_projects import TaskProject, normalize_github_remote
+from forge.ops.stop_command import StopCommand, parse_stop_command
+from forge.ops.surface_events import (
+    SurfaceEventStore,
+    TrustedTurnContext,
+)
+from forge.ops.task_database import TaskDatabase
 from forge.ops.task_setup import (
     DEFAULT_SURFACE,
     SETUP_TIMEOUT,
@@ -105,6 +117,7 @@ from forge.ops.task_setup import (
     TaskSetupContext,
     TurnResult,
 )
+from forge.ops.task_stop import StopReceipt, StoppableTask, TaskStopService
 
 
 _CHOICE_LABELS = {
@@ -137,6 +150,23 @@ TaskServiceCallback = Callable[[TaskCreationRequest], str]
 StateKey = tuple[str, str, str]
 
 
+class TaskStopBackend(Protocol):
+    def get_stoppable(
+        self,
+        context: TrustedTurnContext,
+        issue_number: int | None = None,
+    ) -> tuple[StoppableTask, ...]: ...
+
+    def request_stop(
+        self,
+        request_id: str,
+        context: TrustedTurnContext,
+        payload: str,
+        *,
+        at: datetime | None = None,
+    ) -> StopReceipt: ...
+
+
 @dataclass(frozen=True)
 class _FailedInput:
     text: str
@@ -149,6 +179,47 @@ class _FailedInput:
 class _PendingTask:
     request: TaskCreationRequest
     in_flight: bool = False
+
+
+@dataclass(frozen=True)
+class _PendingStop:
+    prompt: ChoicePrompt
+    request_ids: frozenset[str]
+
+
+class _LocalStopBackend:
+    """Bind the trusted source receipt immediately before the Stop transaction."""
+
+    def __init__(self, database_path: str) -> None:
+        database = TaskDatabase(database_path)
+        self._events = SurfaceEventStore(database)
+        self._stops = TaskStopService(database)
+
+    def get_stoppable(
+        self,
+        context: TrustedTurnContext,
+        issue_number: int | None = None,
+    ) -> tuple[StoppableTask, ...]:
+        return self._stops.get_stoppable(context, issue_number)
+
+    def request_stop(
+        self,
+        request_id: str,
+        context: TrustedTurnContext,
+        payload: str,
+        *,
+        at: datetime | None = None,
+    ) -> StopReceipt:
+        # Reauthorize before the receipt write so revoked access cannot create
+        # even a local Stop-side effect or disclose the owner host.
+        self._stops.resolve_stoppable(request_id, context)
+        event = self._events.receive(context, payload, at=at)
+        return self._stops.request_stop(
+            request_id,
+            context,
+            payload_hash=event.payload_hash,
+            at=at,
+        )
 
 
 class _GitHubMetadataAdapter:
@@ -487,8 +558,10 @@ _task_context_factory: Callable[[str | None], TaskSetupContext | None] = (
     _default_task_context
 )
 _task_service: TaskServiceCallback = _default_task_service
+_task_stop_backend: TaskStopBackend | None = None
 _failed_inputs: dict[StateKey, _FailedInput] = {}
 _pending_tasks: dict[StateKey, _PendingTask] = {}
+_pending_stops: dict[StateKey, _PendingStop] = {}
 _state_lock = RLock()
 
 
@@ -498,6 +571,24 @@ def set_task_service(callback: TaskServiceCallback | None) -> None:
     global _task_service
     with _state_lock:
         _task_service = callback if callback is not None else _default_task_service
+
+
+def set_task_stop_backend(backend: TaskStopBackend | None) -> None:
+    """Install a Stop backend, or restore lazy local construction."""
+
+    global _task_stop_backend
+    with _state_lock:
+        _task_stop_backend = backend
+
+
+def _stop_backend() -> TaskStopBackend:
+    global _task_stop_backend
+    with _state_lock:
+        if _task_stop_backend is None:
+            _task_stop_backend = _LocalStopBackend(
+                _required_environment(_TASK_SETTINGS_DB_ENV)
+            )
+        return _task_stop_backend
 
 
 def _hook_result(result: TurnResult) -> dict[str, object]:
@@ -577,7 +668,13 @@ def _combined_event(
     combined: dict[str, object] = dict(event or {})
     # The message/envelope is user controlled. Only the carried hook keyword
     # may supply trusted transport metadata.
-    combined.pop("working_directory", None)
+    for field_name in (
+        "owner_host",
+        "subject_id",
+        "source_event_id",
+        "working_directory",
+    ):
+        combined.pop(field_name, None)
     combined.update(values)
     return combined
 
@@ -650,6 +747,213 @@ def _read_event(
         now,
         working_directory,
     )
+
+
+def _trusted_stop_context(
+    combined: Mapping[str, object],
+    *,
+    session_id: str,
+    user_id: str,
+    surface: str,
+    working_directory: str | None,
+) -> TrustedTurnContext:
+    owner_host = combined.get("owner_host")
+    subject_id = combined.get("subject_id")
+    source_event_id = combined.get("source_event_id")
+    if (
+        not isinstance(owner_host, str)
+        or not owner_host
+        or not isinstance(subject_id, str)
+        or not subject_id
+        or subject_id != user_id
+        or not isinstance(source_event_id, str)
+        or not source_event_id
+    ):
+        raise RuntimeError(
+            "Trusted owner, subject, and source event context is required for Stop."
+        )
+    return TrustedTurnContext(
+        owner_host=owner_host,
+        subject_id=subject_id,
+        session_id=session_id,
+        surface=surface,
+        source_event_id=source_event_id,
+        working_directory=working_directory,
+    )
+
+
+def _stop_prompt(tasks: tuple[StoppableTask, ...], now: datetime) -> ChoicePrompt:
+    if len(tasks) < 2:
+        raise RuntimeError("Stop chooser requires at least two Tasks")
+    if len(tasks) > 256:
+        raise RuntimeError("Too many Tasks are stoppable; use an exact Task number")
+    choices = tuple(
+        Choice(
+            task.request_id,
+            (
+                f"#{task.parent_issue_number} — {task.title} "
+                f"({task.request_id[:8]})"
+                if task.parent_issue_number is not None
+                else f"Prepared Task — {task.title} ({task.request_id[:8]})"
+            ),
+            f"{task.management_repository} — {task.state}",
+        )
+        for task in tasks
+    ) + (Choice("cancel", "Cancel", "Keep every Task running"),)
+    return ChoicePrompt(
+        choice_prompt_id=str(uuid4()),
+        choice_mode=ChoiceMode.SINGLE,
+        min_choices=1,
+        max_choices=1,
+        submit_label="Stop Task",
+        expires_at=now + SETUP_TIMEOUT,
+        choices=choices,
+    )
+
+
+def _stop_receipt_result(receipt: StopReceipt) -> dict[str, object]:
+    target = (
+        f"Task #{receipt.parent_issue_number}"
+        if receipt.parent_issue_number is not None
+        else f"Task {receipt.request_id[:8]}"
+    )
+    return _hook_result(
+        TurnResult.handled(
+            f"{target} stop requested. New Task work is now blocked."
+        )
+    )
+
+
+def _stop_prompt_result(
+    pending: _PendingStop,
+    text: str,
+) -> dict[str, object]:
+    return _hook_result(
+        TurnResult.handled(text, choice_prompt=pending.prompt)
+    )
+
+
+def _execute_stop(
+    request_id: str,
+    context: TrustedTurnContext,
+    text: str,
+    now: datetime,
+) -> dict[str, object]:
+    try:
+        receipt = _stop_backend().request_stop(
+            request_id,
+            context,
+            text,
+            at=now,
+        )
+    except Exception as error:
+        return _hook_result(TurnResult.handled(f"Task was not stopped: {error}"))
+    return _stop_receipt_result(receipt)
+
+
+def _handle_stop_turn(
+    *,
+    combined: Mapping[str, object],
+    key: StateKey,
+    text: str,
+    submission: ChoiceSubmission | None,
+    session_id: str,
+    user_id: str,
+    surface: str,
+    working_directory: str | None,
+    now: datetime,
+    is_new_session: bool,
+) -> dict[str, object] | None:
+    with _state_lock:
+        if is_new_session:
+            _pending_stops.pop(key, None)
+        pending = _pending_stops.get(key)
+
+    stop_submission = submission
+    if pending is not None and stop_submission is None and text.startswith("choose "):
+        try:
+            stop_submission = _read_plain_choice_submission(text)
+        except ChoicePromptError as error:
+            return _stop_prompt_result(
+                pending,
+                f"That Stop chooser reply is invalid: {error}",
+            )
+
+    if pending is not None and stop_submission is not None:
+        try:
+            selected = pending.prompt.validate_submission(stop_submission, now)
+        except ChoicePromptError as error:
+            if now >= pending.prompt.expires_at:
+                with _state_lock:
+                    if _pending_stops.get(key) is pending:
+                        _pending_stops.pop(key, None)
+                return _hook_result(TurnResult.handled("Stop chooser expired."))
+            return _stop_prompt_result(
+                pending,
+                f"That Stop chooser reply is invalid: {error}",
+            )
+        with _state_lock:
+            if _pending_stops.get(key) is pending:
+                _pending_stops.pop(key, None)
+        request_id = selected[0]
+        if request_id == "cancel":
+            return _hook_result(TurnResult.handled("Task Stop cancelled."))
+        try:
+            context = _trusted_stop_context(
+                combined,
+                session_id=session_id,
+                user_id=user_id,
+                surface=surface,
+                working_directory=working_directory,
+            )
+        except Exception as error:
+            return _hook_result(TurnResult.handled(f"Task was not stopped: {error}"))
+        return _execute_stop(request_id, context, text, now)
+
+    command: StopCommand | None = parse_stop_command(text)
+    if command is None:
+        if pending is None:
+            return None
+        return _stop_prompt_result(
+            pending,
+            "Choose one Task to stop, or choose Cancel.",
+        )
+    if pending is not None:
+        with _state_lock:
+            if _pending_stops.get(key) is pending:
+                _pending_stops.pop(key, None)
+    try:
+        context = _trusted_stop_context(
+            combined,
+            session_id=session_id,
+            user_id=user_id,
+            surface=surface,
+            working_directory=working_directory,
+        )
+        tasks = _stop_backend().get_stoppable(context, command.issue_number)
+    except Exception as error:
+        return _hook_result(TurnResult.handled(f"Task was not stopped: {error}"))
+    if not tasks:
+        return _hook_result(TurnResult.handled("No running Task can be stopped."))
+    if len(tasks) == 1:
+        return _execute_stop(tasks[0].request_id, context, text, now)
+    try:
+        prompt = _stop_prompt(tasks, now)
+    except Exception as error:
+        return _hook_result(TurnResult.handled(f"Task was not stopped: {error}"))
+    pending = _PendingStop(
+        prompt=prompt,
+        request_ids=frozenset(task.request_id for task in tasks),
+    )
+    with _state_lock:
+        if len(_pending_stops) >= _MAX_PENDING_TASKS and key not in _pending_stops:
+            return _hook_result(
+                TurnResult.handled(
+                    "Task Stop chooser is temporarily full. Try again shortly."
+                )
+            )
+        _pending_stops[key] = pending
+    return _stop_prompt_result(pending, "Choose the Task to stop.")
 
 
 def _sweep_failed_inputs(now: datetime) -> None:
@@ -874,6 +1178,21 @@ def before_user_turn(
         return _error_result(error)
 
     key = (surface, session_id, user_id)
+
+    stop_result = _handle_stop_turn(
+        combined=combined,
+        key=key,
+        text=text,
+        submission=submission,
+        session_id=session_id,
+        user_id=user_id,
+        surface=surface,
+        working_directory=working_directory,
+        now=cleanup_time,
+        is_new_session=is_new_session,
+    )
+    if stop_result is not None:
+        return stop_result
 
     with _state_lock:
         _sweep_failed_inputs(cleanup_time)
@@ -1193,4 +1512,5 @@ __all__ = [
     "before_user_turn",
     "register",
     "set_task_service",
+    "set_task_stop_backend",
 ]
