@@ -1314,6 +1314,26 @@ class _ProjectRuntimeRegistry:
             if snapshot.project_state in self._RUNNABLE_STATES
         )
 
+    def get_active(
+        self,
+        *,
+        request_id: str,
+        task_settings_hash: str,
+        project_id: str,
+    ) -> ProjectRuntimeSnapshot:
+        """Return one exact dispatch-ready Project or fail closed."""
+
+        matches = tuple(
+            snapshot
+            for snapshot in self.list_active()
+            if snapshot.request.request_id == request_id
+            and snapshot.settings.task_settings_hash == task_settings_hash
+            and snapshot.project.project_id == project_id
+        )
+        if len(matches) != 1:
+            raise GateError("exact active Project runtime binding is unavailable")
+        return matches[0]
+
     def _require_complete_project_sets(
         self,
         connection: sqlite3.Connection,
@@ -1598,6 +1618,11 @@ class _ProjectRuntimeRegistry:
             expected_dispatch,
         ):
             raise GateError("v2 Task dispatch event does not match every Project")
+
+
+# Public dispatcher seam.  Keep the private alias used by existing flow code so
+# this change does not broaden or alter the established runtime path.
+ProjectRuntimeRegistry = _ProjectRuntimeRegistry
 
 
 def _project_root_payload(snapshot: ProjectRuntimeSnapshot) -> dict[str, object]:

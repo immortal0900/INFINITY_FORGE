@@ -1314,6 +1314,29 @@ def _activated_v2(
     return database_path, hermes_db, request, settings
 
 
+def test_public_project_runtime_registry_returns_only_the_exact_active_snapshot(
+    tmp_path: Path,
+) -> None:
+    settings_db, _hermes_db, request, settings = _activated_v2(tmp_path)
+    registry = task_runtime_module.ProjectRuntimeRegistry(settings_db)
+
+    snapshot = registry.get_active(
+        request_id=request.request_id,
+        task_settings_hash=settings.task_settings_hash,
+        project_id=request.projects[0].project_id,
+    )
+
+    assert snapshot.request == request
+    assert snapshot.settings == settings
+    assert snapshot.project == request.projects[0]
+    with pytest.raises(GateError, match="exact active Project"):
+        registry.get_active(
+            request_id=request.request_id,
+            task_settings_hash="f" * 64,
+            project_id=request.projects[0].project_id,
+        )
+
+
 def test_v2_worker_enumerates_all_projects_and_uses_each_worktree(
     tmp_path: Path,
 ) -> None:
