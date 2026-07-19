@@ -2318,6 +2318,20 @@ def _insert_project_merge_task_database(
                     request_payload["confirmed_at"],
                 ),
             )
+        connection.execute(
+            """
+            INSERT INTO task_access (
+                request_id, surface, subject_id, role, granted_by,
+                granted_at, revoked_at
+            ) VALUES (?, 'desktop', ?, 'owner', ?, ?, NULL)
+            """,
+            (
+                request.request_id,
+                request.confirmed_by,
+                request.confirmed_by,
+                request_payload["confirmed_at"],
+            ),
+        )
 
 
 def _create_empty_hermes_database(path: Path) -> None:

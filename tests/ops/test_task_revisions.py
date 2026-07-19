@@ -172,6 +172,20 @@ def _seed_active(
                 timestamp,
             ),
         )
+        connection.execute(
+            """
+            INSERT INTO task_access (
+                request_id, surface, subject_id, role, granted_by,
+                granted_at, revoked_at
+            ) VALUES (?, 'desktop', ?, 'owner', ?, ?, NULL)
+            """,
+            (
+                request.request_id,
+                request.confirmed_by,
+                request.confirmed_by,
+                timestamp,
+            ),
+        )
     return database, request, settings, project
 
 
@@ -314,6 +328,52 @@ def _bind_replacement(
                     }
                 ),
                 occurred_at,
+            ),
+        )
+
+
+def _seed_runtime_run(
+    database: TaskDatabase,
+    request: TaskRequestV2,
+    settings: TaskSettingsV2,
+    *,
+    packet_hash: str,
+    worker_task_id: str,
+    run_id: str,
+    state: str = "running",
+) -> None:
+    terminal = state in {"completed", "failed", "stopped"}
+    ended_at = (
+        (NOW + timedelta(minutes=4))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+        if terminal
+        else None
+    )
+    result_hash = hashlib.sha256(b"result").hexdigest() if state == "completed" else None
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO task_runtime_runs (
+                run_id, request_id, task_settings_hash, project_id, host_id,
+                worker_task_id, runtime_name, process_identity_json,
+                message_packet_hash, state, result_hash, started_at, ended_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'test-runtime', '{}', ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                request.request_id,
+                settings.task_settings_hash,
+                request.projects[0].project_id,
+                request.task_owner_host,
+                worker_task_id,
+                packet_hash,
+                state,
+                result_hash,
+                (NOW + timedelta(minutes=3))
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z"),
+                ended_at,
             ),
         )
 
@@ -575,6 +635,14 @@ def test_confirm_before_activation_does_not_expose_packet_then_activation_does(
         forged,
         packet_hash=hashlib.sha256(forged.to_json().encode("utf-8")).hexdigest(),
     )
+    _seed_runtime_run(
+        database,
+        replacement,
+        replacement_settings,
+        packet_hash=forged.packet_hash,
+        worker_task_id="forged-worker",
+        run_id="forged-run",
+    )
     with pytest.raises(TaskMessageError, match="omits|adds"):
         TaskMessageStore(database).record_included(
             forged,
@@ -659,6 +727,157 @@ def test_worker_included_is_not_ack_and_pending_blocks_result_acceptance(
     store = TaskMessageStore(database)
     packet = store.build_packet(replacement.request_id, settings.task_settings_hash)
 
+    for state in ("starting", "stopping", "failed", "stopped"):
+        run_id = f"{state}-run"
+        _seed_runtime_run(
+            database,
+            replacement,
+            settings,
+            packet_hash=packet.packet_hash,
+            worker_task_id="state-worker",
+            run_id=run_id,
+            state=state,
+        )
+        with pytest.raises(TaskMessageError, match="state"):
+            store.record_included(
+                packet,
+                worker_task_id="state-worker",
+                run_id=run_id,
+                at=NOW + timedelta(minutes=3),
+            )
+    _seed_runtime_run(
+        database,
+        replacement,
+        settings,
+        packet_hash=packet.packet_hash,
+        worker_task_id="completed-new-worker",
+        run_id="completed-new-run",
+        state="completed",
+    )
+    with pytest.raises(TaskMessageError, match="completed|state"):
+        store.record_included(
+            packet,
+            worker_task_id="completed-new-worker",
+            run_id="completed-new-run",
+            at=NOW + timedelta(minutes=4),
+        )
+    _seed_runtime_run(
+        database,
+        replacement,
+        settings,
+        packet_hash=packet.packet_hash,
+        worker_task_id="completed-ack-worker",
+        run_id="completed-ack-run",
+        state="completed",
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO task_message_events (
+                message_event_id, message_id, task_settings_hash,
+                worker_task_id, run_id, event_type, reason, occurred_at
+            ) VALUES ('completed-ack-included', ?, ?, 'completed-ack-worker',
+                      'completed-ack-run', 'included', NULL, ?)
+            """,
+            (
+                receipt.message.message_id,
+                settings.task_settings_hash,
+                (NOW + timedelta(minutes=3))
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z"),
+            ),
+        )
+    with pytest.raises(TaskMessageError, match="completed|state"):
+        store.record_ack(
+            packet,
+            message_id=receipt.message.message_id,
+            outcome="applied",
+            worker_task_id="completed-ack-worker",
+            run_id="completed-ack-run",
+            reason="must not be new",
+            at=NOW + timedelta(minutes=4),
+        )
+
+    with database.transaction() as connection:
+        for event_type, reason in (
+            ("included", None),
+            ("applied", "orphan applied"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO task_message_events (
+                    message_event_id, message_id, task_settings_hash,
+                    worker_task_id, run_id, event_type, reason, occurred_at
+                ) VALUES (?, ?, ?, 'orphan-worker', 'orphan-run', ?, ?, ?)
+                """,
+                (
+                    f"orphan-{event_type}",
+                    receipt.message.message_id,
+                    settings.task_settings_hash,
+                    event_type,
+                    reason,
+                    (NOW + timedelta(minutes=3))
+                    .isoformat(timespec="microseconds")
+                    .replace("+00:00", "Z"),
+                ),
+            )
+    with pytest.raises(TaskMessageError, match="runtime run"):
+        store.record_ack(
+            packet,
+            message_id=receipt.message.message_id,
+            outcome="applied",
+            worker_task_id="orphan-worker",
+            run_id="orphan-run",
+            reason="orphan applied",
+            at=NOW + timedelta(minutes=4),
+        )
+    with pytest.raises(TaskMessageError, match="runtime run"):
+        store.require_result_acknowledged(
+            packet,
+            worker_task_id="orphan-worker",
+            run_id="orphan-run",
+        )
+    with database.transaction() as connection:
+        connection.execute(
+            "DELETE FROM task_message_events WHERE run_id = 'orphan-run'"
+        )
+    with pytest.raises(TaskMessageError, match="runtime run"):
+        store.record_included(
+            packet,
+            worker_task_id="worker-1",
+            run_id="missing-run",
+            at=NOW + timedelta(minutes=3),
+        )
+    _seed_runtime_run(
+        database,
+        replacement,
+        settings,
+        packet_hash="0" * 64,
+        worker_task_id="worker-1",
+        run_id="wrong-packet-run",
+    )
+    with pytest.raises(TaskMessageError, match="packet"):
+        store.record_included(
+            packet,
+            worker_task_id="worker-1",
+            run_id="wrong-packet-run",
+            at=NOW + timedelta(minutes=3),
+        )
+    _seed_runtime_run(
+        database,
+        replacement,
+        settings,
+        packet_hash=packet.packet_hash,
+        worker_task_id="worker-1",
+        run_id="run-1",
+    )
+    with pytest.raises(TaskMessageError, match="worker"):
+        store.record_included(
+            packet,
+            worker_task_id="other-worker",
+            run_id="run-1",
+            at=NOW + timedelta(minutes=3),
+        )
     store.record_included(
         packet,
         worker_task_id="worker-1",
@@ -689,6 +908,44 @@ def test_worker_included_is_not_ack_and_pending_blocks_result_acceptance(
         reason="implemented",
         at=NOW + timedelta(minutes=4),
     )
+    with database.transaction() as connection:
+        before = connection.execute(
+            "SELECT count(*) FROM task_message_events WHERE run_id = 'run-1'"
+        ).fetchone()[0]
+        connection.execute(
+            """
+            UPDATE task_runtime_runs
+            SET state = 'completed', result_hash = ?, ended_at = ?
+            WHERE run_id = 'run-1' AND state = 'running'
+            """,
+            (
+                hashlib.sha256(b"result").hexdigest(),
+                (NOW + timedelta(minutes=5))
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z"),
+            ),
+        )
+    store.record_included(
+        packet,
+        worker_task_id="worker-1",
+        run_id="run-1",
+        at=NOW + timedelta(minutes=5),
+    )
+    store.record_ack(
+        packet,
+        message_id=receipt.message.message_id,
+        outcome="applied",
+        worker_task_id="worker-1",
+        run_id="run-1",
+        reason="implemented",
+        at=NOW + timedelta(minutes=5),
+    )
+    store.require_result_acknowledged(packet, worker_task_id="worker-1", run_id="run-1")
+    with database.read() as connection:
+        after = connection.execute(
+            "SELECT count(*) FROM task_message_events WHERE run_id = 'run-1'"
+        ).fetchone()[0]
+    assert after == before
     with pytest.raises(TaskMessageError, match="immutable"):
         store.record_ack(
             packet,

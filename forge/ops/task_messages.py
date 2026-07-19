@@ -349,6 +349,60 @@ def _require_active_on_connection(
         raise TaskMessageError("Task Resume has another pending revision")
 
 
+def _require_message_access(
+    connection: sqlite3.Connection,
+    request_id: str,
+    context: TrustedTurnContext,
+) -> None:
+    denied = TaskMessageError("Task is unavailable or access is denied")
+    request = connection.execute(
+        "SELECT task_owner_host FROM task_requests WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    if request is None or request[0] != context.owner_host:
+        raise denied
+
+    access = connection.execute(
+        """
+        SELECT role, revoked_at
+        FROM task_access
+        WHERE request_id = ? AND surface = ? AND subject_id = ?
+        """,
+        (request_id, context.surface, context.subject_id),
+    ).fetchone()
+    if access is not None:
+        if access[0] not in {"owner", "operator"} or access[1] is not None:
+            raise denied
+        return
+
+    bindings = connection.execute(
+        """
+        SELECT binding.parent_issue_number, settings.parent_issue_number
+        FROM task_session_bindings AS binding
+        JOIN task_settings_v2 AS settings
+          ON settings.request_id = binding.request_id
+         AND settings.parent_issue_number = binding.parent_issue_number
+        WHERE binding.request_id = ? AND binding.surface = ?
+          AND binding.subject_id = ? AND binding.session_id = ?
+        """,
+        (
+            request_id,
+            context.surface,
+            context.subject_id,
+            context.session_id,
+        ),
+    ).fetchall()
+    if len(bindings) != 1:
+        raise denied
+    binding = bindings[0]
+    if (
+        not isinstance(binding[0], int)
+        or binding[0] <= 0
+        or binding[0] != binding[1]
+    ):
+        raise denied
+
+
 def _message_from_row(row: sqlite3.Row) -> TaskMessage:
     try:
         message = TaskMessage(
@@ -442,16 +496,7 @@ class TaskMessageStore:
         encoded_size: int,
         timestamp: datetime,
     ) -> TaskMessageReceipt:
-        request_row = connection.execute(
-            """
-            SELECT task_owner_host FROM task_requests WHERE request_id = ?
-            """,
-            (request_id,),
-        ).fetchone()
-        if request_row is None:
-            raise TaskMessageError("Task request does not exist")
-        if request_row[0] != context.owner_host:
-            raise TaskMessageError("Task belongs to another owner host")
+        _require_message_access(connection, request_id, context)
 
         existing_row = connection.execute(
             "SELECT * FROM task_messages WHERE source_event_id = ?",
@@ -873,7 +918,12 @@ class TaskMessageStore:
         run_id = _require_id(run_id, "run_id")
         with self._database.transaction() as connection:
             self._validate_packet(connection, packet)
-            self._require_exact_run_packet(connection, packet, run_id=run_id)
+            run_state = self._require_exact_run_packet(
+                connection,
+                packet,
+                worker_task_id=worker_task_id,
+                run_id=run_id,
+            )
             for message in packet.messages:
                 self._ensure_message_event(
                     connection,
@@ -884,6 +934,7 @@ class TaskMessageStore:
                     event_type="included",
                     reason=None,
                     occurred_at=timestamp,
+                    allow_insert=run_state == "running",
                 )
 
     def record_ack(
@@ -907,7 +958,12 @@ class TaskMessageStore:
         timestamp = _utc(at if at is not None else self._clock(), "ack time")
         with self._database.transaction() as connection:
             self._validate_packet(connection, packet)
-            self._require_exact_run_packet(connection, packet, run_id=run_id)
+            run_state = self._require_exact_run_packet(
+                connection,
+                packet,
+                worker_task_id=worker_task_id,
+                run_id=run_id,
+            )
             if message_id not in {message.message_id for message in packet.messages}:
                 raise TaskMessageError(
                     "worker acknowledged a message outside its packet"
@@ -939,6 +995,10 @@ class TaskMessageStore:
                 ):
                     raise TaskMessageError("worker acknowledgement is immutable")
                 return
+            if run_state != "running":
+                raise TaskMessageError(
+                    "completed runtime run cannot add message acknowledgements"
+                )
             self._ensure_message_event(
                 connection,
                 message_id=message_id,
@@ -959,9 +1019,14 @@ class TaskMessageStore:
     ) -> None:
         worker_task_id = _require_id(worker_task_id, "worker_task_id")
         run_id = _require_id(run_id, "run_id")
-        with self._database.read() as connection:
+        with self._database.transaction() as connection:
             self._validate_packet(connection, packet)
-            self._require_exact_run_packet(connection, packet, run_id=run_id)
+            self._require_exact_run_packet(
+                connection,
+                packet,
+                worker_task_id=worker_task_id,
+                run_id=run_id,
+            )
             for message in packet.messages:
                 rows = connection.execute(
                     """
@@ -1048,8 +1113,60 @@ class TaskMessageStore:
         connection: sqlite3.Connection,
         packet: TaskMessagePacket,
         *,
+        worker_task_id: str,
         run_id: str,
-    ) -> None:
+    ) -> str:
+        run = connection.execute(
+            """
+            SELECT runtime.request_id, runtime.task_settings_hash,
+                   runtime.project_id, runtime.host_id,
+                   runtime.worker_task_id, runtime.message_packet_hash,
+                   request.task_owner_host, settings.task_owner_host,
+                   project.task_settings_hash, runtime.state,
+                   runtime.result_hash, runtime.ended_at
+            FROM task_runtime_runs AS runtime
+            JOIN task_requests AS request
+              ON request.request_id = runtime.request_id
+            JOIN task_settings_v2 AS settings
+              ON settings.request_id = runtime.request_id
+             AND settings.task_settings_hash = runtime.task_settings_hash
+            JOIN task_projects AS project
+              ON project.request_id = runtime.request_id
+             AND project.project_id = runtime.project_id
+             AND project.task_settings_hash = runtime.task_settings_hash
+            WHERE runtime.run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if run is None:
+            raise TaskMessageError("runtime run is unavailable or does not match")
+        if run[0] != packet.request_id or run[1] != packet.task_settings_hash:
+            raise TaskMessageError("runtime run Task or settings do not match packet")
+        if run[4] != worker_task_id:
+            raise TaskMessageError("runtime run worker does not match")
+        if run[5] != packet.packet_hash:
+            raise TaskMessageError("runtime run packet hash does not match")
+        if (
+            run[6] != run[7]
+            or run[3] != run[6]
+            or run[8] != packet.task_settings_hash
+        ):
+            raise TaskMessageError("runtime run Project or host binding changed")
+        run_state = run[9]
+        if run_state not in {"running", "completed"}:
+            raise TaskMessageError(
+                f"runtime run state {run_state} does not permit message events"
+            )
+        if run_state == "running":
+            if run[10] is not None or run[11] is not None:
+                raise TaskMessageError("running runtime run result binding changed")
+        elif (
+            not isinstance(run[10], str)
+            or _SHA256.fullmatch(run[10]) is None
+            or not isinstance(run[11], str)
+            or not run[11]
+        ):
+            raise TaskMessageError("completed runtime run result binding changed")
         revision = connection.execute(
             """
             SELECT request_id, created_at, updated_at
@@ -1097,6 +1214,7 @@ class TaskMessageStore:
         actual_ids = tuple(message.message_id for message in packet.messages)
         if actual_ids != expected_ids:
             raise TaskMessageError("run packet omits or adds a revision message")
+        return str(run_state)
 
     @staticmethod
     def _ensure_message_event(
@@ -1109,6 +1227,7 @@ class TaskMessageStore:
         event_type: str,
         reason: str | None,
         occurred_at: datetime,
+        allow_insert: bool = True,
     ) -> None:
         event_id = _event_id(message_id, task_settings_hash, run_id, event_type)
         existing = connection.execute(
@@ -1128,6 +1247,10 @@ class TaskMessageStore:
             reason,
         )
         if existing is None:
+            if not allow_insert:
+                raise TaskMessageError(
+                    "completed runtime run cannot add message events"
+                )
             connection.execute(
                 """
                 INSERT INTO task_message_events (

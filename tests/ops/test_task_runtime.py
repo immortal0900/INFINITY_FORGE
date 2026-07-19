@@ -1295,6 +1295,20 @@ def _activated_v2(
                 request_payload["confirmed_at"],
             ),
         )
+        connection.execute(
+            """
+            INSERT INTO task_access (
+                request_id, surface, subject_id, role, granted_by,
+                granted_at, revoked_at
+            ) VALUES (?, 'desktop', ?, 'owner', ?, ?, NULL)
+            """,
+            (
+                request.request_id,
+                request.confirmed_by,
+                request.confirmed_by,
+                request_payload["confirmed_at"],
+            ),
+        )
     hermes_db = tmp_path / "hermes-v2.db"
     _create_hermes_db(hermes_db)
     return database_path, hermes_db, request, settings

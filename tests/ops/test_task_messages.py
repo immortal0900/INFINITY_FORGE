@@ -79,6 +79,7 @@ def _insert_active(
     request: TaskRequestV2,
     *,
     issue_number: int = 21,
+    grant_access: bool = True,
 ) -> TaskSettingsV2:
     settings = TaskSettingsV2.create(
         request=request,
@@ -181,6 +182,21 @@ def _insert_active(
                 occurred_at,
             ),
         )
+        if grant_access:
+            connection.execute(
+                """
+                INSERT INTO task_access (
+                    request_id, surface, subject_id, role, granted_by,
+                    granted_at, revoked_at
+                ) VALUES (?, 'desktop', ?, 'owner', ?, ?, NULL)
+                """,
+                (
+                    request.request_id,
+                    request.confirmed_by,
+                    request.confirmed_by,
+                    occurred_at,
+                ),
+            )
     return settings
 
 
@@ -212,6 +228,97 @@ def _receive(
     at: datetime,
 ) -> None:
     SurfaceEventStore(database).receive(context, text, at=at)
+
+
+def test_send_requires_exact_task_access_without_revealing_task_existence(
+    tmp_path: Path,
+) -> None:
+    database = TaskDatabase(tmp_path / "task.db")
+    request = _request(tmp_path)
+    _insert_active(database, request, grant_access=False)
+    context = TrustedTurnContext(
+        owner_host=HOST_ID,
+        subject_id="other-user",
+        session_id="other-session",
+        surface="desktop",
+        source_event_id="desktop:unauthorized",
+        working_directory=None,
+    )
+    _receive(database, context, "unauthorized", at=NOW + timedelta(seconds=1))
+    store = TaskMessageStore(database)
+
+    with pytest.raises(TaskMessageError) as known:
+        store.send(request.request_id, context, "unauthorized")
+    with pytest.raises(TaskMessageError) as missing:
+        store.send("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", context, "unauthorized")
+
+    assert str(known.value) == "Task is unavailable or access is denied"
+    assert str(missing.value) == str(known.value)
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM task_messages").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM task_revision_requests").fetchone()[0]
+            == 0
+        )
+
+
+def test_exact_session_binding_can_authorize_task_message(
+    tmp_path: Path,
+) -> None:
+    database = TaskDatabase(tmp_path / "task.db")
+    request = _request(tmp_path)
+    _insert_active(database, request, grant_access=False)
+    context = _context(1)
+    _receive(database, context, "bound update", at=NOW + timedelta(seconds=1))
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO task_session_bindings (
+                surface, subject_id, session_id, request_id,
+                parent_issue_number, bound_at
+            ) VALUES (?, ?, ?, ?, 22, ?)
+            """,
+            (
+                context.surface,
+                context.subject_id,
+                context.session_id,
+                request.request_id,
+                NOW.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            ),
+        )
+    with pytest.raises(
+        TaskMessageError,
+        match="Task is unavailable or access is denied",
+    ):
+        TaskMessageStore(database).send(
+            request.request_id,
+            context,
+            "bound update",
+            at=NOW + timedelta(seconds=2),
+        )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE task_session_bindings SET parent_issue_number = 21
+            WHERE request_id = ? AND surface = ? AND subject_id = ?
+              AND session_id = ?
+            """,
+            (
+                request.request_id,
+                context.surface,
+                context.subject_id,
+                context.session_id,
+            ),
+        )
+
+    receipt = TaskMessageStore(database).send(
+        request.request_id,
+        context,
+        "bound update",
+        at=NOW + timedelta(seconds=2),
+    )
+
+    assert receipt.message.request_id == request.request_id
 
 
 def test_send_atomically_appends_message_and_one_changing_barrier(
