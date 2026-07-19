@@ -26,6 +26,17 @@ from forge.hermes_change.installer import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_surface_event_outbox(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv(
+        "INFINITY_FORGE_SOURCE_EVENT_OUTBOX",
+        str(tmp_path / "surface-events.json"),
+    )
+
+
 PLUGIN_SOURCE = '''VALID_HOOKS: set[str] = {
     "pre_gateway_dispatch",
 }
@@ -78,6 +89,63 @@ class AIAgent:
             persist_user_timestamp=persist_user_timestamp,
             moa_config=moa_config,
         )
+'''
+
+TOOL_EXECUTOR_SOURCE = '''from typing import Any
+
+def _apply_tool_request_middleware_for_agent(
+    agent,
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+    tool_call_id: str,
+) -> tuple[dict, list[dict[str, Any]]]:
+    try:
+        from hermes_cli.middleware import apply_tool_request_middleware
+        result = apply_tool_request_middleware(
+            function_name,
+            function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
+        payload = result.payload if isinstance(result.payload, dict) else function_args
+        return payload, list(result.trace)
+    except Exception:
+        return function_args, []
+
+def concurrent(agent, function_name, function_args, effective_task_id, tool_call):
+    function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
+        agent,
+        function_name=function_name,
+        function_args=function_args,
+        effective_task_id=effective_task_id,
+        tool_call_id=getattr(tool_call, "id", "") or "",
+    )
+    block_result = None
+    if _ts_scope_block is not None:
+        block_result = _ts_scope_block
+    else:
+        dispatch(function_args)
+
+def sequential(agent, function_name, function_args, effective_task_id, tool_call):
+    function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
+        agent,
+        function_name=function_name,
+        function_args=function_args,
+        effective_task_id=effective_task_id,
+        tool_call_id=getattr(tool_call, "id", "") or "",
+    )
+    _block_msg = None
+    _block_error_type = "plugin_block"
+    if _ts_scope_block is not None:
+        _block_msg = _ts_scope_block
+        _block_error_type = "tool_scope_block"
+    else:
+        dispatch(function_args)
 '''
 
 CLI_SOURCE = '''class ModalShell:
@@ -382,6 +450,18 @@ export type GatewayEvent =
     }
 """
 
+TUI_SUBMISSION_SOURCE = """export function submitPrompt(text: string, deps: any): void {
+  const sid = getUiState().sid
+  const startSubmit = (displayText: string, submitText: string) => {
+    const liveSid = getUiState().sid
+    deps.gw.request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText }).catch((e: Error) => {
+      deps.sys(`error: ${e.message}`)
+    })
+  }
+  startSubmit(text, text)
+}
+"""
+
 TUI_EVENT_HANDLER_SOURCE = """import type { GatewayEvent } from '../gatewayTypes.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { getUiState } from './uiStore.js'
@@ -518,6 +598,23 @@ export function PromptOverlays() {
 }
 """
 
+DESKTOP_SUBMIT_SOURCE = """export async function submitPrompt(
+  requestGateway: any,
+  sessionId: string,
+  text: string,
+  recoveredId: string | null,
+): Promise<void> {
+  await withSessionBusyRetry(() =>
+    requestGateway('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+  )
+  if (recoveredId) {
+    await withSessionBusyRetry(() =>
+      requestGateway('prompt.submit', { session_id: recoveredId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+    )
+  }
+}
+"""
+
 SLACK_ADAPTER_SOURCE = """class SlackAdapter(BasePlatformAdapter):
     def __init__(self, config):
         super().__init__(config, Platform.SLACK)
@@ -594,6 +691,9 @@ def _hermes_tree(root: Path) -> None:
     (root / "agent" / "conversation_loop.py").write_text(
         CONVERSATION_SOURCE, encoding="utf-8"
     )
+    (root / "agent" / "tool_executor.py").write_text(
+        TOOL_EXECUTOR_SOURCE, encoding="utf-8"
+    )
     (root / "run_agent.py").write_text(RUN_AGENT_SOURCE, encoding="utf-8")
     (root / "cli.py").write_text(CLI_SOURCE, encoding="utf-8")
     (root / "tui_gateway").mkdir(parents=True)
@@ -612,6 +712,9 @@ def _hermes_tree(root: Path) -> None:
     )
     (root / "ui-tui" / "src" / "app" / "overlayStore.ts").write_text(
         TUI_OVERLAY_STORE_SOURCE, encoding="utf-8"
+    )
+    (root / "ui-tui" / "src" / "app" / "submissionCore.ts").write_text(
+        TUI_SUBMISSION_SOURCE, encoding="utf-8"
     )
     (root / "ui-tui" / "src" / "components" / "prompts.tsx").write_text(
         TUI_PROMPTS_SOURCE, encoding="utf-8"
@@ -634,6 +737,10 @@ def _hermes_tree(root: Path) -> None:
     )
     (root / "apps" / "desktop" / "src" / "components" / "prompt-overlays.tsx").write_text(
         DESKTOP_PROMPT_OVERLAYS_SOURCE, encoding="utf-8"
+    )
+    (root / "apps" / "desktop" / "src" / "app" / "session" / "hooks" / "use-prompt-actions").mkdir(parents=True)
+    (root / "apps" / "desktop" / "src" / "app" / "session" / "hooks" / "use-prompt-actions" / "submit.ts").write_text(
+        DESKTOP_SUBMIT_SOURCE, encoding="utf-8"
     )
     (root / "plugins" / "platforms" / "slack").mkdir(parents=True)
     (root / "plugins" / "platforms" / "slack" / "adapter.py").write_text(
@@ -662,18 +769,21 @@ def test_carried_change_targets_user_surfaces_and_forwarder(tmp_path: Path) -> N
     assert {item.path for item in manifest.files} == {
         "hermes_cli/plugins.py",
         "agent/conversation_loop.py",
+        "agent/tool_executor.py",
         "run_agent.py",
         "cli.py",
         "tui_gateway/server.py",
         "ui-tui/src/gatewayTypes.ts",
         "ui-tui/src/app/createGatewayEventHandler.ts",
         "ui-tui/src/app/overlayStore.ts",
+        "ui-tui/src/app/submissionCore.ts",
         "ui-tui/src/components/prompts.tsx",
         "ui-tui/src/components/appOverlays.tsx",
         "apps/desktop/src/lib/chat-messages.ts",
         "apps/desktop/src/store/prompts.ts",
         "apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts",
         "apps/desktop/src/components/prompt-overlays.tsx",
+        "apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts",
         "plugins/platforms/slack/adapter.py",
         "gateway/run.py",
         "ui-tui/src/__tests__/prompt.test.ts",
@@ -712,6 +822,59 @@ def test_tui_chooser_payload_is_session_keyed_and_never_becomes_prompt_text() ->
     assert "choice.submit" in changed_prompts
     assert "prompt.submit" not in changed_prompts
     assert "ChoicePrompt" in changed_overlays
+
+
+def test_tui_blocked_store_supports_current_hermes_crlf_source() -> None:
+    source = '''import { atom, computed } from 'nanostores'
+
+import type { OverlayState } from './interfaces.js'
+
+export const $overlayState = atom<OverlayState>({} as OverlayState)
+
+export const $isBlocked = computed(
+  $overlayState,
+  ({
+    agents,
+    approval,
+    billing,
+    clarify,
+    confirm,
+    journey,
+    modelPicker,
+    pager,
+    petPicker,
+    pluginsHub,
+    secret,
+    sessions,
+    skillsHub,
+    sudo
+  }) =>
+    Boolean(
+      agents ||
+      approval ||
+      billing ||
+      clarify ||
+      confirm ||
+      journey ||
+      modelPicker ||
+      pager ||
+      petPicker ||
+      pluginsHub ||
+      secret ||
+      sessions ||
+      skillsHub ||
+      sudo
+    )
+)
+
+export const getOverlayState = () => $overlayState.get()
+'''.replace("\n", "\r\n")
+
+    changed = installer.change_tui_overlay_store_source(source)
+
+    assert "[$overlayState, $choicePrompts, $uiSessionId]" in changed
+    assert "(sessionId && choices[sessionId])" in changed
+    assert changed.count("\r\n") == changed.count("\n")
 
 
 def test_desktop_chooser_has_separate_keyed_store_and_accessible_controls() -> None:
@@ -1144,6 +1307,167 @@ def test_user_surfaces_opt_in_and_handled_turns_skip_model_followups() -> None:
         compile(changed, "<changed Hermes source>", "exec")
 
 
+def test_cli_outbox_reuses_source_event_after_failed_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outbox_path = tmp_path / "cli-source-events.json"
+    monkeypatch.setenv("INFINITY_FORGE_SOURCE_EVENT_OUTBOX", str(outbox_path))
+    monkeypatch.setenv(
+        "INFINITY_FORGE_HOST_ID", "d6f70d5d-6482-45f5-80d2-219ec2ad4d19"
+    )
+    namespace: dict[str, object] = {
+        "queue": queue,
+        "maybe_auto_title": lambda: None,
+    }
+    exec(installer.change_cli_source(CLI_SOURCE), namespace)
+    source_event_ids: list[str] = []
+
+    class Agent:
+        def __init__(self, fail: bool) -> None:
+            self.fail = fail
+
+        def run_conversation(self, **kwargs):
+            source_event_ids.append(
+                kwargs["trusted_turn_context"]["source_event_id"]
+            )
+            if self.fail:
+                raise RuntimeError("response lost")
+            return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    first = namespace["ModalShell"]()
+    first.agent = Agent(True)
+    first.session_id = "session-1"
+    first.conversation_history = [{"role": "user", "content": "hello"}]
+    with pytest.raises(RuntimeError, match="response lost"):
+        namespace["process"](first, "hello", "hello", None)
+
+    restarted = namespace["ModalShell"]()
+    restarted.agent = Agent(False)
+    restarted.session_id = "session-1"
+    restarted.conversation_history = [{"role": "user", "content": "hello"}]
+    namespace["process"](restarted, "hello", "hello", None)
+
+    assert len(source_event_ids) == 2
+    assert source_event_ids[0] == source_event_ids[1]
+    raw = json.loads(outbox_path.read_text(encoding="utf-8"))
+    assert raw["pending"] == {}
+
+
+def test_clients_reuse_one_persisted_source_event_id_for_transport_retry() -> None:
+    changed_tui = installer.change_tui_submission_source(TUI_SUBMISSION_SOURCE)
+    changed_desktop = installer.change_desktop_submit_source(DESKTOP_SUBMIT_SOURCE)
+
+    assert "forge-surface-event/v1" in changed_tui
+    assert "source_event_id: sourceEvent.id" in changed_tui
+    assert changed_tui.count("source_event_id: sourceEvent.id") == 1
+    assert "localStorage" in changed_desktop
+    assert changed_desktop.count("source_event_id: sourceEvent.id") == 2
+    assert "acknowledgeSourceEvent" in changed_desktop
+
+
+def test_gateway_and_slack_carry_authenticated_source_event_identity() -> None:
+    changed_tui = installer.change_tui_gateway_source(TUI_GATEWAY_SOURCE)
+    changed_gateway = installer.change_gateway_source(GATEWAY_SOURCE)
+    changed_slack = installer.change_slack_adapter_source(SLACK_ADAPTER_SOURCE)
+
+    assert 'params.get("source_event_id")' in changed_tui
+    assert "if _forge_source_event_id is None:" in changed_tui
+    assert '_forge_source_event_id = ""' in changed_tui
+    assert '"trusted_turn_context"' in changed_tui
+    assert '"source_event_id"' in changed_gateway
+    assert "trusted_turn_context=" in changed_gateway
+    assert 'event.get("client_msg_id")' in changed_slack
+    assert 'event.get("event_ts")' in changed_slack
+    assert 'choice_metadata["source_event_id"] = _forge_source_event_id' in changed_slack
+
+
+def test_gateway_trusted_context_attaches_to_the_runner_class() -> None:
+    source = GATEWAY_SOURCE.replace(
+        "class Gateway:",
+        "class GatewayRunner(GatewayAuthorizationMixin, GatewaySlashCommandsMixin):",
+    )
+
+    changed = installer.change_gateway_source(source)
+
+    runner = changed.split("class GatewayRunner", 1)[1]
+    assert "def _forge_trusted_turn_context" in runner
+    assert runner.index("def _forge_trusted_turn_context") < runner.index(
+        "async def _run_agent("
+    )
+
+
+def test_tui_busy_queue_keeps_one_authenticated_source_event() -> None:
+    busy_helpers = '''
+def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+    existing = session.get("queued_prompt")
+    if existing and isinstance(existing.get("text"), str) and isinstance(text, str):
+        prev = existing["text"]
+        text = f"{prev}\\n\\n{text}" if prev and text else (prev or text)
+    session["queued_prompt"] = {"text": text, "transport": transport}
+
+def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
+    _enqueue_prompt(session, text, transport)
+    return _ok(rid, {"status": "queued"})
+
+def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+    queued = session["queued_prompt"]
+    _run_prompt_submit(rid, sid, session, queued["text"])
+    return True
+
+def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+    pass
+
+def run_after_agent_ready():
+    _run_prompt_submit(rid, sid, session, text)
+
+run_thread = threading.Thread(target=run_after_agent_ready)
+'''
+    source = TUI_GATEWAY_SOURCE.replace(
+        "def process(agent, history, _stream, session, sid, text, raw, status):",
+        (
+            f"{busy_helpers}\n"
+            "def process(agent, history, _stream, session, sid, text, raw, status):"
+        ),
+    ).replace(
+        '    with session["history_lock"]:',
+        (
+            '    if session.get("running"):\n'
+            '        return _handle_busy_submit(rid, sid, session, text, '
+            't or session.get("transport"))\n'
+            '    with session["history_lock"]:'
+        ),
+        1,
+    )
+
+    changed = installer.change_tui_gateway_source(source)
+
+    assert "source_event_id = None" in changed
+    assert (
+        'session["queued_prompt"] = {"text": text, "transport": transport, '
+        '"source_event_id": source_event_id}'
+    ) in changed
+    assert 'queued.get("source_event_id")' in changed
+
+
+def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event() -> None:
+    changed = installer.change_tool_executor_source(TOOL_EXECUTOR_SOURCE)
+
+    assert "RISK(security)" in changed
+    assert "_FORGE_TRUSTED_TURN_FIELDS" in changed
+    assert "trusted_turn_context=_forge_trusted_context" in changed
+    assert "send_to_task" in changed and "stop_task" in changed
+    assert changed.count("_forge_context_block") >= 4
+    compile(changed, "<changed Hermes tool executor>", "exec")
+
+
+def test_run_agent_forwards_trusted_context_without_exposing_schema_fields() -> None:
+    changed = installer.change_run_agent_source(RUN_AGENT_SOURCE)
+
+    assert "trusted_turn_context: Optional[dict[str, Any]] = None" in changed
+    assert "trusted_turn_context=trusted_turn_context" in changed
+
+
 def test_cli_displays_choice_labels_without_changing_stable_ids() -> None:
     namespace: dict[str, object] = {"maybe_auto_title": lambda: None}
     exec(installer.change_cli_source(CLI_SOURCE), namespace)
@@ -1388,6 +1712,7 @@ def test_structured_ctrl_c_does_not_reenter_the_user_turn_hook() -> None:
     cli._voice_lock = threading.Lock()
     cli._voice_recording = False
     cli._voice_recorder = None
+    cli._slash_confirm_state = None
     cli.conversation_history = ["current"]
     cli.session_id = "session-1"
     namespace["cli_ref"] = cli

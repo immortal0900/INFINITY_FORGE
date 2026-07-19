@@ -90,6 +90,33 @@ def change_plugins_source(source: str) -> str:
 
 
 _CONVERSATION_HOOK = fr'''
+    # RISK(security): these names belong to the authenticated transport. A
+    # model/user envelope with the same names must never become authorization.
+    _forge_trusted_field_names = (
+        "owner_host", "subject_id", "user_id", "session_id", "surface",
+        "source_event_id", "working_directory", "cwd",
+    )
+    _forge_trusted_context = {{}}
+    if is_user_turn and isinstance(trusted_turn_context, dict):
+        for _forge_field in (
+            "owner_host", "subject_id", "session_id", "surface",
+            "source_event_id", "working_directory",
+        ):
+            _forge_value = trusted_turn_context.get(_forge_field)
+            if isinstance(_forge_value, str) and _forge_value:
+                _forge_trusted_context[_forge_field] = _forge_value
+            elif _forge_field == "working_directory" and _forge_value is None:
+                _forge_trusted_context[_forge_field] = None
+    if isinstance(user_message, dict):
+        user_message = {{
+            _forge_key: _forge_value
+            for _forge_key, _forge_value in user_message.items()
+            if _forge_key not in _forge_trusted_field_names
+        }}
+    # Reset on every run so an internal/background turn cannot inherit an
+    # authenticated identity from the preceding external user turn.
+    setattr(agent, "_infinity_forge_trusted_turn_context", {{}})
+
     if is_user_turn:
         # {_HOOK_MARKER}: only a caller that received a real user turn opts in.
         # Internal build, review, delegate, and batch calls keep the safe default.
@@ -258,24 +285,38 @@ _CONVERSATION_HOOK = fr'''
                 ),
                 "task_id": task_id,
                 "session_id": str(
-                    getattr(agent, "_gateway_session_key", "")
+                    _forge_trusted_context.get("session_id", "")
+                    or getattr(agent, "_gateway_session_key", "")
                     or task_id
                     or "local-session"
                 ),
                 "user_id": str(
-                    getattr(agent, "_user_id", "")
+                    _forge_trusted_context.get("subject_id", "")
+                    or getattr(agent, "_user_id", "")
                     or getattr(agent, "_gateway_user_id", "")
                     or getattr(agent, "user_id", "")
                     or os.environ.get("HERMES_USER_ID", "")
                     or "local-user"
                 ),
                 "surface": str(
-                    getattr(agent, "platform", "")
+                    _forge_trusted_context.get("surface", "")
+                    or getattr(agent, "platform", "")
                     or os.environ.get("HERMES_SESSION_SOURCE", "cli")
                 ),
                 # Trusted transport metadata is carried separately from the
                 # user-controlled message/envelope and is never inferred here.
-                "working_directory": working_directory,
+                "working_directory": _forge_trusted_context.get(
+                    "working_directory", working_directory
+                ),
+                "owner_host": str(
+                    _forge_trusted_context.get("owner_host", "")
+                ),
+                "subject_id": str(
+                    _forge_trusted_context.get("subject_id", "")
+                ),
+                "source_event_id": str(
+                    _forge_trusted_context.get("source_event_id", "")
+                ),
                 "is_new_session": (
                     False
                     if isinstance(user_message, dict)
@@ -286,6 +327,19 @@ _CONVERSATION_HOOK = fr'''
                     else not bool(conversation_history)
                 ),
             }}
+            _forge_trusted_context = {{
+                "owner_host": _pre_user_turn_values["owner_host"],
+                "subject_id": _pre_user_turn_values["user_id"],
+                "session_id": _pre_user_turn_values["session_id"],
+                "surface": _pre_user_turn_values["surface"],
+                "source_event_id": _pre_user_turn_values["source_event_id"],
+                "working_directory": _pre_user_turn_values["working_directory"],
+            }}
+            setattr(
+                agent,
+                "_infinity_forge_trusted_turn_context",
+                dict(_forge_trusted_context),
+            )
             if isinstance(user_message, dict):
                 for _submission_field in (
                     "choice_prompt_id",
@@ -446,6 +500,7 @@ def change_conversation_source(source: str) -> str:
         f"    moa_config: Optional[dict[str, Any]] = None,{newline}"
         f"    is_user_turn: bool = False,{newline}"
         f"    working_directory: Optional[str] = None,{newline}"
+        f"    trusted_turn_context: Optional[dict[str, Any]] = None,{newline}"
         f") -> Dict[str, Any]:{newline}"
     )
     source = (
@@ -602,6 +657,7 @@ def change_run_agent_source(source: str) -> str:
             "# RISK(breaking): this optional public argument defaults off for every existing caller.",
             "is_user_turn: bool = False,",
             "working_directory: Optional[str] = None,",
+            "trusted_turn_context: Optional[dict[str, Any]] = None,",
         ),
         label="run_agent.py signature",
     )
@@ -611,9 +667,142 @@ def change_run_agent_source(source: str) -> str:
         (
             "is_user_turn=is_user_turn,",
             "working_directory=working_directory,",
+            "trusted_turn_context=trusted_turn_context,",
         ),
         label="run_agent.py forwarding",
     )
+
+
+_TOOL_EXECUTOR_TRUST_HELPERS = r'''
+# INFINITY_FORGE_PRE_USER_TURN_V1: authenticated Forge tool context.
+_FORGE_TRUSTED_TURN_FIELDS = frozenset({
+    "owner_host", "subject_id", "user_id", "session_id", "surface",
+    "source_event_id", "working_directory", "cwd",
+})
+_FORGE_MUTATING_TOOLS = frozenset({"send_to_task", "stop_task"})
+
+
+def _forge_bind_trusted_tool_context(agent, function_name: str, function_args: dict):
+    # RISK(security): model-generated identity keys are discarded before any
+    # middleware, guardrail, approval, hook, or tool handler can observe them.
+    sanitized = {
+        key: value
+        for key, value in function_args.items()
+        if key not in _FORGE_TRUSTED_TURN_FIELDS
+    }
+    raw_context = getattr(agent, "_infinity_forge_trusted_turn_context", {})
+    trusted_context = {
+        key: raw_context.get(key)
+        for key in (
+            "owner_host", "subject_id", "session_id", "surface",
+            "source_event_id", "working_directory",
+        )
+        if isinstance(raw_context, dict)
+        and (isinstance(raw_context.get(key), str) or raw_context.get(key) is None)
+    }
+    source_event_id = trusted_context.get("source_event_id")
+    block_message = None
+    if function_name in _FORGE_MUTATING_TOOLS and (
+        not isinstance(source_event_id, str) or not source_event_id.strip()
+    ):
+        block_message = (
+            "Authenticated source event ID is unavailable; retry this user turn "
+            "before changing a Forge Task."
+        )
+    return sanitized, trusted_context, block_message
+'''
+
+
+def change_tool_executor_source(source: str) -> str:
+    """Bind authenticated turn metadata before both Hermes tool dispatch paths."""
+
+    if _HOOK_MARKER in source:
+        raise InstallError("tool_executor.py trusted turn handling is already installed")
+    source = _insert_before_unique_line(
+        source,
+        "def _apply_tool_request_middleware_for_agent(",
+        tuple(_TOOL_EXECUTOR_TRUST_HELPERS.strip("\n").splitlines()) + ("",),
+        label="tool executor trusted context helpers",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="def _apply_tool_request_middleware_for_agent(",
+        expected="try:",
+        addition=(
+            "    function_args, _forge_trusted_context, _forge_context_block = (",
+            "        _forge_bind_trusted_tool_context(agent, function_name, function_args)",
+            "    )",
+        ),
+        max_lines=14,
+        label="tool executor trusted context binding",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="result = apply_tool_request_middleware(",
+        expected='api_request_id=getattr(agent, "_current_api_request_id", "") or "",',
+        addition="trusted_turn_context=_forge_trusted_context,",
+        max_lines=14,
+        label="tool request trusted middleware context",
+    )
+    if source.count("return payload, list(result.trace)") != 1:
+        raise InstallError("tool executor middleware success return is not unique")
+    source = source.replace(
+        "return payload, list(result.trace)",
+        "return payload, list(result.trace), _forge_context_block",
+        1,
+    )
+    if source.count("return function_args, []") != 1:
+        raise InstallError("tool executor middleware failure return is not unique")
+    source = source.replace(
+        "return function_args, []",
+        "return function_args, [], _forge_context_block",
+        1,
+    )
+    assignment = (
+        "function_args, middleware_trace = "
+        "_apply_tool_request_middleware_for_agent("
+    )
+    if source.count(assignment) != 2:
+        raise InstallError("tool executor middleware call paths are not exact")
+    source = source.replace(
+        assignment,
+        "function_args, middleware_trace, _forge_context_block = "
+        "_apply_tool_request_middleware_for_agent(",
+    )
+
+    sequential_markers = (
+        "def execute_tool_calls_sequential(",
+        "def sequential(",
+    )
+    sequential_positions = [source.find(marker) for marker in sequential_markers]
+    sequential_positions = [position for position in sequential_positions if position >= 0]
+    if len(sequential_positions) != 1:
+        raise InstallError("tool executor sequential path is not unique")
+    split_at = sequential_positions[0]
+    concurrent, sequential = source[:split_at], source[split_at:]
+    concurrent = _insert_after_line_in_unique_block(
+        concurrent,
+        block_start="function_args, middleware_trace, _forge_context_block = _apply_tool_request_middleware_for_agent(",
+        expected=")",
+        addition=(
+            "if _forge_context_block is not None:",
+            "    _ts_scope_block = json.dumps({\"error\": _forge_context_block}, ensure_ascii=False)",
+        ),
+        max_lines=12,
+        label="concurrent Forge source event block",
+    )
+    sequential = _insert_after_line_in_unique_block(
+        sequential,
+        block_start="function_args, middleware_trace, _forge_context_block = _apply_tool_request_middleware_for_agent(",
+        expected=")",
+        addition=(
+            "if _forge_context_block is not None:",
+            "    _ts_scope_block = _forge_context_block",
+        ),
+        max_lines=12,
+        label="sequential Forge source event block",
+    )
+    return concurrent + sequential
 
 
 _CLI_CHOICE_METHODS = r'''
@@ -834,6 +1023,7 @@ def _continue_choice_modal_result(
     task_id,
     moa_config,
     working_directory=None,
+    trusted_turn_context=None,
 ):
     """Resolve bounded handled choosers through the same user-turn hook path."""
     # A direct Project can add remote and branch choosers before the existing
@@ -858,6 +1048,7 @@ def _continue_choice_modal_result(
             task_id=task_id,
             is_user_turn=True,
             working_directory=working_directory,
+            trusted_turn_context=trusted_turn_context,
             persist_user_message=None,
             moa_config=moa_config,
         )
@@ -952,6 +1143,29 @@ def change_cli_source(source: str) -> str:
             "    _forge_working_directory = __import__(\"os\").getcwd()",
             "except OSError:",
             "    _forge_working_directory = None",
+            "_forge_source_outbox = None",
+            "_forge_source_event_id = \"\"",
+            "try:",
+            "    from forge.ops.surface_events import LocalSurfaceOutbox as _ForgeSurfaceOutbox",
+            "    _forge_outbox_path = __import__(\"os\").environ.get(\"INFINITY_FORGE_SOURCE_EVENT_OUTBOX\")",
+            "    if not _forge_outbox_path:",
+            "        _forge_outbox_path = str(__import__(\"pathlib\").Path.home() / \".hermes\" / \"infinity-forge\" / \"surface-events.json\")",
+            "    _forge_source_outbox = _ForgeSurfaceOutbox(_forge_outbox_path)",
+            "    _forge_source_event_id = _forge_source_outbox.prepare(",
+            "        surface=\"cli\", session_id=str(self.session_id), payload=message",
+            "    )",
+            "except Exception as _forge_outbox_error:",
+            "    __import__(\"logging\").getLogger(__name__).warning(",
+            "        \"Infinity Forge source-event outbox unavailable: %s\", _forge_outbox_error",
+            "    )",
+            "_forge_trusted_turn_context = {",
+            "    \"owner_host\": __import__(\"os\").environ.get(\"INFINITY_FORGE_HOST_ID\", \"\"),",
+            "    \"subject_id\": __import__(\"os\").environ.get(\"HERMES_USER_ID\", \"local-user\"),",
+            "    \"session_id\": str(self.session_id),",
+            "    \"surface\": \"cli\",",
+            "    \"source_event_id\": _forge_source_event_id,",
+            "    \"working_directory\": _forge_working_directory,",
+            "}",
         ),
         label="cli.py initial working directory capture",
     )
@@ -974,6 +1188,14 @@ def change_cli_source(source: str) -> str:
     source = _insert_after_line_in_unique_block(
         source,
         block_start="result = self.agent.run_conversation(",
+        expected="working_directory=_forge_working_directory,",
+        addition="trusted_turn_context=_forge_trusted_turn_context,",
+        max_lines=16,
+        label="cli.py trusted source event context",
+    )
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start="result = self.agent.run_conversation(",
         expected=")",
         addition=(
             "result = self._continue_choice_modal_result(",
@@ -983,6 +1205,7 @@ def change_cli_source(source: str) -> str:
             "    task_id=self.session_id,",
             "    moa_config=_moa_cfg,",
             "    working_directory=_forge_working_directory,",
+            "    trusted_turn_context=_forge_trusted_turn_context,",
             ")",
         ),
         max_lines=14,
@@ -993,6 +1216,20 @@ def change_cli_source(source: str) -> str:
         "def _prompt_text_input_modal(",
         tuple(_CLI_CHOICE_METHODS.strip("\n").splitlines()) + ("",),
         label="cli.py generic chooser methods",
+    )
+    source = _insert_before_unique_line(
+        source,
+        'response = result.get("final_response", "") if result else ""',
+        (
+            "if (",
+            "    _forge_source_outbox is not None",
+            "    and _forge_source_event_id",
+            "    and isinstance(result, dict)",
+            "    and not result.get(\"failed\")",
+            "):",
+            "    _forge_source_outbox.acknowledge(_forge_source_event_id)",
+        ),
+        label="cli.py source event acknowledgement",
     )
     source = _insert_after_line_in_unique_block(
         source,
@@ -1147,6 +1384,99 @@ def change_tui_gateway_source(source: str) -> str:
 
     if _HOOK_MARKER in source:
         raise InstallError("tui_gateway/server.py user-turn handling is already installed")
+    source = _insert_after_line_in_unique_block(
+        source,
+        block_start='@method("prompt.submit")',
+        expected="return err",
+        addition=(
+            '_forge_source_event_id = params.get("source_event_id")',
+            "if _forge_source_event_id is None:",
+            '    _forge_source_event_id = ""',
+            "elif (",
+            "    not isinstance(_forge_source_event_id, str)",
+            "    or not _forge_source_event_id.strip()",
+            "    or _forge_source_event_id != _forge_source_event_id.strip()",
+            "    or any(ord(_forge_character) < 32 for _forge_character in _forge_source_event_id)",
+            "    or len(_forge_source_event_id) > 512",
+            "):",
+            "    return _err(rid, 4004, \"source_event_id is required\")",
+            'session["_infinity_forge_source_event_id"] = _forge_source_event_id',
+        ),
+        max_lines=12,
+        label="TUI source event validation",
+    )
+    if "def _run_prompt_submit(" in source:
+        source = _replace_unique_line(
+            source,
+            "def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:",
+            "def _run_prompt_submit(rid, sid: str, session: dict, text: Any, source_event_id: str | None = None) -> None:",
+            label="TUI source event turn parameter",
+        )
+        source = _replace_unique_line(
+            source,
+            "def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:",
+            "def _enqueue_prompt(session: dict, text: Any, transport: Any, source_event_id: str | None = None) -> None:",
+            label="TUI queued source event parameter",
+        )
+        source = _insert_after_line_in_unique_block(
+            source,
+            block_start=(
+                "def _enqueue_prompt(session: dict, text: Any, transport: Any, "
+                "source_event_id: str | None = None) -> None:"
+            ),
+            expected='text = f"{prev}\\n\\n{text}" if prev and text else (prev or text)',
+            addition=(
+                "# Multiple platform events merged into one prompt have no single",
+                "# authenticated event identity, so mutating Forge tools fail closed.",
+                "source_event_id = None",
+            ),
+            max_lines=24,
+            label="TUI merged event fail closed",
+        )
+        source = _replace_unique_line(
+            source,
+            'session["queued_prompt"] = {"text": text, "transport": transport}',
+            'session["queued_prompt"] = {"text": text, "transport": transport, "source_event_id": source_event_id}',
+            label="TUI queued source event storage",
+        )
+        source = _replace_unique_line(
+            source,
+            "def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:",
+            "def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any, source_event_id: str | None = None) -> dict:",
+            label="TUI busy source event parameter",
+        )
+        source = _replace_unique_line(
+            source,
+            "_enqueue_prompt(session, text, transport)",
+            "_enqueue_prompt(session, text, transport, source_event_id)",
+            label="TUI busy source event queue",
+        )
+        source = _replace_unique_line(
+            source,
+            '_run_prompt_submit(rid, sid, session, queued["text"])',
+            '_run_prompt_submit(rid, sid, session, queued["text"], queued.get("source_event_id"))',
+            label="TUI queued source event dispatch",
+        )
+        source = _replace_unique_line(
+            source,
+            "return _handle_busy_submit(rid, sid, session, text, t or session.get(\"transport\"))",
+            "return _handle_busy_submit(rid, sid, session, text, t or session.get(\"transport\"), _forge_source_event_id)",
+            label="TUI busy source event capture",
+        )
+        run_after_start = source.find("def run_after_agent_ready()")
+        run_after_end = source.find("run_thread = threading.Thread", run_after_start)
+        if run_after_start < 0 or run_after_end < 0:
+            raise InstallError("TUI prompt submit runner block was not found")
+        runner_block = source[run_after_start:run_after_end]
+        expected_call = "_run_prompt_submit(rid, sid, session, text)"
+        if runner_block.count(expected_call) != 1:
+            raise InstallError("TUI prompt submit source event call is not unique")
+        runner_block = runner_block.replace(
+            expected_call,
+            "_run_prompt_submit(rid, sid, session, text, _forge_source_event_id)",
+            1,
+        )
+        source = source[:run_after_start] + runner_block + source[run_after_end:]
     source = _insert_after_unique_line(
         source,
         '"stream_callback": _stream,',
@@ -1155,6 +1485,22 @@ def change_tui_gateway_source(source: str) -> str:
             '"is_user_turn": True,',
         ),
         label="tui gateway user-turn call",
+    )
+    source = _insert_after_unique_line(
+        source,
+        '"is_user_turn": True,',
+        (
+            '"working_directory": session.get("cwd"),',
+            '"trusted_turn_context": {',
+            '    "owner_host": __import__("os").environ.get("INFINITY_FORGE_HOST_ID", ""),',
+            '    "subject_id": __import__("os").environ.get("HERMES_USER_ID", "local-user"),',
+            '    "session_id": str(session.get("session_key") or sid),',
+            '    "surface": "tui",',
+            '    "source_event_id": (source_event_id if "source_event_id" in locals() else session.get("_infinity_forge_source_event_id", "")),',
+            '    "working_directory": session.get("cwd"),',
+            "},",
+        ),
+        label="TUI trusted source event context",
     )
     source = _replace_unique_line(
         source,
@@ -1199,6 +1545,16 @@ def change_tui_gateway_source(source: str) -> str:
             "        payload[_choice_field] = copy.deepcopy(result[_choice_field])",
         ),
         label="tui gateway chooser payload",
+    )
+    source = _insert_after_unique_line(
+        source,
+        'payload = {"text": raw, "usage": _get_usage(agent), "status": status}',
+        (
+            '_forge_completed_source_event_id = (source_event_id if "source_event_id" in locals() else session.get("_infinity_forge_source_event_id", ""))',
+            "if _forge_completed_source_event_id:",
+            '    payload["source_event_id"] = _forge_completed_source_event_id',
+        ),
+        label="TUI source event acknowledgement payload",
     )
     source = _insert_before_unique_line(
         source,
@@ -1448,7 +1804,7 @@ def change_tui_gateway_types_source(source: str) -> str:
         label="TUI chooser gateway types",
     )
     old = "payload?: { reasoning?: string; rendered?: string; text?: string; usage?: Usage }"
-    new = "payload?: Partial<GatewayChoicePrompt> & { reasoning?: string; rendered?: string; text?: string; usage?: Usage }"
+    new = "payload?: Partial<GatewayChoicePrompt> & { reasoning?: string; rendered?: string; source_event_id?: string; text?: string; usage?: Usage }"
     return _replace_unique_line(source, old, new, label="TUI chooser message.complete type")
 
 
@@ -1552,8 +1908,12 @@ def change_tui_overlay_store_source(source: str) -> str:
     )
 )'''
     fixture = "export const $isBlocked = computed($overlayState, overlay => Boolean(overlay.clarify))"
-    if source.count(actual) == 1:
-        return source.replace(actual, replacement)
+    newline = "\r\n" if "\r\n" in source else "\n"
+    normalized = source.replace("\r\n", "\n")
+    if normalized.count(actual) == 1:
+        native_actual = actual.replace("\n", newline)
+        native_replacement = replacement.replace("\n", newline)
+        return source.replace(native_actual, native_replacement, 1)
     if source.count(fixture) == 1:
         return source.replace(fixture, replacement)
     raise InstallError("TUI blocked-state chooser anchor is not unique")
@@ -1566,6 +1926,12 @@ def change_tui_event_handler_source(source: str) -> str:
         "import { clearChoicePrompt, getOverlayState, patchOverlayState, setChoicePrompt } from './overlayStore.js'",
         label="TUI chooser event store import",
     )
+    source = _insert_after_unique_line(
+        source,
+        "import { clearChoicePrompt, getOverlayState, patchOverlayState, setChoicePrompt } from './overlayStore.js'",
+        ("import { acknowledgeSourceEvent } from './submissionCore.js'",),
+        label="TUI source event acknowledgement import",
+    )
     return _insert_after_unique_line(
         source,
         "const sid = getUiState().sid",
@@ -1573,6 +1939,7 @@ def change_tui_event_handler_source(source: str) -> str:
             "",
             "// Capture background-session prompts before the active-session event gate.",
             "if (ev.type === 'message.start' && ev.session_id) clearChoicePrompt(ev.session_id)",
+            "if (ev.type === 'message.complete' && typeof ev.payload?.source_event_id === 'string') acknowledgeSourceEvent(ev.payload.source_event_id)",
             "if (ev.type === 'message.complete' && ev.session_id) setChoicePrompt(ev.session_id, ev.payload)",
         ),
         label="TUI chooser event capture",
@@ -1749,6 +2116,165 @@ def change_tui_app_overlays_source(source: str) -> str:
     return source
 
 
+_TUI_SOURCE_EVENT_OUTBOX = r'''import { createHash, randomUUID } from 'node:crypto'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+
+type ForgePendingSourceEvent = {
+  id: string
+  payloadHash: string
+  sessionId: string
+}
+
+type ForgeSourceEventOutbox = {
+  format: 'forge-surface-event/v1'
+  pending: ForgePendingSourceEvent[]
+}
+
+const forgeSourceEventPath = join(
+  process.env.HERMES_HOME || join(homedir(), '.hermes'),
+  'infinity-forge',
+  'tui-source-events.json',
+)
+
+const readSourceEvents = (): ForgeSourceEventOutbox => {
+  if (!existsSync(forgeSourceEventPath)) return { format: 'forge-surface-event/v1', pending: [] }
+  const value = JSON.parse(readFileSync(forgeSourceEventPath, 'utf8')) as ForgeSourceEventOutbox
+  if (value.format !== 'forge-surface-event/v1' || !Array.isArray(value.pending)) {
+    throw new Error('Infinity Forge TUI source-event outbox is invalid')
+  }
+  return value
+}
+
+const writeSourceEvents = (value: ForgeSourceEventOutbox): void => {
+  mkdirSync(dirname(forgeSourceEventPath), { mode: 0o700, recursive: true })
+  const temporary = `${forgeSourceEventPath}.${process.pid}.tmp`
+  writeFileSync(temporary, JSON.stringify(value), { encoding: 'utf8', mode: 0o600 })
+  chmodSync(temporary, 0o600)
+  renameSync(temporary, forgeSourceEventPath)
+}
+
+const prepareSourceEvent = (sessionId: string, payload: string): ForgePendingSourceEvent => {
+  const payloadHash = createHash('sha256').update(payload, 'utf8').digest('hex')
+  const outbox = readSourceEvents()
+  const prior = [...outbox.pending].reverse().find(
+    event => event.sessionId === sessionId && event.payloadHash === payloadHash,
+  )
+  if (prior) return prior
+  const event = { id: `tui:${randomUUID()}`, payloadHash, sessionId }
+  outbox.pending.push(event)
+  writeSourceEvents(outbox)
+  return event
+}
+
+export const acknowledgeSourceEvent = (sourceEventId: string): void => {
+  const outbox = readSourceEvents()
+  const pending = outbox.pending.filter(event => event.id !== sourceEventId)
+  if (pending.length === outbox.pending.length) return
+  writeSourceEvents({ ...outbox, pending })
+}
+'''
+
+
+def change_tui_submission_source(source: str) -> str:
+    """Persist one TUI submission ID before the gateway request is sent."""
+
+    if "forge-surface-event/v1" in source:
+        raise InstallError("TUI source-event outbox is already installed")
+    source = _TUI_SOURCE_EVENT_OUTBOX + "\n" + source
+    request_line = (
+        "deps.gw.request<PromptSubmitResponse>('prompt.submit', "
+        "{ session_id: liveSid, text: submitText }).catch((e: Error) => {"
+    )
+    source = _insert_before_unique_line(
+        source,
+        request_line,
+        ("const sourceEvent = prepareSourceEvent(liveSid, submitText)",),
+        label="TUI durable source event preparation",
+    )
+    return _replace_unique_line(
+        source,
+        request_line,
+        "deps.gw.request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText, source_event_id: sourceEvent.id }).catch((e: Error) => {",
+        label="TUI source event submission",
+    )
+
+
+_DESKTOP_SOURCE_EVENT_OUTBOX = r'''type ForgeDesktopSourceEvent = {
+  id: string
+  payloadHash: string
+  sessionId: string
+}
+
+const forgeDesktopSourceEventKey = 'forge-surface-event/v1'
+
+const readDesktopSourceEvents = (): ForgeDesktopSourceEvent[] => {
+  const raw = globalThis.localStorage.getItem(forgeDesktopSourceEventKey)
+  if (!raw) return []
+  const value = JSON.parse(raw) as unknown
+  if (!Array.isArray(value)) throw new Error('Infinity Forge Desktop source-event outbox is invalid')
+  return value as ForgeDesktopSourceEvent[]
+}
+
+const payloadHash = async (payload: string): Promise<string> => {
+  const bytes = new TextEncoder().encode(payload)
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes)
+  return [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, '0')).join('')
+}
+
+const prepareSourceEvent = async (sessionId: string, payload: string): Promise<ForgeDesktopSourceEvent> => {
+  const hash = await payloadHash(payload)
+  const pending = readDesktopSourceEvents()
+  const prior = [...pending].reverse().find(event => event.sessionId === sessionId && event.payloadHash === hash)
+  if (prior) return prior
+  const event = { id: `desktop:${globalThis.crypto.randomUUID()}`, payloadHash: hash, sessionId }
+  globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify([...pending, event]))
+  return event
+}
+
+export const acknowledgeSourceEvent = (sourceEventId: string): void => {
+  const pending = readDesktopSourceEvents()
+  const retained = pending.filter(event => event.id !== sourceEventId)
+  if (retained.length !== pending.length) {
+    globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify(retained))
+  }
+}
+'''
+
+
+def change_desktop_submit_source(source: str) -> str:
+    """Reuse one localStorage-backed Desktop ID across request retries."""
+
+    if "forge-surface-event/v1" in source:
+        raise InstallError("Desktop source-event outbox is already installed")
+    source = _DESKTOP_SOURCE_EVENT_OUTBOX + "\n" + source
+    first_request = (
+        "requestGateway('prompt.submit', { session_id: sessionId, text }, "
+        "PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)"
+    )
+    source = _insert_before_unique_line(
+        source,
+        first_request,
+        ("const sourceEvent = await prepareSourceEvent(sessionId, text)",),
+        label="Desktop durable source event preparation",
+    )
+    if source.count("{ session_id: sessionId, text }") != 1 or source.count(
+        "{ session_id: recoveredId, text }"
+    ) != 1:
+        raise InstallError("Desktop prompt.submit retry payloads are not exact")
+    source = source.replace(
+        "{ session_id: sessionId, text }",
+        "{ session_id: sessionId, text, source_event_id: sourceEvent.id }",
+        1,
+    )
+    return source.replace(
+        "{ session_id: recoveredId, text }",
+        "{ session_id: recoveredId, text, source_event_id: sourceEvent.id }",
+        1,
+    )
+
+
 def change_desktop_chat_messages_source(source: str) -> str:
     """Widen only message.complete choices; clarify keeps its string contract."""
 
@@ -1791,6 +2317,7 @@ def change_desktop_chat_messages_source(source: str) -> str:
             "max_choices?: null | number",
             "submit_label?: string",
             "expires_at?: string",
+            "source_event_id?: string",
         ),
         label="Desktop chooser contract fields",
     )
@@ -1922,6 +2449,12 @@ def change_desktop_gateway_event_source(source: str) -> str:
     if source.count(actual_import) != 1:
         raise InstallError("Desktop gateway chooser import anchor is not unique")
     source = source.replace(actual_import, new_import)
+    source = _insert_after_unique_line(
+        source,
+        new_import,
+        ("import { acknowledgeSourceEvent } from '../use-prompt-actions/submit'",),
+        label="Desktop source event acknowledgement import",
+    )
 
     message_start = "} else if (event.type === 'message.start') {"
     source = _insert_after_unique_line(
@@ -1932,16 +2465,18 @@ def change_desktop_gateway_event_source(source: str) -> str:
         ),
         label="Desktop chooser clear on new turn",
     )
-    return _insert_after_unique_line(
+    source = _insert_after_unique_line(
         source,
         "completeAssistantMessage(sessionId, finalText)",
         (
+            "if (typeof payload?.source_event_id === 'string') acknowledgeSourceEvent(payload.source_event_id)",
             "",
             "const choiceRequest = choiceRequestFromPayload(payload, sessionId)",
             "if (choiceRequest) setChoiceRequest(choiceRequest)",
         ),
         label="Desktop chooser capture after message completion",
     )
+    return source
 
 
 def change_desktop_prompt_overlays_source(source: str) -> str:
@@ -2274,7 +2809,13 @@ def change_slack_adapter_source(source: str) -> str:
             message_type=MessageType.TEXT,
             source=source,
             raw_message={"type": "forge_choice_action"},
-            metadata={"structured_user_message": envelope},
+            metadata={
+                "structured_user_message": envelope,
+                "source_event_id": (
+                    f"slack-choice:{state['channel_id']}:{state['user_id']}:"
+                    f"{state['prompt']['choice_prompt_id']}:{','.join(selected_ids)}"
+                ),
+            },
         )
         await self.handle_message(event)
 
@@ -2389,7 +2930,11 @@ def change_slack_adapter_source(source: str) -> str:
         "if choice_reply_handled and structured_choice is None:",
         "    logger.warning(\"[Slack] Ignoring invalid exact-ID chooser reply from %s\", user_id)",
         "    return",
+        "_forge_platform_event_id = (event.get(\"event_ts\") if event.get(\"subtype\") == \"message_changed\" else event.get(\"client_msg_id\")) or event.get(\"event_ts\") or event.get(\"ts\") or (event.get(\"message\") or {}).get(\"client_msg_id\")",
+        "_forge_source_event_id = f\"slack:{channel_id}:{_forge_platform_event_id}\" if _forge_platform_event_id else \"\"",
         "choice_metadata = {\"structured_user_message\": structured_choice} if structured_choice else {}",
+        "if _forge_source_event_id:",
+        "    choice_metadata[\"source_event_id\"] = _forge_source_event_id",
         "",
     )
     source = _insert_before_unique_line(source, msg_anchor, prelude, label="Slack exact-ID chooser fallback")
@@ -2408,6 +2953,43 @@ def change_gateway_source(source: str) -> str:
 
     if _HOOK_MARKER in source:
         raise InstallError("gateway/run.py user-turn handling is already installed")
+    gateway_lines = source.splitlines()
+    runner_methods = [
+        index
+        for index, line in enumerate(gateway_lines)
+        if line.strip() == "async def _run_agent("
+    ]
+    if len(runner_methods) != 1:
+        raise InstallError("gateway structured runner seam is not unique")
+    runner_classes = [
+        line.strip()
+        for line in gateway_lines[: runner_methods[0]]
+        if line.startswith("class ") and line.rstrip().endswith(":")
+    ]
+    if not runner_classes:
+        raise InstallError("gateway runner class was not found")
+    gateway_class_anchor = runner_classes[-1]
+    source = _insert_after_unique_line(
+        source,
+        gateway_class_anchor,
+        (
+            "    @staticmethod",
+            "    def _forge_trusted_turn_context(event, source, session_id):",
+            "        # RISK(security): source identity is adapter-authenticated; user/model text is ignored.",
+            "        metadata = getattr(event, \"metadata\", None)",
+            "        source_event_id = metadata.get(\"source_event_id\", \"\") if isinstance(metadata, dict) else \"\"",
+            "        return {",
+            "            \"owner_host\": os.environ.get(\"INFINITY_FORGE_HOST_ID\", \"\"),",
+            "            \"subject_id\": str(getattr(source, \"user_id\", \"\") or \"\"),",
+            "            \"session_id\": str(session_id or \"\"),",
+            "            \"surface\": str(getattr(source, \"platform\", \"\") or \"gateway\"),",
+            "            \"source_event_id\": str(source_event_id or \"\"),",
+            "            \"working_directory\": getattr(source, \"working_directory\", None),",
+            "        }",
+            "",
+        ),
+        label="gateway trusted turn context builder",
+    )
     source = _insert_after_unique_line(
         source,
         '"task_id": session_id,',
@@ -2454,14 +3036,15 @@ def change_gateway_source(source: str) -> str:
     # The full Hermes gateway has an inner runner seam that can accept the
     # trusted adapter metadata without serializing it into user-visible text.
     runner_seams = source.count("async def _run_agent(")
-    if runner_seams != 1:
-        raise InstallError("gateway structured runner seam is not unique")
     if runner_seams == 1:
         source = _insert_after_line_in_unique_block(
             source,
             block_start="async def _run_agent(",
             expected="persist_user_timestamp: Optional[float] = None,",
-            addition="structured_user_message: Optional[dict] = None,",
+            addition=(
+                "structured_user_message: Optional[dict] = None,",
+                "trusted_turn_context: Optional[dict] = None,",
+            ),
             max_lines=30,
             label="gateway structured chooser wrapper parameter",
         )
@@ -2469,7 +3052,10 @@ def change_gateway_source(source: str) -> str:
             source,
             block_start="async def _run_agent_inner(",
             expected="persist_user_timestamp: Optional[float] = None,",
-            addition="structured_user_message: Optional[dict] = None,",
+            addition=(
+                "structured_user_message: Optional[dict] = None,",
+                "trusted_turn_context: Optional[dict] = None,",
+            ),
             max_lines=30,
             label="gateway structured chooser inner parameter",
         )
@@ -2490,8 +3076,14 @@ def change_gateway_source(source: str) -> str:
                 if ordinal == 0
                 else "structured_user_message"
             )
+            trusted_value = (
+                "self._forge_trusted_turn_context(event, source, session_id)"
+                if ordinal == 0
+                else "trusted_turn_context"
+            )
             lines[index + 1 : index + 1] = [
-                f"{indent}structured_user_message={value},{newline}"
+                f"{indent}structured_user_message={value},{newline}",
+                f"{indent}trusted_turn_context={trusted_value},{newline}",
             ]
         source = "".join(lines)
         source = _insert_after_unique_line(
@@ -2512,6 +3104,12 @@ def change_gateway_source(source: str) -> str:
                 "",
             ),
             label="gateway trusted chooser envelope",
+        )
+        source = _insert_after_unique_line(
+            source,
+            '"is_user_turn": True,',
+            ('"trusted_turn_context": trusted_turn_context,',),
+            label="gateway trusted source event forwarding",
         )
 
         final_return = re.compile(
@@ -2790,18 +3388,21 @@ class TestSlackChoicePrompt:
 _CHANGES: dict[str, Callable[[str], str]] = {
     "hermes_cli/plugins.py": change_plugins_source,
     "agent/conversation_loop.py": change_conversation_source,
+    "agent/tool_executor.py": change_tool_executor_source,
     "run_agent.py": change_run_agent_source,
     "cli.py": change_cli_source,
     "tui_gateway/server.py": change_tui_gateway_source,
     "ui-tui/src/gatewayTypes.ts": change_tui_gateway_types_source,
     "ui-tui/src/app/createGatewayEventHandler.ts": change_tui_event_handler_source,
     "ui-tui/src/app/overlayStore.ts": change_tui_overlay_store_source,
+    "ui-tui/src/app/submissionCore.ts": change_tui_submission_source,
     "ui-tui/src/components/prompts.tsx": change_tui_prompts_source,
     "ui-tui/src/components/appOverlays.tsx": change_tui_app_overlays_source,
     "apps/desktop/src/lib/chat-messages.ts": change_desktop_chat_messages_source,
     "apps/desktop/src/store/prompts.ts": change_desktop_prompts_store_source,
     "apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts": change_desktop_gateway_event_source,
     "apps/desktop/src/components/prompt-overlays.tsx": change_desktop_prompt_overlays_source,
+    "apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts": change_desktop_submit_source,
     "plugins/platforms/slack/adapter.py": change_slack_adapter_source,
     "gateway/run.py": change_gateway_source,
     "ui-tui/src/__tests__/prompt.test.ts": change_tui_prompt_test_source,

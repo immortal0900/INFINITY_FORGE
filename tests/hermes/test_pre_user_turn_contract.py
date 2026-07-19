@@ -45,6 +45,7 @@ def _run_changed_source(
     user_message: str | dict[str, object] = "first question",
     conversation_history: list[dict[str, object]] | None = None,
     working_directory: str | None = None,
+    trusted_turn_context: dict[str, object] | None = None,
 ):
     plugins = types.ModuleType("hermes_cli.plugins")
     hook_results = hook_result if isinstance(hook_result, list) else [hook_result]
@@ -63,6 +64,7 @@ def _run_changed_source(
         conversation_history=conversation_history or [],
         is_user_turn=is_user_turn,
         working_directory=working_directory,
+        trusted_turn_context=trusted_turn_context,
     )
 
 
@@ -451,9 +453,85 @@ def test_hook_uses_only_carried_working_directory_not_user_envelope(monkeypatch)
         working_directory="C:/trusted",
     )
 
-    assert result == {
-        "seen": {"text": "first question", "working_directory": "C:/untrusted"}
-    }
+    assert result == {"seen": {"text": "first question"}}
     assert captured["name"] == "pre_user_turn"
     assert captured["text"] == "first question"
     assert captured["working_directory"] == "C:/trusted"
+
+
+def test_trusted_turn_context_overrides_same_named_model_input(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    plugins = types.ModuleType("hermes_cli.plugins")
+
+    def invoke_hook(name: str, **values: object):
+        captured.update(values)
+        return [{"action": "continue"}]
+
+    plugins.has_hook = lambda name: True
+    plugins.invoke_hook = invoke_hook
+    package = types.ModuleType("hermes_cli")
+    package.plugins = plugins
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+    namespace: dict[str, object] = {}
+    exec(change_conversation_source(CONVERSATION_SOURCE), namespace)
+    agent = types.SimpleNamespace(platform="forged", _gateway_session_key="forged")
+    trusted = {
+        "owner_host": "d6f70d5d-6482-45f5-80d2-219ec2ad4d19",
+        "subject_id": "trusted-user",
+        "session_id": "trusted-session",
+        "surface": "desktop",
+        "source_event_id": "desktop:01JZABC",
+        "working_directory": "C:/trusted",
+    }
+
+    result = namespace["run_conversation"](
+        agent,
+        {
+            "text": "update the Task",
+            "owner_host": "forged-host",
+            "subject_id": "forged-subject",
+            "user_id": "forged-user",
+            "session_id": "forged-session",
+            "surface": "forged-surface",
+            "source_event_id": "forged-event",
+            "working_directory": "C:/forged",
+        },
+        conversation_history=[],
+        is_user_turn=True,
+        trusted_turn_context=trusted,
+    )
+
+    assert result == {"seen": {"text": "update the Task"}}
+    assert captured["owner_host"] == trusted["owner_host"]
+    assert captured["subject_id"] == "trusted-user"
+    assert captured["user_id"] == "trusted-user"
+    assert captured["session_id"] == "trusted-session"
+    assert captured["surface"] == "desktop"
+    assert captured["source_event_id"] == "desktop:01JZABC"
+    assert captured["working_directory"] == "C:/trusted"
+    assert agent._infinity_forge_trusted_turn_context == trusted
+
+
+def test_internal_turn_clears_a_prior_trusted_context(monkeypatch) -> None:
+    plugins = types.ModuleType("hermes_cli.plugins")
+    plugins.has_hook = lambda name: True
+    plugins.invoke_hook = lambda name, **values: [{"action": "continue"}]
+    package = types.ModuleType("hermes_cli")
+    package.plugins = plugins
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+    namespace: dict[str, object] = {}
+    exec(change_conversation_source(CONVERSATION_SOURCE), namespace)
+    agent = types.SimpleNamespace(
+        _infinity_forge_trusted_turn_context={"source_event_id": "stale"}
+    )
+
+    namespace["run_conversation"](
+        agent,
+        "internal prompt",
+        conversation_history=[],
+        is_user_turn=False,
+    )
+
+    assert agent._infinity_forge_trusted_turn_context == {}
