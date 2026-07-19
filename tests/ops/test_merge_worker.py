@@ -18,6 +18,8 @@ from forge.ops.contracts import CheckRun
 from forge.ops.github import GitHubMergeEvidence, PullRequestWriteState
 from forge.ops.github_merge import BranchRefreshResult, MergeWriteResult
 from forge.ops.hermes import GateError
+from forge.ops.surface_events import SurfaceEventStore, TrustedTurnContext
+from forge.ops.task_messages import TaskMessageStore
 from forge.ops.merge_decision import (
     AUTO_MERGE_ALLOWED,
     MANUAL_MERGE_REQUIRED,
@@ -45,6 +47,7 @@ from forge.ops.task_options import MergeMode, TaskFlow
 from forge.ops.task_service import TaskCreationRequest
 from forge.ops.task_projects import TaskProject
 from forge.ops.task_database import TaskDatabase
+from forge.ops.task_revisions import TaskRevisionService
 from forge.ops.task_settings import (
     TASK_SETTINGS_FORMAT,
     BranchRefreshIntent,
@@ -3170,3 +3173,56 @@ def test_database_reservation_rejects_lifecycle_change_after_barrier(
             (task.request.request_id, target.project.project_id),
         ).fetchone()
     assert state is not None and state[0] == target.project_state
+
+
+def test_project_merge_store_allows_only_explicitly_resumed_revision(
+    tmp_path: Path,
+) -> None:
+    task = _project_merge_task(tmp_path)
+    database_path = tmp_path / "task.db"
+    _insert_project_merge_task_database(database_path, task)
+    database = TaskDatabase(database_path)
+    context = TrustedTurnContext(
+        owner_host=task.request.task_owner_host,
+        subject_id=task.request.confirmed_by,
+        session_id="merge-resume-session",
+        surface="desktop",
+        source_event_id="desktop:merge-resume",
+        working_directory=None,
+    )
+    SurfaceEventStore(database).receive(
+        context,
+        "cancel this merge update",
+        at=NOW + timedelta(seconds=1),
+    )
+    receipt = TaskMessageStore(database).send(
+        task.request.request_id,
+        context,
+        "cancel this merge update",
+        at=NOW + timedelta(seconds=1),
+    )
+    proofs = tuple(
+        ProjectMergeProof(
+            snapshot.project.project_id,
+            snapshot.project.repository,
+            AUTO_MERGE_ALLOWED,
+            snapshot.task_flow_state.current_commit,  # type: ignore[union-attr]
+        )
+        for snapshot in task.projects
+    )
+    store = TaskDatabaseProjectMergeStore(database_path)
+
+    with pytest.raises(MergeRuntimeError, match="lifecycle"):
+        store.prepare_barrier(task, proofs, occurred_at=NOW + timedelta(seconds=2))
+    revisions = TaskRevisionService(database)
+    revisions.cancel(
+        receipt.revision_request_id,
+        reason="user cancelled",
+        at=NOW + timedelta(seconds=2),
+    )
+    revisions.resume(
+        receipt.revision_request_id,
+        at=NOW + timedelta(seconds=3),
+    )
+
+    store.prepare_barrier(task, proofs, occurred_at=NOW + timedelta(seconds=4))

@@ -57,6 +57,7 @@ from .task_flow import (
 from .task_outbox import TaskOutbox
 from .task_database import TaskDatabase, TaskDatabaseError
 from .task_projects import TaskProject
+from .task_revisions import task_lifecycle_is_active
 from .task_service import (
     TaskCreationRequest,
     TaskIssue,
@@ -1229,19 +1230,6 @@ class _ProjectRuntimeRegistry:
     """Read and guard the Task 8 registry without inventing fallback state."""
 
     _RUNNABLE_STATES = frozenset({"ready", "running", "reviewing"})
-    _BARRIER_EVENTS = frozenset(
-        {
-            "revision_requested",
-            "stop_requested",
-            "changing",
-            "stopping",
-            "cancelled",
-            "expired",
-            "merged",
-            "replaced",
-            "partially_merged",
-        }
-    )
 
     def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self._read_only = read_only
@@ -1285,21 +1273,32 @@ class _ProjectRuntimeRegistry:
                     JOIN task_projects AS p
                       ON p.request_id = s.request_id
                      AND p.task_settings_hash = s.task_settings_hash
-                    WHERE EXISTS (
-                        SELECT 1 FROM task_events AS active_event
-                        WHERE active_event.request_id = s.request_id
-                          AND active_event.task_settings_hash = s.task_settings_hash
-                          AND active_event.event_type = 'active'
-                    )
-                      AND NOT EXISTS (
-                        SELECT 1 FROM task_events AS barrier_event
-                        WHERE barrier_event.request_id = s.request_id
-                          AND barrier_event.event_type IN (
-                              'revision_requested', 'stop_requested', 'changing',
-                              'stopping', 'cancelled', 'expired', 'merged',
-                              'replaced', 'partially_merged'
+                    WHERE (
+                        SELECT lifecycle.event_type
+                        FROM task_events AS lifecycle
+                        WHERE lifecycle.request_id = s.request_id
+                          AND lifecycle.event_type IN (
+                              'active', 'revision_requested', 'changing',
+                              'revision_cancelled', 'revision_resumed',
+                              'stop_requested', 'stopping', 'cancelled',
+                              'expired', 'merged', 'replaced',
+                              'partially_merged'
                           )
-                    )
+                        ORDER BY lifecycle.event_id DESC LIMIT 1
+                    ) IN ('active', 'revision_resumed')
+                      AND (
+                        SELECT lifecycle.task_settings_hash
+                        FROM task_events AS lifecycle
+                        WHERE lifecycle.request_id = s.request_id
+                          AND lifecycle.event_type IN (
+                              'active', 'revision_requested', 'changing',
+                              'revision_cancelled', 'revision_resumed',
+                              'stop_requested', 'stopping', 'cancelled',
+                              'expired', 'merged', 'replaced',
+                              'partially_merged'
+                          )
+                        ORDER BY lifecycle.event_id DESC LIMIT 1
+                      ) = s.task_settings_hash
                     ORDER BY r.request_id, p.project_id
                     """
                 ).fetchall()
@@ -1325,21 +1324,32 @@ class _ProjectRuntimeRegistry:
             SELECT r.request_json, s.settings_json
             FROM task_settings_v2 AS s
             JOIN task_requests AS r ON r.request_id = s.request_id
-            WHERE EXISTS (
-                SELECT 1 FROM task_events AS active_event
-                WHERE active_event.request_id = s.request_id
-                  AND active_event.task_settings_hash = s.task_settings_hash
-                  AND active_event.event_type = 'active'
-            )
-              AND NOT EXISTS (
-                SELECT 1 FROM task_events AS barrier_event
-                WHERE barrier_event.request_id = s.request_id
-                  AND barrier_event.event_type IN (
-                      'revision_requested', 'stop_requested', 'changing',
-                      'stopping', 'cancelled', 'expired', 'merged',
-                      'replaced', 'partially_merged'
+            WHERE (
+                SELECT lifecycle.event_type
+                FROM task_events AS lifecycle
+                WHERE lifecycle.request_id = s.request_id
+                  AND lifecycle.event_type IN (
+                      'active', 'revision_requested', 'changing',
+                      'revision_cancelled', 'revision_resumed',
+                      'stop_requested', 'stopping', 'cancelled',
+                      'expired', 'merged', 'replaced',
+                      'partially_merged'
                   )
-            )
+                ORDER BY lifecycle.event_id DESC LIMIT 1
+            ) IN ('active', 'revision_resumed')
+              AND (
+                SELECT lifecycle.task_settings_hash
+                FROM task_events AS lifecycle
+                WHERE lifecycle.request_id = s.request_id
+                  AND lifecycle.event_type IN (
+                      'active', 'revision_requested', 'changing',
+                      'revision_cancelled', 'revision_resumed',
+                      'stop_requested', 'stopping', 'cancelled',
+                      'expired', 'merged', 'replaced',
+                      'partially_merged'
+                  )
+                ORDER BY lifecycle.event_id DESC LIMIT 1
+              ) = s.task_settings_hash
             ORDER BY r.request_id
             """
         ).fetchall()
@@ -1558,9 +1568,12 @@ class _ProjectRuntimeRegistry:
             """,
             (request.request_id,),
         ).fetchall()
-        event_types = [row[0] for row in rows]
-        if any(event_type in self._BARRIER_EVENTS for event_type in event_types):
-            raise GateError("v2 Task is blocked by a lifecycle event")
+        if not task_lifecycle_is_active(
+            connection,
+            request.request_id,
+            settings.task_settings_hash,
+        ):
+            raise GateError("v2 Task is blocked by its latest lifecycle event")
         common = _canonical_json(
             {"task_settings_hash": settings.task_settings_hash}
         )

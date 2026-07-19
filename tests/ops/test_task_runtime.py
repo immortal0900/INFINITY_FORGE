@@ -6,7 +6,7 @@ import subprocess
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -20,13 +20,17 @@ from forge.ops.contracts import (
 )
 from forge.ops.github_merge import BranchRefreshResult
 from forge.ops.hermes import GateError, task_card_key
+from forge.ops.surface_events import SurfaceEventStore, TrustedTurnContext
+from forge.ops.task_messages import TaskMessageStore
 from forge.ops.task_options import MergeMode, TaskFlow
 from forge.ops.task_database import TaskDatabase
 from forge.ops.task_projects import TaskProject
+from forge.ops.task_revisions import TaskRevisionService
 from forge.ops.task_outbox import TaskOutbox
 from forge.ops.task_runtime import (
     TaskFlowSnapshot,
     label_for_snapshot,
+    load_project_runtime_snapshots,
     load_ready_to_merge_snapshots,
     load_task_flow_snapshots,
     next_card_spec,
@@ -1361,6 +1365,51 @@ def test_v2_worker_rejects_tampered_project_snapshot_before_card_write(
         )
 
     assert calls == []
+
+
+def test_v2_runtime_resumes_only_after_cancelled_revision_messages_are_rejected(
+    tmp_path: Path,
+) -> None:
+    settings_db, _hermes_db, request, settings = _activated_v2(tmp_path)
+    database = TaskDatabase(settings_db)
+    context = TrustedTurnContext(
+        owner_host=request.task_owner_host,
+        subject_id=request.confirmed_by,
+        session_id="runtime-resume-session",
+        surface="desktop",
+        source_event_id="desktop:runtime-resume",
+        working_directory=None,
+    )
+    SurfaceEventStore(database).receive(
+        context,
+        "cancel this update",
+        at=NOW + timedelta(seconds=1),
+    )
+    receipt = TaskMessageStore(database).send(
+        request.request_id,
+        context,
+        "cancel this update",
+        at=NOW + timedelta(seconds=1),
+    )
+
+    assert load_project_runtime_snapshots(settings_db) == ()
+    revisions = TaskRevisionService(database)
+    revisions.cancel(
+        receipt.revision_request_id,
+        reason="user cancelled",
+        at=NOW + timedelta(seconds=2),
+    )
+    assert load_project_runtime_snapshots(settings_db) == ()
+    revisions.resume(
+        receipt.revision_request_id,
+        at=NOW + timedelta(seconds=3),
+    )
+
+    snapshots = load_project_runtime_snapshots(settings_db)
+    assert len(snapshots) == len(request.projects)
+    assert {item.settings.task_settings_hash for item in snapshots} == {
+        settings.task_settings_hash
+    }
 
 
 def test_v2_worker_dry_run_does_not_create_worktrees_or_update_registry(

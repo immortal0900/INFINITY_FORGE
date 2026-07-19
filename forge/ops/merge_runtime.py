@@ -35,6 +35,7 @@ from .task_options import MergeMode
 from .task_service import TaskCreationRequest
 from .task_database import TaskDatabase, TaskDatabaseError
 from .task_projects import TaskProject
+from .task_revisions import task_lifecycle_is_active
 from .task_settings import (
     BranchRefreshIntent,
     TaskSettings,
@@ -261,21 +262,6 @@ class ProjectMergeGuard(Protocol):
         *,
         occurred_at: datetime,
     ) -> None: ...
-
-
-_V2_MERGE_BARRIERS = frozenset(
-    {
-        "revision_requested",
-        "stop_requested",
-        "changing",
-        "stopping",
-        "cancelled",
-        "expired",
-        "merged",
-        "replaced",
-        "partially_merged",
-    }
-)
 
 
 class TaskDatabaseProjectMergeStore:
@@ -799,17 +785,10 @@ class TaskDatabaseProjectMergeStore:
             task.settings.task_owner_host,
         ):
             raise MergeRuntimeError("v2 merge settings changed")
-        barriers = connection.execute(
-            """
-            SELECT event_type FROM task_events
-            WHERE request_id = ?
-            ORDER BY event_id
-            """,
-            (task.request.request_id,),
-        ).fetchall()
-        event_types = [row[0] for row in barriers]
-        if event_types.count("active") != 1 or any(
-            event_type in _V2_MERGE_BARRIERS for event_type in event_types
+        if not task_lifecycle_is_active(
+            connection,
+            task.request.request_id,
+            task.settings.task_settings_hash,
         ):
             raise MergeRuntimeError("v2 merge is blocked by lifecycle state")
         active = connection.execute(
@@ -1173,24 +1152,47 @@ def load_project_merge_tasks(
             JOIN task_projects AS p
               ON p.request_id = s.request_id
              AND p.task_settings_hash = s.task_settings_hash
-            WHERE EXISTS (
-                SELECT 1 FROM task_events AS active_event
-                WHERE active_event.request_id = s.request_id
-                  AND active_event.task_settings_hash = s.task_settings_hash
-                  AND active_event.event_type = 'active'
-            )
-              AND NOT EXISTS (
-                SELECT 1 FROM task_events AS barrier_event
-                WHERE barrier_event.request_id = s.request_id
-                  AND barrier_event.event_type IN (
-                      'revision_requested', 'stop_requested', 'changing',
-                      'stopping', 'cancelled', 'expired', 'merged',
-                      'replaced', 'partially_merged'
+            WHERE (
+                SELECT lifecycle.event_type
+                FROM task_events AS lifecycle
+                WHERE lifecycle.request_id = s.request_id
+                  AND lifecycle.event_type IN (
+                      'active', 'revision_requested', 'changing',
+                      'revision_cancelled', 'revision_resumed',
+                      'stop_requested', 'stopping', 'cancelled',
+                      'expired', 'merged', 'replaced',
+                      'partially_merged'
                   )
-            )
+                ORDER BY lifecycle.event_id DESC LIMIT 1
+            ) IN ('active', 'revision_resumed')
+              AND (
+                SELECT lifecycle.task_settings_hash
+                FROM task_events AS lifecycle
+                WHERE lifecycle.request_id = s.request_id
+                  AND lifecycle.event_type IN (
+                      'active', 'revision_requested', 'changing',
+                      'revision_cancelled', 'revision_resumed',
+                      'stop_requested', 'stopping', 'cancelled',
+                      'expired', 'merged', 'replaced',
+                      'partially_merged'
+                  )
+                ORDER BY lifecycle.event_id DESC LIMIT 1
+              ) = s.task_settings_hash
             ORDER BY r.request_id, p.project_id
             """
         ).fetchall()
+        for row in rows:
+            try:
+                request = TaskRequestV2.from_json(row[0])
+                settings = TaskSettingsV2.from_json(row[1], request=request)
+            except TaskSettingsV2Error as error:
+                raise MergeRuntimeError("stored v2 merge settings are invalid") from error
+            if not task_lifecycle_is_active(
+                connection,
+                request.request_id,
+                settings.task_settings_hash,
+            ):
+                raise MergeRuntimeError("v2 merge is blocked by lifecycle state")
     grouped: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
         try:
