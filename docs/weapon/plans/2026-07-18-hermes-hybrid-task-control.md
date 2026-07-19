@@ -370,21 +370,21 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 - v2 snapshot carries exact `TaskProject`
 - PR repository must equal `project.repository`
 
-- [ ] **Step 1: arbitrary Project worktree/branch RED test 작성**
+- [x] **Step 1: arbitrary Project worktree/branch RED test 작성**
 
   dirty original checkout 보존, deterministic branch, collision, stale base commit, wrong remote/PR repo를
   검증한다.
 
-- [ ] **Step 2: v2 card format과 runtime enumeration 구현**
+- [x] **Step 2: v2 card format과 runtime enumeration 구현**
 
   v1 card format과 `--repo/--workspace` drain 경로는 그대로 둔다. v2 worker는 DB registry에서
   활성 Projects를 동적으로 열거한다.
 
-- [ ] **Step 3: 모든 safe point에서 exact Project/settings guard 확인**
+- [x] **Step 3: 모든 safe point에서 exact Project/settings guard 확인**
 
   Project A 결과가 B에 들어가거나 한 Project만 완료되어 parent가 완료되는 것을 거부한다.
 
-- [ ] **Step 4: test와 commit**
+- [x] **Step 4: test와 commit**
 
   Run: `python -m pytest tests/ops/test_task_worktrees.py tests/ops/test_adapters.py tests/ops/test_task_runtime.py tests/ops/test_task_worker_cli.py -q`
 
@@ -407,19 +407,19 @@ release까지 되돌릴 때만 SQLite backup 복원이 필요하다.
 - Aggregates all Project readiness before any multi full-auto write
 - Terminal: all merged → `merged`; some merged → `partially_merged`
 
-- [ ] **Step 1: manual·multi safe_auto write-0 RED tests 작성**
+- [x] **Step 1: manual·multi safe_auto write-0 RED tests 작성**
 
   full_auto도 exact merge order와 모든 Project current evidence가 없으면 merge 0회를 검증한다.
 
-- [ ] **Step 2: aggregate barrier와 ordered expected-head merge 구현**
+- [x] **Step 2: aggregate barrier와 ordered expected-head merge 구현**
 
   `RISK(race)` 주석과 함께 한 Project merge 직전/직후 실패 순서를 모두 test한다.
 
-- [ ] **Step 3: partial merge readback과 parent needs-decision 투영**
+- [x] **Step 3: partial merge readback과 parent needs-decision 투영**
 
   자동 rollback 없이 남은 merge를 차단하고 merge된/실패한/남은 Project를 표시한다.
 
-- [ ] **Step 4: test와 commit**
+- [x] **Step 4: test와 commit**
 
   Run: `python -m pytest tests/ops/test_merge_decision.py tests/ops/test_merge_worker.py tests/ops/test_task_worker_cli.py -q`
 
