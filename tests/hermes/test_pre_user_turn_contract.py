@@ -11,6 +11,10 @@ from forge.hermes_change.installer import (
     change_conversation_source,
     change_plugins_source,
 )
+from forge.ops.surface_events import (
+    TrustedTurnContext,
+    surface_event_payload_hash,
+)
 
 from .test_installer import CLI_SOURCE, CONVERSATION_SOURCE, PLUGIN_SOURCE
 
@@ -201,18 +205,42 @@ def test_structured_chat_replace_calls_model_once_with_stashed_text(monkeypatch)
     namespace: dict[str, object] = {"model_calls": model_calls}
     exec(change_conversation_source(source), namespace)
 
+    agent = types.SimpleNamespace(platform="cli", _gateway_session_key="s1")
+    trusted = {
+        "owner_host": "d6f70d5d-6482-45f5-80d2-219ec2ad4d19",
+        "subject_id": "trusted-user",
+        "session_id": "trusted-session",
+        "surface": "desktop",
+        "source_event_id": "desktop:chat-choice",
+        "working_directory": "C:/trusted",
+    }
     result = namespace["run_conversation"](
-        types.SimpleNamespace(platform="cli", _gateway_session_key="s1"),
+        agent,
         {
             "choice_prompt_id": PROMPT_ID,
             "selected_choice_ids": ["chat"],
         },
         conversation_history=[],
         is_user_turn=True,
+        trusted_turn_context=trusted,
     )
 
     assert result == {"seen": "stashed first question"}
     assert model_calls == ["stashed first question"]
+    expected_context = TrustedTurnContext(
+        owner_host=trusted["owner_host"],
+        subject_id=trusted["subject_id"],
+        session_id=trusted["session_id"],
+        surface=trusted["surface"],
+        source_event_id=trusted["source_event_id"],
+        working_directory=trusted["working_directory"],
+    )
+    assert agent._infinity_forge_trusted_turn_context["source_payload"] == (
+        "stashed first question"
+    )
+    assert agent._infinity_forge_trusted_turn_context["source_payload_hash"] == (
+        surface_event_payload_hash(expected_context, "stashed first question")
+    )
 
 
 @pytest.mark.parametrize(
@@ -495,6 +523,8 @@ def test_trusted_turn_context_overrides_same_named_model_input(monkeypatch) -> N
             "session_id": "forged-session",
             "surface": "forged-surface",
             "source_event_id": "forged-event",
+            "source_payload": "forged payload",
+            "source_payload_hash": "f" * 64,
             "working_directory": "C:/forged",
         },
         conversation_history=[],
@@ -510,7 +540,22 @@ def test_trusted_turn_context_overrides_same_named_model_input(monkeypatch) -> N
     assert captured["surface"] == "desktop"
     assert captured["source_event_id"] == "desktop:01JZABC"
     assert captured["working_directory"] == "C:/trusted"
-    assert agent._infinity_forge_trusted_turn_context == trusted
+    expected_context = TrustedTurnContext(
+        owner_host=trusted["owner_host"],
+        subject_id=trusted["subject_id"],
+        session_id=trusted["session_id"],
+        surface=trusted["surface"],
+        source_event_id=trusted["source_event_id"],
+        working_directory=trusted["working_directory"],
+    )
+    assert agent._infinity_forge_trusted_turn_context == {
+        **trusted,
+        "source_payload": "update the Task",
+        "source_payload_hash": surface_event_payload_hash(
+            expected_context,
+            "update the Task",
+        ),
+    }
 
 
 def test_internal_turn_clears_a_prior_trusted_context(monkeypatch) -> None:

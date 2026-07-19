@@ -94,7 +94,8 @@ _CONVERSATION_HOOK = fr'''
     # model/user envelope with the same names must never become authorization.
     _forge_trusted_field_names = (
         "owner_host", "subject_id", "user_id", "session_id", "surface",
-        "source_event_id", "working_directory", "cwd",
+        "source_event_id", "source_payload", "source_payload_hash",
+        "working_directory", "cwd",
     )
     _forge_trusted_context = {{}}
     if is_user_turn and isinstance(trusted_turn_context, dict):
@@ -335,6 +336,43 @@ _CONVERSATION_HOOK = fr'''
                 "source_event_id": _pre_user_turn_values["source_event_id"],
                 "working_directory": _pre_user_turn_values["working_directory"],
             }}
+            _forge_source_payload = _pre_user_turn_values["text"]
+            if (
+                isinstance(_forge_source_payload, str)
+                and _forge_trusted_context["owner_host"]
+                and _forge_trusted_context["source_event_id"]
+                and (
+                    _forge_trusted_context["working_directory"] is None
+                    or isinstance(
+                        _forge_trusted_context["working_directory"], str
+                    )
+                )
+            ):
+                # RISK(security): keep the exact raw user turn and its
+                # host/directory-bound digest beside model-controlled args.
+                import hashlib as _forge_hashlib
+
+                _forge_payload_digest = _forge_hashlib.sha256(
+                    _forge_source_payload.encode("utf-8")
+                ).hexdigest()
+                _forge_directory = _forge_trusted_context["working_directory"]
+                _forge_directory_bytes = (
+                    b"\x00"
+                    if _forge_directory is None
+                    else b"\x01" + _forge_directory.encode("utf-8")
+                )
+                _forge_directory_digest = _forge_hashlib.sha256(
+                    _forge_directory_bytes
+                ).hexdigest()
+                _forge_bound_payload = (
+                    "forge-surface-event-payload/v1\0"
+                    f"{{_forge_trusted_context['owner_host']}}\0"
+                    f"{{_forge_directory_digest}}\0{{_forge_payload_digest}}"
+                ).encode("utf-8")
+                _forge_trusted_context["source_payload"] = _forge_source_payload
+                _forge_trusted_context["source_payload_hash"] = (
+                    _forge_hashlib.sha256(_forge_bound_payload).hexdigest()
+                )
             setattr(
                 agent,
                 "_infinity_forge_trusted_turn_context",
@@ -477,6 +515,24 @@ _CONVERSATION_HOOK = fr'''
                 )
             user_message = _replacement
             persist_user_message = _replacement
+            if "source_payload_hash" in _forge_trusted_context:
+                _forge_payload_digest = _forge_hashlib.sha256(
+                    _replacement.encode("utf-8")
+                ).hexdigest()
+                _forge_bound_payload = (
+                    "forge-surface-event-payload/v1\0"
+                    f"{{_forge_trusted_context['owner_host']}}\0"
+                    f"{{_forge_directory_digest}}\0{{_forge_payload_digest}}"
+                ).encode("utf-8")
+                _forge_trusted_context["source_payload"] = _replacement
+                _forge_trusted_context["source_payload_hash"] = (
+                    _forge_hashlib.sha256(_forge_bound_payload).hexdigest()
+                )
+                setattr(
+                    agent,
+                    "_infinity_forge_trusted_turn_context",
+                    dict(_forge_trusted_context),
+                )
 '''
 
 
@@ -754,7 +810,11 @@ _TOOL_EXECUTOR_TRUST_HELPERS = r'''
 # INFINITY_FORGE_PRE_USER_TURN_V1: authenticated Forge tool context.
 _FORGE_TRUSTED_TURN_FIELDS = frozenset({
     "owner_host", "subject_id", "user_id", "session_id", "surface",
-    "source_event_id", "working_directory", "cwd",
+    "source_event_id", "source_payload", "source_payload_hash",
+    "working_directory", "cwd",
+})
+_FORGE_TOOLS = frozenset({
+    "list_tasks", "task_status", "send_to_task", "stop_task",
 })
 _FORGE_MUTATING_TOOLS = frozenset({"send_to_task", "stop_task"})
 
@@ -762,20 +822,37 @@ _FORGE_MUTATING_TOOLS = frozenset({"send_to_task", "stop_task"})
 def _forge_bind_trusted_tool_context(agent, function_name: str, function_args: dict):
     # RISK(security): model-generated identity keys are discarded before any
     # middleware, guardrail, approval, hook, or tool handler can observe them.
-    sanitized = {
-        key: value
-        for key, value in function_args.items()
-        if key not in _FORGE_TRUSTED_TURN_FIELDS
-    }
-    raw_context = getattr(agent, "_infinity_forge_trusted_turn_context", {})
+    is_forge_tool = function_name in _FORGE_TOOLS
+    sanitized = (
+        {
+            key: value
+            for key, value in function_args.items()
+            if key not in _FORGE_TRUSTED_TURN_FIELDS
+        }
+        if is_forge_tool
+        else dict(function_args)
+    )
+    raw_context = (
+        getattr(agent, "_infinity_forge_trusted_turn_context", {})
+        if is_forge_tool
+        else {}
+    )
     trusted_context = {
         key: raw_context.get(key)
         for key in (
             "owner_host", "subject_id", "session_id", "surface",
-            "source_event_id", "working_directory",
+            "source_event_id", "source_payload", "source_payload_hash",
+            "working_directory",
         )
         if isinstance(raw_context, dict)
-        and (isinstance(raw_context.get(key), str) or raw_context.get(key) is None)
+        and (
+            isinstance(raw_context.get(key), str)
+            or (
+                key == "working_directory"
+                and key in raw_context
+                and raw_context.get(key) is None
+            )
+        )
     }
     source_event_id = trusted_context.get("source_event_id")
     block_message = None

@@ -2268,6 +2268,8 @@ def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event(
                 "session_id": "session-1",
                 "surface": "desktop",
                 "source_event_id": "",
+                "source_payload": "trusted raw turn",
+                "source_payload_hash": "a" * 64,
                 "working_directory": "C:/work",
             }
         )
@@ -2278,6 +2280,8 @@ def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event(
                 "value": 1,
                 "owner_host": "forged-host",
                 "source_event_id": "forged-event",
+                "source_payload": "forged raw turn",
+                "source_payload_hash": "f" * 64,
                 "cwd": "C:/forged",
             },
             "task-1",
@@ -2288,6 +2292,8 @@ def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event(
         assert middleware_calls[0][1] == {"value": 1}
         assert middleware_calls[0][2]["owner_host"] == "host-1"
         assert middleware_calls[0][2]["source_event_id"] == ""
+        assert middleware_calls[0][2]["source_payload"] == "trusted raw turn"
+        assert middleware_calls[0][2]["source_payload_hash"] == "a" * 64
 
         middleware_calls.clear()
         namespace[path_name](
@@ -2297,8 +2303,12 @@ def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event(
             "task-1",
             tool_call,
         )
-        assert middleware_calls[0][1] == {"value": 2}
-        assert dispatched == [{"value": 2}]
+        assert middleware_calls[0][1] == {
+            "value": 2,
+            "subject_id": "forged-user",
+        }
+        assert middleware_calls[0][2] == {}
+        assert dispatched == [{"value": 2, "subject_id": "forged-user"}]
 
         dispatched.clear()
         agent._infinity_forge_trusted_turn_context["source_event_id"] = (
