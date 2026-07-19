@@ -508,6 +508,34 @@ def test_transaction_allows_same_thread_nested_quick_check(tmp_path: Path) -> No
         assert database.quick_check() == "ok"
 
 
+def test_transaction_rejects_same_thread_nested_write_without_waiting(
+    tmp_path: Path,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+
+    with database.transaction() as connection:
+        started = time.monotonic()
+        with pytest.raises(TaskDatabaseError, match="Nested Task database transaction"):
+            with database.transaction():
+                pass
+        elapsed = time.monotonic() - started
+        connection.execute(
+            """
+            INSERT INTO surface_events (
+                source_event_id, subject_id, session_id, surface, payload_hash,
+                state, received_at, retention_until
+            ) VALUES (
+                'outer-event', 'user-1', 'session-1', 'cli', ?,
+                'received', 'now', 'later'
+            )
+            """,
+            ("e" * 64,),
+        )
+
+    assert elapsed < 0.25
+    assert _surface_event_ids(database) == ["outer-event"]
+
+
 def test_database_permissions_are_owner_only(tmp_path: Path) -> None:
     database = TaskDatabase(tmp_path / "task-settings.db")
 
@@ -686,6 +714,84 @@ module._remove_empty_precreated_sidecars(prepared)
     stdout, stderr = process.communicate(timeout=10)
     assert process.returncode == 0, f"{stdout}\n{stderr}"
     assert not unsafe_observed
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows WAL exposure contract")
+def test_clean_wal_database_fails_before_sqlite_can_create_sidecars(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "clean-wal.db"
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+        connection.execute("CREATE TABLE sample(value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sample(value) VALUES ('stored')")
+        connection.commit()
+    wal_path = Path(f"{database_path}-wal")
+    shm_path = Path(f"{database_path}-shm")
+    assert not wal_path.exists()
+    assert not shm_path.exists()
+
+    started_path = tmp_path / "wal-open-started"
+    pragma_path = tmp_path / "wal-pragma-ran"
+    script = '''
+import sys
+import time
+from pathlib import Path
+
+import forge.ops.task_database as module
+from forge.ops.task_database import TaskDatabase, TaskDatabaseError
+
+database_path, started_path, pragma_path = map(Path, sys.argv[1:])
+real_prepare = module._prepare_secure_sqlite_write_sidecars
+
+def delayed_prepare(connection, path):
+    connection.execute("PRAGMA main.journal_mode").fetchone()
+    pragma_path.touch()
+    time.sleep(0.5)
+    return real_prepare(connection, path)
+
+module._prepare_secure_sqlite_write_sidecars = delayed_prepare
+started_path.touch()
+try:
+    TaskDatabase(database_path)
+except TaskDatabaseError as error:
+    if "WAL database requires existing owner-only sidecars" not in str(error):
+        raise
+else:
+    raise RuntimeError("clean WAL database unexpectedly opened")
+'''
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(database_path),
+            str(started_path),
+            str(pragma_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_subprocess_environment(),
+    )
+    unsafe_observed = False
+    deadline = time.monotonic() + 10
+    while process.poll() is None:
+        assert time.monotonic() < deadline
+        for sidecar in (wal_path, shm_path):
+            if sidecar.exists() and not task_database_module._verify_owner_only_permissions(
+                sidecar
+            ):
+                unsafe_observed = True
+        time.sleep(0.002)
+    stdout, stderr = process.communicate(timeout=1)
+
+    assert process.returncode == 0, f"{stdout}\n{stderr}"
+    assert started_path.exists()
+    assert not pragma_path.exists()
+    assert not unsafe_observed
+    assert not wal_path.exists()
+    assert not shm_path.exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle ownership contract")

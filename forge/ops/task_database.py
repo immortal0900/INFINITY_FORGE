@@ -559,6 +559,7 @@ class _OperationBarrierState:
 
 _OPERATION_BARRIERS_LOCK = threading.Lock()
 _OPERATION_BARRIERS: dict[str, _OperationBarrierState] = {}
+_ACTIVE_TRANSACTION_PATHS = threading.local()
 
 
 class TaskDatabase:
@@ -578,6 +579,7 @@ class TaskDatabase:
         """Open one validated-path connection with foreign keys enabled."""
 
         _assert_safe_file(self.database_path, required=True)
+        _assert_sqlite_connection_preconditions(self.database_path)
         try:
             connection = sqlite3.connect(
                 f"{self.database_path.as_uri()}?mode=rw",
@@ -612,6 +614,7 @@ class TaskDatabase:
         """Serialize one mutable operation without excluding readers."""
 
         with (
+            _database_transaction_scope(self.database_path),
             _database_operation_lock(self._operation_lock_path),
             _database_operation_lock(self._write_lock_path, exclusive=True),
             closing(self.connect()) as connection,
@@ -907,6 +910,7 @@ def _initialize_database_connection(connection: sqlite3.Connection) -> None:
     database_path = _database_path_for_connection(connection)
     prepared_sidecars: tuple[_PreparedSidecar, ...] = ()
     try:
+        _require_standalone_journal(connection, "Task database")
         prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
             connection,
             database_path,
@@ -1194,6 +1198,26 @@ def _database_operation_lock(
     finally:
         if not nested_exclusive:
             _leave_shared_operation(state)
+
+
+@contextmanager
+def _database_transaction_scope(database_path: Path) -> Iterator[None]:
+    key = os.path.normcase(str(database_path))
+    active_paths = getattr(_ACTIVE_TRANSACTION_PATHS, "paths", None)
+    if active_paths is None:
+        active_paths = set()
+        _ACTIVE_TRANSACTION_PATHS.paths = active_paths
+    if key in active_paths:
+        raise TaskDatabaseError(
+            "Nested Task database transactions are not supported"
+        )
+    active_paths.add(key)
+    try:
+        yield
+    finally:
+        active_paths.remove(key)
+        if not active_paths:
+            del _ACTIVE_TRANSACTION_PATHS.paths
 
 
 def _operation_barrier_state(lock_path: Path) -> _OperationBarrierState:
@@ -1593,8 +1617,58 @@ def _ensure_secure_database_file(path: Path) -> None:
     _ensure_owner_only_permissions(path)
 
 
+def _assert_sqlite_connection_preconditions(path: Path) -> None:
+    uses_wal = _database_header_uses_wal(path)
+    _assert_owner_only_sqlite_sidecars(path)
+    if not uses_wal:
+        return
+    required_sidecars = (Path(f"{path}-wal"), Path(f"{path}-shm"))
+    if any(not sidecar.is_file() for sidecar in required_sidecars):
+        raise TaskDatabaseError(
+            "WAL database requires existing owner-only sidecars before opening"
+        )
+
+
+def _database_header_uses_wal(path: Path) -> bool:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOINHERIT", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TaskDatabaseError(
+            "Task database header could not be checked safely"
+        ) from error
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        header = os.read(descriptor, 20)
+        path_stat = os.lstat(path)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise TaskDatabaseError("Task database must be a regular file")
+        if stat.S_ISLNK(path_stat.st_mode) or (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        ) != (path_stat.st_dev, path_stat.st_ino):
+            raise TaskDatabaseError(
+                "Task database path changed during WAL header check"
+            )
+    except TaskDatabaseError:
+        raise
+    except OSError as error:
+        raise TaskDatabaseError(
+            "Task database header could not be checked safely"
+        ) from error
+    finally:
+        os.close(descriptor)
+    return (
+        header[:16] == b"SQLite format 3\x00"
+        and header[18:20] == b"\x02\x02"
+    )
+
+
 def _connect_database_file(path: Path, *, mode: str) -> sqlite3.Connection:
     _assert_safe_file(path, required=True)
+    _assert_sqlite_connection_preconditions(path)
     try:
         connection = sqlite3.connect(
             f"{path.as_uri()}?mode={mode}",
