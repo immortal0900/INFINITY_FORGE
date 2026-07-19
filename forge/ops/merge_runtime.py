@@ -1273,31 +1273,13 @@ def load_project_merge_tasks(
                         "pending Project merge proof is incomplete"
                     )
                 candidate = github.get_pr_write_state(stored_pr_url)
-                if (
-                    candidate.pr_url != stored_pr_url
-                    or candidate.repository != project.repository
-                    or candidate.base_ref != project.base_branch
-                    or candidate.base_commit != project.base_commit
-                    or candidate.head_commit != stored_head
-                    or (
-                        candidate.is_merged
-                        and (
-                            candidate.merged_base_commit != project.base_commit
-                            or candidate.merged_head_commit != stored_head
-                            or candidate.merged_commit is None
-                        )
-                    )
-                    or (
-                        not candidate.is_merged
-                        and any(
-                            value is not None
-                            for value in (
-                                candidate.merged_commit,
-                                candidate.merged_base_commit,
-                                candidate.merged_head_commit,
-                            )
-                        )
-                    )
+                if not _pending_project_readback_matches(
+                    candidate,
+                    pr_url=stored_pr_url,
+                    repository=project.repository,
+                    base_ref=project.base_branch,
+                    expected_base_commit=project.base_commit,
+                    expected_head_commit=stored_head,
                 ):
                     raise MergeRuntimeError(
                         "pending Project remote proof does not match"
@@ -1383,6 +1365,45 @@ def load_project_merge_tasks(
         _validate_project_task(task)
         tasks.append(task)
     return tuple(tasks)
+
+
+def _pending_project_readback_matches(
+    candidate: object,
+    *,
+    pr_url: str,
+    repository: str,
+    base_ref: str,
+    expected_base_commit: str,
+    expected_head_commit: str,
+) -> bool:
+    """Bind pending recovery to current heads or exact merged parents."""
+
+    if (
+        not isinstance(candidate, PullRequestWriteState)
+        or type(candidate.is_merged) is not bool
+        or candidate.pr_url != pr_url
+        or candidate.repository != repository
+        or candidate.base_ref != base_ref
+    ):
+        return False
+    if candidate.is_merged:
+        try:
+            validate_commit_sha(candidate.merged_commit, "merged result commit")
+        except RuntimeError:
+            return False
+        # Current PR base/head views may move after merge. The immutable
+        # merged parents are the only exact response-loss proof.
+        return (
+            candidate.merged_base_commit == expected_base_commit
+            and candidate.merged_head_commit == expected_head_commit
+        )
+    return (
+        candidate.base_commit == expected_base_commit
+        and candidate.head_commit == expected_head_commit
+        and candidate.merged_commit is None
+        and candidate.merged_base_commit is None
+        and candidate.merged_head_commit is None
+    )
 
 
 def _ready_project_state(

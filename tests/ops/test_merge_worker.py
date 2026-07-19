@@ -8,6 +8,7 @@ import importlib.util
 import json
 import multiprocessing
 from pathlib import Path
+import sqlite3
 import threading
 from typing import Any
 
@@ -24,11 +25,13 @@ from forge.ops.merge_decision import (
     RESTART_FLOW,
 )
 from forge.ops.merge_runtime import (
+    MergeRuntimeError,
     MergeRunReport,
     TaskDatabaseProjectMergeStore,
     ProjectMergeSnapshot,
     ProjectMergeTask,
     TaskMergeReport,
+    load_project_merge_tasks,
     run_merge_tasks,
     run_project_merge_tasks,
 )
@@ -2312,6 +2315,151 @@ def _insert_project_merge_task_database(
                     request_payload["confirmed_at"],
                 ),
             )
+
+
+def _create_empty_hermes_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                body TEXT,
+                idempotency_key TEXT,
+                assignee TEXT,
+                skills TEXT
+            );
+            CREATE TABLE task_links (
+                parent_id TEXT NOT NULL,
+                child_id TEXT NOT NULL
+            );
+            """
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FixedProjectSnapshotGitHub:
+    state: PullRequestWriteState
+
+    def get_pr_write_state(self, pr_url: str) -> PullRequestWriteState:
+        assert pr_url == self.state.pr_url
+        return self.state
+
+
+def _pending_loader_fixture(
+    tmp_path: Path,
+    *,
+    merged_commit: str | None = MERGED,
+    merged_base_commit: str | None = None,
+    merged_head_commit: str | None = None,
+) -> tuple[Path, Path, ProjectMergeTask, ProjectMergeSnapshot, PullRequestWriteState]:
+    task = _project_merge_task(tmp_path)
+    database_path = tmp_path / "task.db"
+    hermes_path = tmp_path / "hermes.db"
+    _insert_project_merge_task_database(database_path, task)
+    _create_empty_hermes_database(hermes_path)
+    pending = task.projects[0]
+    assert pending.task_flow_state is not None
+    with TaskDatabase(database_path).transaction() as connection:
+        connection.execute(
+            """
+            UPDATE task_projects
+            SET state = 'waiting_for_help', pr_url = ?, head_commit = ?
+            WHERE request_id = ? AND project_id = ?
+            """,
+            (
+                pending.task_flow_state.pr_url,
+                pending.task_flow_state.current_commit,
+                task.request.request_id,
+                pending.project.project_id,
+            ),
+        )
+    candidate = PullRequestWriteState(
+        pr_url=pending.task_flow_state.pr_url,
+        repository=pending.project.repository,
+        pr_number=1,
+        base_commit="e" * 40,
+        base_ref=pending.project.base_branch,
+        head_commit="f" * 40,
+        is_open=False,
+        is_merged=True,
+        merged_commit=merged_commit,
+        merged_base_commit=(
+            pending.project.base_commit
+            if merged_base_commit is None
+            else merged_base_commit
+        ),
+        merged_head_commit=(
+            pending.task_flow_state.current_commit
+            if merged_head_commit is None
+            else merged_head_commit
+        ),
+    )
+    return database_path, hermes_path, task, pending, candidate
+
+
+def test_pending_loader_uses_merged_parent_proof_not_current_pr_heads(
+    tmp_path: Path,
+) -> None:
+    database_path, hermes_path, task, pending, candidate = (
+        _pending_loader_fixture(tmp_path)
+    )
+
+    loaded = load_project_merge_tasks(
+        settings_db=database_path,
+        hermes_db=hermes_path,
+        github=FixedProjectSnapshotGitHub(candidate),
+    )
+
+    assert len(loaded) == 1
+    recovered = next(
+        snapshot
+        for snapshot in loaded[0].projects
+        if snapshot.project.project_id == pending.project.project_id
+    )
+    assert recovered.merge_attempt_pending is True
+    assert recovered.task_flow_state is not None
+    assert recovered.task_flow_state.current_base_commit == pending.project.base_commit
+    assert (
+        recovered.task_flow_state.current_commit
+        == pending.task_flow_state.current_commit  # type: ignore[union-attr]
+    )
+    assert candidate.base_commit != pending.project.base_commit
+    assert candidate.head_commit != recovered.task_flow_state.current_commit
+    assert loaded[0].request == task.request
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("merged_commit", "not-a-commit"),
+        ("merged_base_commit", "9" * 40),
+        ("merged_head_commit", "8" * 40),
+    ),
+)
+def test_pending_loader_rejects_malformed_merged_parent_proof(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    database_path, hermes_path, _, pending, candidate = _pending_loader_fixture(
+        tmp_path
+    )
+    assert pending.task_flow_state is not None
+    malformed = replace(
+        candidate,
+        base_commit=pending.project.base_commit,
+        head_commit=pending.task_flow_state.current_commit,
+        **{field: value},
+    )
+
+    with pytest.raises(MergeRuntimeError, match="pending Project remote proof"):
+        load_project_merge_tasks(
+            settings_db=database_path,
+            hermes_db=hermes_path,
+            github=FixedProjectSnapshotGitHub(malformed),
+        )
 
 
 def test_database_project_guard_rechecks_head_and_records_terminal_partial(
