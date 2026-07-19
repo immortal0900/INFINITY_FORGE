@@ -1252,6 +1252,8 @@ class FakeProjectMergeStore:
         self.partial: list[tuple[tuple[str, ...], str, tuple[str, ...]]] = []
         self.completed = False
         self.fail_record_once_for: str | None = None
+        self.pending: list[str] = []
+        self.failed: list[str] = []
 
     def prepare_barrier(
         self,
@@ -1322,9 +1324,53 @@ class FakeProjectMergeStore:
         )
         self.timeline.append("parent:partially_merged")
 
+    def converge_observed_merge(
+        self,
+        task: ProjectMergeTask,
+        snapshot: ProjectMergeSnapshot,
+        result: MergeWriteResult,
+        *,
+        occurred_at: datetime,
+    ) -> None:
+        assert snapshot in task.projects
+        assert result.already_merged is True
+        assert occurred_at == NOW
+        if snapshot.project.project_id not in self.merged:
+            self.merged.append(snapshot.project.project_id)
+        self.timeline.append(f"observed:{snapshot.project.repository}")
+
+    def mark_reconciliation_pending(
+        self,
+        task: ProjectMergeTask,
+        snapshot: ProjectMergeSnapshot,
+        *,
+        occurred_at: datetime,
+    ) -> None:
+        assert snapshot in task.projects
+        assert occurred_at == NOW
+        self.pending.append(snapshot.project.project_id)
+        self.timeline.append(f"pending:{snapshot.project.repository}")
+
+    def mark_failed(
+        self,
+        task: ProjectMergeTask,
+        snapshot: ProjectMergeSnapshot,
+        *,
+        reason: str,
+        occurred_at: datetime,
+    ) -> None:
+        assert snapshot in task.projects
+        assert reason
+        assert occurred_at == NOW
+        self.failed.append(snapshot.project.project_id)
+        self.timeline.append(f"failed:{snapshot.project.repository}")
+
 
 class ProjectEvidenceReader:
-    def __init__(self, evidence: dict[str, list[GitHubMergeEvidence]]) -> None:
+    def __init__(
+        self,
+        evidence: dict[str, list[GitHubMergeEvidence | Exception]],
+    ) -> None:
         self.evidence = evidence
         self.calls: list[str] = []
 
@@ -1339,7 +1385,10 @@ class ProjectEvidenceReader:
         assert include_safe_files is False
         self.calls.append(pr_url)
         values = self.evidence[pr_url]
-        return values.pop(0) if len(values) > 1 else values[0]
+        value = values.pop(0) if len(values) > 1 else values[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
 
 
 class OrderedProjectWriter(FakeMergeWriter):
@@ -1375,6 +1424,7 @@ def _project_merge_task(
     *,
     merge_mode: MergeMode = MergeMode.FULL_AUTO,
     second_ready: bool = True,
+    expired: bool = False,
 ) -> ProjectMergeTask:
     host_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     projects = []
@@ -1412,7 +1462,13 @@ def _project_merge_task(
         confirmed_by="user-1",
         confirmed_at=NOW - timedelta(minutes=10),
         auto_merge_expires_at=(
-            None if merge_mode is MergeMode.MANUAL else NOW + timedelta(hours=1)
+            None
+            if merge_mode is MergeMode.MANUAL
+            else (
+                NOW - timedelta(minutes=1)
+                if expired
+                else NOW + timedelta(hours=1)
+            )
         ),
     )
     settings = TaskSettingsV2.create(request=request, parent_issue_number=21)
@@ -1507,6 +1563,59 @@ def test_multi_project_manual_and_safe_auto_have_zero_merge_writes(
     assert writer.merge_calls == []
     assert store.merged == []
     assert "barrier" not in timeline
+
+
+@pytest.mark.parametrize(
+    ("merge_mode", "environment", "expired"),
+    (
+        (MergeMode.MANUAL, {"AUTO_MERGE_ENABLED": "true"}, False),
+        (MergeMode.SAFE_AUTO, {"AUTO_MERGE_ENABLED": "true"}, False),
+        (MergeMode.FULL_AUTO, {}, False),
+        (MergeMode.FULL_AUTO, {"AUTO_MERGE_ENABLED": "true"}, True),
+    ),
+)
+def test_write_blocked_policy_still_converges_exact_remote_merges(
+    tmp_path: Path,
+    merge_mode: MergeMode,
+    environment: dict[str, str],
+    expired: bool,
+) -> None:
+    task = _project_merge_task(
+        tmp_path,
+        merge_mode=merge_mode,
+        expired=expired,
+    )
+    timeline: list[str] = []
+    store = FakeProjectMergeStore(timeline)
+    reader = ProjectEvidenceReader(
+        {
+            snapshot.task_flow_state.pr_url: [
+                _project_evidence(snapshot, merged=True)
+            ]
+            for snapshot in task.projects
+            if snapshot.task_flow_state is not None
+        }
+    )
+    writer = OrderedProjectWriter(timeline)
+
+    report = run_project_merge_tasks(
+        (task,),
+        evidence_reader=reader,
+        merge_writer=writer,
+        merge_store=store,
+        required_check="eval",
+        environment=environment,
+        clock=lambda: NOW,
+    )
+
+    assert report.ok is True
+    assert len(reader.calls) == len(task.projects)
+    assert writer.merge_calls == []
+    assert set(store.merged) == {
+        snapshot.project.project_id for snapshot in task.projects
+    }
+    assert store.completed is True
+    assert all(item.action == "observed_merge" for item in report.tasks)
 
 
 def test_full_auto_does_not_start_when_one_project_is_not_verified(
@@ -1615,6 +1724,106 @@ def test_second_project_failure_records_partial_and_never_merges_the_rest(
     assert len(store.partial) == 1
     assert store.partial[0][0] == tuple(store.merged)
     assert "parent:partially_merged" in timeline
+
+
+def test_unknown_second_merge_result_stays_pending_without_false_partial(
+    tmp_path: Path,
+) -> None:
+    task = _project_merge_task(tmp_path)
+    ordered = [
+        next(
+            snapshot
+            for snapshot in task.projects
+            if snapshot.project.project_id == project_id
+        )
+        for project_id in task.settings.merge_order or ()
+    ]
+    timeline: list[str] = []
+    store = FakeProjectMergeStore(timeline)
+    evidence: dict[str, list[GitHubMergeEvidence | Exception]] = {}
+    for index, snapshot in enumerate(ordered):
+        assert snapshot.task_flow_state is not None
+        evidence[snapshot.task_flow_state.pr_url] = [
+            _project_evidence(snapshot),
+            _project_evidence(snapshot),
+            *(
+                [
+                    GateError("GitHub merge readback is unavailable"),
+                    GateError("GitHub merge readback is still unavailable"),
+                ]
+                if index == 1
+                else []
+            ),
+        ]
+    reader = ProjectEvidenceReader(evidence)
+    writer = OrderedProjectWriter(timeline, fail_on_call=2)
+
+    report = run_project_merge_tasks(
+        (task,),
+        evidence_reader=reader,
+        merge_writer=writer,
+        merge_store=store,
+        required_check="eval",
+        environment={"AUTO_MERGE_ENABLED": "true"},
+        clock=lambda: NOW,
+    )
+
+    assert report.ok is False
+    assert len(store.merged) == 1
+    assert store.failed == []
+    assert store.partial == []
+    assert store.pending == [ordered[1].project.project_id]
+    assert report.tasks[-1].action == "reconciliation_pending"
+    assert "parent:partially_merged" not in timeline
+
+
+def test_pending_retry_only_reconciles_and_starts_no_new_merge(
+    tmp_path: Path,
+) -> None:
+    original = _project_merge_task(tmp_path)
+    pending = original.projects[0]
+    task = replace(
+        original,
+        projects=tuple(
+            replace(
+                snapshot,
+                project_state="waiting_for_help",
+                merge_attempt_pending=True,
+            )
+            if snapshot == pending
+            else snapshot
+            for snapshot in original.projects
+        ),
+    )
+    timeline: list[str] = []
+    store = FakeProjectMergeStore(timeline)
+    reader = ProjectEvidenceReader(
+        {
+            snapshot.task_flow_state.pr_url: [
+                _project_evidence(snapshot, merged=snapshot.project == pending.project)
+            ]
+            for snapshot in task.projects
+            if snapshot.task_flow_state is not None
+        }
+    )
+    writer = OrderedProjectWriter(timeline)
+
+    report = run_project_merge_tasks(
+        (task,),
+        evidence_reader=reader,
+        merge_writer=writer,
+        merge_store=store,
+        required_check="eval",
+        environment={"AUTO_MERGE_ENABLED": "true"},
+        clock=lambda: NOW,
+    )
+
+    assert report.ok is True
+    assert writer.merge_calls == []
+    assert store.merged == [pending.project.project_id]
+    assert store.partial == []
+    assert store.completed is False
+    assert any(item.action == "observed_merge" for item in report.tasks)
 
 
 def test_lost_merge_response_converges_from_exact_remote_readback(
@@ -1867,6 +2076,119 @@ def test_database_project_guard_rechecks_head_and_records_terminal_partial(
     assert states[second.project.project_id][0] == "failed"
     assert terminal is not None and terminal[0] == "partially_merged"
     assert json.loads(terminal[1])["failed_project_id"] == second.project.project_id
+
+
+def test_database_store_converges_human_merges_without_remote_writes(
+    tmp_path: Path,
+) -> None:
+    task = _project_merge_task(tmp_path, merge_mode=MergeMode.MANUAL)
+    database_path = tmp_path / "task.db"
+    _insert_project_merge_task_database(database_path, task)
+    store = TaskDatabaseProjectMergeStore(database_path)
+    reader = ProjectEvidenceReader(
+        {
+            snapshot.task_flow_state.pr_url: [
+                _project_evidence(snapshot, merged=True)
+            ]
+            for snapshot in task.projects
+            if snapshot.task_flow_state is not None
+        }
+    )
+    writer = OrderedProjectWriter([])
+
+    report = run_project_merge_tasks(
+        (task,),
+        evidence_reader=reader,
+        merge_writer=writer,
+        merge_store=store,
+        required_check="eval",
+        environment={"AUTO_MERGE_ENABLED": "true"},
+        clock=lambda: NOW,
+    )
+
+    with TaskDatabase(database_path).read() as connection:
+        states = connection.execute(
+            """
+            SELECT state, pr_url, head_commit, merge_commit
+            FROM task_projects WHERE request_id = ? ORDER BY project_id
+            """,
+            (task.request.request_id,),
+        ).fetchall()
+        terminal = connection.execute(
+            """
+            SELECT event_type FROM task_events
+            WHERE request_id = ? AND event_type = 'merged'
+            """,
+            (task.request.request_id,),
+        ).fetchone()
+    assert report.ok is True
+    assert writer.merge_calls == []
+    assert all(row[0] == "merged" and row[3] == MERGED for row in states)
+    assert all(row[1] is not None and row[2] is not None for row in states)
+    assert terminal is not None
+
+
+def test_database_store_keeps_unknown_merge_nonterminal_and_retryable(
+    tmp_path: Path,
+) -> None:
+    task = _project_merge_task(tmp_path)
+    database_path = tmp_path / "task.db"
+    _insert_project_merge_task_database(database_path, task)
+    ordered = [
+        next(
+            snapshot
+            for snapshot in task.projects
+            if snapshot.project.project_id == project_id
+        )
+        for project_id in task.settings.merge_order or ()
+    ]
+    evidence: dict[str, list[GitHubMergeEvidence | Exception]] = {}
+    for index, snapshot in enumerate(ordered):
+        assert snapshot.task_flow_state is not None
+        evidence[snapshot.task_flow_state.pr_url] = [
+            _project_evidence(snapshot),
+            _project_evidence(snapshot),
+            *(
+                [GateError("GitHub readback is unavailable")]
+                if index == 1
+                else []
+            ),
+        ]
+    writer = OrderedProjectWriter([], fail_on_call=2)
+
+    report = run_project_merge_tasks(
+        (task,),
+        evidence_reader=ProjectEvidenceReader(evidence),
+        merge_writer=writer,
+        merge_store=TaskDatabaseProjectMergeStore(database_path),
+        required_check="eval",
+        environment={"AUTO_MERGE_ENABLED": "true"},
+        clock=lambda: NOW,
+    )
+
+    with TaskDatabase(database_path).read() as connection:
+        rows = connection.execute(
+            """
+            SELECT project_id, state, merge_commit FROM task_projects
+            WHERE request_id = ?
+            """,
+            (task.request.request_id,),
+        ).fetchall()
+        terminal = connection.execute(
+            """
+            SELECT event_type FROM task_events
+            WHERE request_id = ? AND event_type = 'partially_merged'
+            """,
+            (task.request.request_id,),
+        ).fetchone()
+    state_by_id = {row[0]: (row[1], row[2]) for row in rows}
+    assert report.ok is False
+    assert state_by_id[ordered[0].project.project_id][0] == "merged"
+    assert state_by_id[ordered[1].project.project_id] == (
+        "waiting_for_help",
+        None,
+    )
+    assert terminal is None
 
 
 def test_database_project_guard_rejects_head_tampering_before_remote_write(
