@@ -21,5 +21,6 @@
   "gateway/run.py",
   "ui-tui/src/__tests__/prompt.test.ts",
   "apps/desktop/src/store/prompts.test.ts",
-  "tests/gateway/test_slack_approval_buttons.py"
+  "tests/gateway/test_slack_approval_buttons.py",
+  "hermes_cli/kanban_db.py"
 ]

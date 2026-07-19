@@ -63,3 +63,4 @@ def test_cli_build_install_restore(tmp_path: Path, capsys) -> None:
         "restore",
     ]
     assert all(report["ok"] is True for report in reports)
+    assert all(len(report["files"]) == 24 for report in reports)

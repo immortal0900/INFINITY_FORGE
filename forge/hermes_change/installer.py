@@ -1,4 +1,4 @@
-"""Safely add the generic ``pre_user_turn`` hook to a Hermes checkout."""
+"""Safely build the INFINITY_FORGE change package for a Hermes checkout."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ _RELEASE_DIR = "release_files"
 _RESTORE_DIR = "restore_files"
 _STATE_NAME = ".infinity-forge-change-state.json"
 _HOOK_MARKER = "INFINITY_FORGE_PRE_USER_TURN_V1"
+_WORKER_MARKER = "INFINITY_FORGE_SUBSCRIPTION_WORKER_V1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -4202,6 +4203,147 @@ class TestSlackChoicePrompt:
 '''
 
 
+_SUBSCRIPTION_WORKER_HELPERS = f'''def _infinity_forge_required_worker_file(value, label, *, native):
+    if not isinstance(value, str) or not value or not os.path.isabs(value):
+        raise RuntimeError(f"{{label}} configuration is invalid")
+    resolved = None
+    regular_file = False
+    try:
+        resolved = Path(value).resolve(strict=True)
+        regular_file = resolved.is_file()
+    except (OSError, RuntimeError, ValueError):
+        pass
+    if resolved is None or not regular_file:
+        raise RuntimeError(f"{{label}} configuration is invalid")
+    if native:
+        if os.name == "nt":
+            if resolved.suffix.lower() != ".exe":
+                raise RuntimeError(f"{{label}} configuration is invalid")
+        elif not os.access(resolved, os.X_OK):
+            raise RuntimeError(f"{{label}} configuration is invalid")
+    return resolved
+
+
+def _infinity_forge_subscription_worker_argv(task, cmd, env):
+    # {_WORKER_MARKER}
+    if env.get("INFINITY_FORGE_SUBSCRIPTION_ROUTING") != "1":
+        return cmd
+    key = task.idempotency_key or ""
+    if not isinstance(key, str) or not key.startswith(("forge-task:", "forge-step:")):
+        return cmd
+
+    python_bin = _infinity_forge_required_worker_file(
+        env.get("INFINITY_FORGE_SUBSCRIPTION_PYTHON"),
+        "INFINITY_FORGE_SUBSCRIPTION_PYTHON",
+        native=True,
+    )
+    runner = _infinity_forge_required_worker_file(
+        env.get("INFINITY_FORGE_SUBSCRIPTION_RUNNER"),
+        "INFINITY_FORGE_SUBSCRIPTION_RUNNER",
+        native=False,
+    )
+    hermes_value = (
+        env.get("INFINITY_FORGE_HERMES_BIN")
+        if "INFINITY_FORGE_HERMES_BIN" in env
+        else env.get("HERMES_BIN")
+    )
+    configured_hermes = _infinity_forge_required_worker_file(
+        hermes_value,
+        "INFINITY_FORGE_HERMES_BIN or HERMES_BIN",
+        native=True,
+    )
+    expected_hermes_name = "hermes.exe" if os.name == "nt" else "hermes"
+    if os.path.normcase(configured_hermes.name) != os.path.normcase(
+        expected_hermes_name
+    ):
+        raise RuntimeError("Hermes executable configuration is invalid")
+
+    original_name = (
+        os.path.basename(cmd[0]).lower()
+        if cmd and isinstance(cmd[0], str)
+        else ""
+    )
+    python_interpreter = original_name in ("py", "py.exe") or original_name.startswith(
+        "python"
+    )
+    interpreter_tail = cmd[1] if len(cmd) >= 2 else None
+    python_script = (
+        isinstance(interpreter_tail, str)
+        and os.path.isabs(interpreter_tail)
+        and interpreter_tail.lower().endswith(".py")
+    )
+    if python_interpreter and (interpreter_tail == "-m" or python_script):
+        raise RuntimeError("Hermes Python interpreter form is not allowed")
+    original_hermes = _infinity_forge_required_worker_file(
+        cmd[0] if cmd else None,
+        "original Hermes command",
+        native=True,
+    )
+    normalized_original = os.path.normcase(os.path.normpath(str(original_hermes)))
+    normalized_configured = os.path.normcase(os.path.normpath(str(configured_hermes)))
+    if normalized_original != normalized_configured:
+        raise RuntimeError("configured Hermes executable does not match original command")
+
+    env["INFINITY_FORGE_HERMES_BIN"] = str(configured_hermes)
+    return [
+        str(python_bin),
+        str(runner),
+        "worker",
+        "--workspace",
+        env["HERMES_KANBAN_WORKSPACE"],
+        "--",
+        *cmd,
+    ]
+
+
+'''
+
+
+def change_kanban_db_source(source: str) -> str:
+    """Route only Forge-owned workers through the subscription runner."""
+
+    if _WORKER_MARKER in source:
+        raise InstallError("kanban_db.py subscription worker routing is already installed")
+    if (
+        "_infinity_forge_required_worker_file" in source
+        or "_infinity_forge_subscription_worker_argv" in source
+    ):
+        raise InstallError("kanban_db.py subscription worker routing is partial or drifted")
+    newline = "\r\n" if "\r\n" in source else "\n"
+    function_anchor = "def _default_spawn("
+    if source.count(function_anchor) != 1:
+        raise InstallError("kanban_db.py _default_spawn anchor is not unique")
+    command_anchor = newline.join(
+        (
+            "    cmd.extend([",
+            '        "chat",',
+            '        "-q", prompt,',
+            "    ])",
+            "",
+        )
+    )
+    if source.count(command_anchor) != 1:
+        raise InstallError("kanban_db.py completed worker command anchor is not unique")
+    function_position = source.index(function_anchor)
+    command_position = source.index(command_anchor)
+    next_function = source.find(f"{newline}def ", function_position + len(function_anchor))
+    if command_position < function_position or (
+        next_function >= 0 and command_position > next_function
+    ):
+        raise InstallError("kanban_db.py completed worker command anchor drifted")
+    helpers = _SUBSCRIPTION_WORKER_HELPERS.replace("\n", newline)
+    source = source.replace(function_anchor, helpers + function_anchor, 1)
+    addition = newline.join(
+        (
+            command_anchor.rstrip("\r\n"),
+            "    # RISK(security): env-selected executables cross the worker process boundary.",
+            "    cmd = _infinity_forge_subscription_worker_argv(task, cmd, env)",
+            "",
+        )
+    )
+    return source.replace(command_anchor, addition, 1)
+
+
 _CHANGES: dict[str, Callable[[str], str]] = {
     "hermes_cli/plugins.py": change_plugins_source,
     "agent/conversation_loop.py": change_conversation_source,
@@ -4226,6 +4368,7 @@ _CHANGES: dict[str, Callable[[str], str]] = {
     "ui-tui/src/__tests__/prompt.test.ts": change_tui_prompt_test_source,
     "apps/desktop/src/store/prompts.test.ts": change_desktop_prompts_test_source,
     "tests/gateway/test_slack_approval_buttons.py": change_slack_approval_test_source,
+    "hermes_cli/kanban_db.py": change_kanban_db_source,
 }
 _CHANGE_TARGETS = _load_change_targets()
 if tuple(_CHANGES) != _CHANGE_TARGETS:

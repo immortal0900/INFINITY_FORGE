@@ -371,6 +371,7 @@ for MarkerFile in \
   gateway/run.py; do
   grep -Fq "INFINITY_FORGE_PRE_USER_TURN_V1" "$HERMES_ROOT/$MarkerFile"
 done
+grep -Fq "INFINITY_FORGE_SUBSCRIPTION_WORKER_V1" "$HERMES_ROOT/hermes_cli/kanban_db.py"
 
 for Profile in builder reviewer deep_checker fix; do
   test -d "$HOME/.hermes/profiles/$Profile"

@@ -101,6 +101,50 @@ function Invoke-WithReleasePythonPath {
   }
 }
 
+function Test-SubscriptionRuntimePreflight {
+  param([Parameter(Mandatory = $true)][pscustomobject]$Paths)
+  $preflight = @'
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from forge.ops.codex_subscription_probe import CodexAppServerProbe
+from forge.ops.subscription_runtime import (
+    is_claude_subscription_auth,
+    scrub_subscription_environment,
+)
+
+environment = scrub_subscription_environment(os.environ)
+completed = subprocess.run(
+    [sys.argv[2], "auth", "status", "--json"],
+    env=environment,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    encoding="utf-8",
+    errors="strict",
+    timeout=10.0,
+    check=False,
+)
+if completed.returncode != 0:
+    raise SystemExit(78)
+try:
+    auth = json.loads(completed.stdout)
+except (json.JSONDecodeError, UnicodeError):
+    raise SystemExit(78)
+if not isinstance(auth, dict) or not is_claude_subscription_auth(auth):
+    raise SystemExit(78)
+snapshot = CodexAppServerProbe().probe(sys.argv[3], environment, timeout=10.0)
+raise SystemExit(0 if snapshot.account_type == "chatgpt" else 78)
+'@
+  & $Paths.HermesPython -X utf8 -c $preflight `
+    $Paths.Repo $Paths.ClaudeBin $Paths.CodexBin
+  Assert-ExternalCommand "Claude.ai and Codex subscription preflight failed."
+}
+
 function Test-ForgeWindowsPreflight {
   if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     throw "LOCALAPPDATA is unavailable."
@@ -114,6 +158,8 @@ function Test-ForgeWindowsPreflight {
   )
   $hermesPython = Join-Path $hermesRoot "venv\Scripts\python.exe"
   $hermesCli = Join-Path $hermesRoot "venv\Scripts\hermes.exe"
+  $claudeBin = (Get-Command claude -CommandType Application -ErrorAction Stop).Source
+  $codexBin = (Get-Command codex.exe -CommandType Application -ErrorAction Stop).Source
   $gh = (Get-Command gh.exe -ErrorAction Stop).Source
   $localRoot = [IO.Path]::GetFullPath(
     (Join-Path $env:LOCALAPPDATA "InfinityForge")
@@ -129,6 +175,8 @@ function Test-ForgeWindowsPreflight {
     HermesRoot = $hermesRoot
     HermesPython = $hermesPython
     HermesCli = $hermesCli
+    ClaudeBin = $claudeBin
+    CodexBin = $codexBin
     Gh = $gh
     EnvFile = (Join-Path $hermesHome ".env")
     PluginRoot = (Join-Path $hermesHome "plugins")
@@ -140,6 +188,8 @@ function Test-ForgeWindowsPreflight {
     TaskOutboxDB = (Join-Path $taskData "task-settings.db.task-outbox.db")
     KanbanDB = (Join-Path $hermesHome "kanban.db")
     PackageRoot = (Join-Path $taskData "hermes-user-turn-changes")
+    StableRunner = (Join-Path $localRoot "subscription-runtime\subscription-runner.py")
+    ClaudeMcpConfig = (Join-Path $taskData "subscription-runtime\claude-mcp.json")
     HermesChangeTargets = @()
   }
 
@@ -148,11 +198,23 @@ function Test-ForgeWindowsPreflight {
     $paths.HermesRoot,
     $paths.HermesPython,
     $paths.HermesCli,
+    $paths.ClaudeBin,
+    $paths.CodexBin,
     $paths.Gh,
     $paths.KanbanDB
   )) {
     if (-not (Test-Path -LiteralPath $path)) {
       throw "Windows preflight path is missing: $path"
+    }
+  }
+  foreach ($authSource in @(
+    (Join-Path $env:USERPROFILE ".codex"),
+    (Join-Path $env:USERPROFILE ".claude"),
+    (Join-Path $env:USERPROFILE ".claude.json")
+  )) {
+    $authItem = Get-Item -LiteralPath $authSource -Force -ErrorAction Stop
+    if (($authItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw "A real local subscription login source is required."
     }
   }
 
@@ -170,6 +232,7 @@ function Test-ForgeWindowsPreflight {
     }
   }
   $null = Get-HermesRuntimeFingerprint -Paths $paths
+  Test-SubscriptionRuntimePreflight -Paths $paths
 
   $legacyCheck = @'
 import sqlite3
@@ -528,7 +591,8 @@ function Install-InfinityForgeProfilesAndSkills {
   }
   New-Item -ItemType Directory -Force -Path $Paths.SkillsRoot | Out-Null
   $commonSkills = @(
-    "forge-ops", "memex", "code-design-principles", "forge-labels"
+    "forge-ops", "memex", "code-design-principles", "forge-labels",
+    "codex", "claude-code"
   )
   $gatewaySkills = @("easy-answer", "code-problem-doc")
   $roleSkills = [ordered]@{
@@ -553,6 +617,158 @@ function Install-InfinityForgeProfilesAndSkills {
       }
     }
   }
+}
+
+function Invoke-InfinityForgeSubscriptionConfiguration {
+  param(
+    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
+    [Parameter(Mandatory = $true)][string]$ReleasePath,
+    [Parameter(Mandatory = $true)][ValidateSet("apply", "verify", "rollback")][string]$Action
+  )
+  $configureScript = Join-Path $ReleasePath "forge\scripts\configure-subscription-runtime.py"
+  $arguments = @($configureScript, $Action, "--hermes-root", $Paths.HermesHome)
+  if ($Action -ne "rollback") {
+    $arguments += @("--forge-root", $ReleasePath)
+  }
+  Invoke-WithReleasePythonPath -ReleasePath $ReleasePath -Action {
+    & $Paths.HermesPython @arguments | Out-Host
+    Assert-ExternalCommand "Subscription runtime $Action failed."
+  }
+}
+
+function Install-InfinityForgeSubscriptionRuntime {
+  param(
+    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
+    [Parameter(Mandatory = $true)][string]$ReleasePath,
+    [Parameter(Mandatory = $true)][hashtable]$Transaction
+  )
+  $HermesPython = $Paths.HermesPython
+  $StableRunner = $Paths.StableRunner
+  $ClaudeBin = $Paths.ClaudeBin
+  $ClaudeMcpConfig = $Paths.ClaudeMcpConfig
+  $Transaction.SubscriptionStarted = $true
+  $SubscriptionEnvironment = [ordered]@{
+    "INFINITY_FORGE_SUBSCRIPTION_ROUTING" = "1"
+    "INFINITY_FORGE_SUBSCRIPTION_PYTHON" = $HermesPython
+    "INFINITY_FORGE_SUBSCRIPTION_RUNNER" = $StableRunner
+    "INFINITY_FORGE_CLAUDE_BIN" = $ClaudeBin
+    "INFINITY_FORGE_CLAUDE_MCP_CONFIG" = $ClaudeMcpConfig
+    "INFINITY_FORGE_REPO" = $ReleasePath
+  }
+
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $StableRunner) | Out-Null
+  New-Item -ItemType Directory -Force -Path $Paths.StateRoot | Out-Null
+  $Transaction.SubscriptionRunnerExisted = Test-Path -LiteralPath $StableRunner
+  if ($Transaction.SubscriptionRunnerExisted) {
+    $Transaction.SubscriptionRunnerBackup = Join-Path $Paths.StateRoot (
+      ".subscription-runner-backup-$PID-$([guid]::NewGuid().ToString('N'))"
+    )
+    Copy-Item -LiteralPath $StableRunner `
+      -Destination $Transaction.SubscriptionRunnerBackup -Force
+  }
+  Copy-Item -LiteralPath (
+    Join-Path $ReleasePath "forge\scripts\subscription-runner.py"
+  ) -Destination $StableRunner -Force
+
+  foreach ($Profile in @("builder", "reviewer", "deep_checker", "fix")) {
+    $ProfileHome = Join-Path $Paths.ProfilesRoot "$Profile\home"
+    New-Item -ItemType Directory -Force -Path $ProfileHome | Out-Null
+    foreach ($AuthName in @(".codex", ".claude", ".claude.json")) {
+      $Source = Join-Path $env:USERPROFILE $AuthName
+      $Destination = Join-Path $ProfileHome $AuthName
+      $Backup = $null
+      if (Test-Path -LiteralPath $Destination) {
+        $Backup = "$Destination.bak.$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')).$PID"
+        Move-Item -LiteralPath $Destination -Destination $Backup
+      }
+      $Transaction.SubscriptionProfileLinks.Add(
+        [pscustomobject]@{ Path = $Destination; Backup = $Backup }
+      )
+      New-Item -ItemType SymbolicLink -Path $Destination -Target $Source | Out-Null
+    }
+  }
+
+  foreach ($Name in $SubscriptionEnvironment.Keys) {
+    $Transaction.SubscriptionPreviousUser[$Name] = [Environment]::GetEnvironmentVariable($Name, "User")
+    $Transaction.SubscriptionPreviousProcess[$Name] = [Environment]::GetEnvironmentVariable($Name, "Process")
+  }
+  $Transaction.SubscriptionEnvironmentChanged = $true
+  foreach ($Name in $SubscriptionEnvironment.Keys) {
+    $Value = [string]$SubscriptionEnvironment[$Name]
+    [Environment]::SetEnvironmentVariable($Name, $Value, "User")
+    Set-Item -Path "Env:$Name" -Value $Value
+  }
+
+  $Transaction.SubscriptionConfigureAttempted = $true
+  Invoke-InfinityForgeSubscriptionConfiguration -Paths $Paths `
+    -ReleasePath $ReleasePath -Action "apply"
+  Invoke-InfinityForgeSubscriptionConfiguration -Paths $Paths `
+    -ReleasePath $ReleasePath -Action "verify"
+}
+
+function Restore-InfinityForgeSubscriptionRuntime {
+  param(
+    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
+    [Parameter(Mandatory = $true)][string]$ReleasePath,
+    [Parameter(Mandatory = $true)][hashtable]$Transaction
+  )
+  $ConfigurationRollbackError = $null
+  if ($Transaction.SubscriptionConfigureAttempted) {
+    try {
+      Invoke-InfinityForgeSubscriptionConfiguration -Paths $Paths `
+        -ReleasePath $ReleasePath -Action "rollback"
+    } catch {
+      # Keep restoring local state even when managed config rollback fails.
+      $ConfigurationRollbackError = $_
+    }
+    $Transaction.SubscriptionConfigureAttempted = $false
+  }
+  if ($Transaction.SubscriptionEnvironmentChanged) {
+    foreach ($Name in $Transaction.SubscriptionPreviousUser.Keys) {
+      $PreviousValue = $Transaction.SubscriptionPreviousUser[$Name]
+      [Environment]::SetEnvironmentVariable($Name, $PreviousValue, "User")
+      $PreviousProcessValue = $Transaction.SubscriptionPreviousProcess[$Name]
+      [Environment]::SetEnvironmentVariable($Name, $PreviousProcessValue, "Process")
+    }
+    $Transaction.SubscriptionEnvironmentChanged = $false
+  }
+  for ($Index = $Transaction.SubscriptionProfileLinks.Count - 1; $Index -ge 0; $Index--) {
+    $Link = $Transaction.SubscriptionProfileLinks[$Index]
+    if (Test-Path -LiteralPath $Link.Path) {
+      Remove-Item -LiteralPath $Link.Path -Force
+    }
+    if ($Link.Backup -and (Test-Path -LiteralPath $Link.Backup)) {
+      Move-Item -LiteralPath $Link.Backup -Destination $Link.Path
+    }
+  }
+  if (Test-Path -LiteralPath $Paths.StableRunner) {
+    Remove-Item -LiteralPath $Paths.StableRunner -Force
+  }
+  if ($Transaction.SubscriptionRunnerExisted -and
+      $Transaction.SubscriptionRunnerBackup -and
+      (Test-Path -LiteralPath $Transaction.SubscriptionRunnerBackup)) {
+    Copy-Item -LiteralPath $Transaction.SubscriptionRunnerBackup `
+      -Destination $Paths.StableRunner -Force
+  }
+  $Transaction.SubscriptionStarted = $false
+  if ($null -ne $ConfigurationRollbackError) {
+    throw "Subscription configuration rollback failed after local state restoration."
+  }
+}
+
+function Complete-InfinityForgeSubscriptionRuntime {
+  param(
+    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
+    [Parameter(Mandatory = $true)][hashtable]$Transaction
+  )
+  if ($Transaction.SubscriptionRunnerBackup -and
+      (Test-Path -LiteralPath $Transaction.SubscriptionRunnerBackup)) {
+    Remove-DeploymentPath -Path $Transaction.SubscriptionRunnerBackup `
+      -ExpectedParent $Paths.StateRoot `
+      -ExpectedPrefix ".subscription-runner-backup-"
+    $Transaction.SubscriptionRunnerBackup = $null
+  }
+  $Transaction.SubscriptionStarted = $false
 }
 
 function Enable-InfinityForgePlugin {
@@ -678,6 +894,12 @@ function Test-ForgeWindowsRuntime {
       throw "Hermes user-turn marker is missing: $markerFile"
     }
   }
+  $workerMarker = Get-Content -Raw -LiteralPath (
+    Join-Path $Paths.HermesRoot "hermes_cli\kanban_db.py"
+  )
+  if (-not $workerMarker.Contains("INFINITY_FORGE_SUBSCRIPTION_WORKER_V1")) {
+    throw "Hermes subscription worker marker is missing."
+  }
   foreach ($profile in @("builder", "reviewer", "deep_checker", "fix")) {
     if (-not (Test-Path (Join-Path $Paths.ProfilesRoot $profile))) {
       throw "Infinity Forge Task profile is missing: $profile"
@@ -733,6 +955,8 @@ for database in databases:
     Assert-ExternalCommand "Windows Infinity Forge runtime verification failed."
   }
   Invoke-InfinityForgeToolsetVerify -Paths $Paths -ReleasePath $ReleasePath
+  Invoke-InfinityForgeSubscriptionConfiguration -Paths $Paths `
+    -ReleasePath $ReleasePath -Action "verify"
   $gatewayRunning = Test-HermesGatewayRunning -Paths $Paths
   if ($gatewayRunning -ne $expectedGatewayRunning) {
     throw "Windows Hermes Gateway running state was not preserved."
@@ -748,6 +972,10 @@ function Restore-WindowsDeploymentTransaction {
   try {
     if (Test-HermesGatewayRunning -Paths $Paths) {
       Stop-HermesGateway -Paths $Paths
+    }
+    if ($Transaction.SubscriptionStarted) {
+      Restore-InfinityForgeSubscriptionRuntime -Paths $Paths `
+        -ReleasePath $ReleasePath -Transaction $Transaction
     }
     if ($Transaction.NewPackageInstalled) {
       Invoke-HermesChange -Paths $Paths -ReleasePath $ReleasePath `
@@ -810,6 +1038,14 @@ function Invoke-ForgeWindowsApply {
     PluginInstalled = $false
     ToolsetBackup = $null
     ToolsetChanged = $false
+    SubscriptionConfigureAttempted = $false
+    SubscriptionStarted = $false
+    SubscriptionEnvironmentChanged = $false
+    SubscriptionPreviousUser = @{}
+    SubscriptionPreviousProcess = @{}
+    SubscriptionProfileLinks = [System.Collections.Generic.List[object]]::new()
+    SubscriptionRunnerBackup = $null
+    SubscriptionRunnerExisted = $false
   }
   try {
     if ($gatewayWasRunning) { Stop-HermesGateway -Paths $Paths }
@@ -829,6 +1065,8 @@ function Invoke-ForgeWindowsApply {
     Set-InfinityForgeEnvironment -Paths $Paths -ReleasePath $releasePath
     Initialize-InfinityForgeDatabases -Paths $Paths -ReleasePath $releasePath
     Install-InfinityForgeProfilesAndSkills -Paths $Paths -ReleasePath $releasePath
+    Install-InfinityForgeSubscriptionRuntime -Paths $Paths `
+      -ReleasePath $releasePath -Transaction $transaction
     $transaction.ToolsetBackup = New-InfinityForgeToolsetBackup `
       -Paths $Paths -ReleasePath $releasePath
     $transaction.ToolsetChanged = $true
@@ -850,6 +1088,8 @@ function Invoke-ForgeWindowsApply {
       $transaction.ToolsetBackup = $null
       $transaction.ToolsetChanged = $false
     }
+    Complete-InfinityForgeSubscriptionRuntime -Paths $Paths `
+      -Transaction $transaction
   } catch {
     Restore-WindowsDeploymentTransaction -Paths $Paths `
       -ReleasePath $releasePath -Transaction $transaction

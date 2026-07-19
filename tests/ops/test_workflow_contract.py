@@ -340,7 +340,7 @@ def test_all_deployments_use_the_exact_hermes_change_target_manifest() -> None:
     server_deploy = DEPLOY.read_text(encoding="utf-8")
     windows_deploy = WINDOWS_DEPLOY.read_text(encoding="utf-8")
 
-    assert len(targets) == 23
+    assert len(targets) == 24
     assert len(targets) == len(set(targets))
     assert all("\\" not in target and not Path(target).is_absolute() for target in targets)
     assert "_load_change_targets" in installer
@@ -561,3 +561,10 @@ def test_every_deploy_layer_applies_and_reads_back_hermes_tool_visibility() -> N
         assert f" {action}" in linux
     for action in ("Backup", "Apply", "Restore", "Verify"):
         assert f"Toolset{action}" in windows
+
+
+def test_deploy_verification_includes_subscription_worker_patch() -> None:
+    deploy = WINDOWS_DEPLOY.read_text(encoding="utf-8")
+
+    assert "hermes_cli\\kanban_db.py" in deploy
+    assert "INFINITY_FORGE_SUBSCRIPTION_WORKER_V1" in deploy

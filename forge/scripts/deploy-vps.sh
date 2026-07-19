@@ -91,11 +91,66 @@ GH_BIN="${INFINITY_FORGE_GH_PATH:-/usr/bin/gh}"
 [ -x "$HERMES_BIN" ] || { echo "[deploy] Hermes command is missing" >&2; exit 1; }
 [ -x "$GH_BIN" ] || { echo "[deploy] GitHub command is missing" >&2; exit 1; }
 
+CLAUDE_VERSION="2.1.215"
+CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+CLAUDE_ACTUAL_VERSION=""
+if [ -n "$CLAUDE_BIN" ]; then
+  CLAUDE_ACTUAL_VERSION="$("$CLAUDE_BIN" --version 2>/dev/null | awk 'NR == 1 { print $1 }')"
+fi
+if [ "$CLAUDE_ACTUAL_VERSION" != "$CLAUDE_VERSION" ]; then
+  # RISK(security): execute only the pinned official native installer before any service/config mutation.
+  curl -fsSL https://claude.ai/install.sh | bash -s 2.1.215
+  hash -r
+  CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+  [ -n "$CLAUDE_BIN" ] || { echo "[deploy] Claude Code installation failed" >&2; exit 78; }
+  CLAUDE_ACTUAL_VERSION="$("$CLAUDE_BIN" --version 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  [ "$CLAUDE_ACTUAL_VERSION" = "$CLAUDE_VERSION" ] || {
+    echo "[deploy] Claude Code 2.1.215 is required" >&2
+    exit 78
+  }
+fi
+
+# RISK(security): keep the JSON private and validate only first-party subscription auth.
+CLAUDE_AUTH_JSON="$("$CLAUDE_BIN" auth status --json 2>/dev/null)" || {
+  echo "[deploy] Claude.ai subscription login required; run: claude auth login" >&2
+  exit 78
+}
+if ! printf '%s' "$CLAUDE_AUTH_JSON" | "$HERMES_PY" -c '
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from forge.ops.subscription_runtime import is_claude_subscription_auth
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeError):
+    raise SystemExit(1)
+valid = isinstance(payload, dict) and is_claude_subscription_auth(payload)
+raise SystemExit(0 if valid else 1)
+' "$REPO_DIR"; then
+  unset CLAUDE_AUTH_JSON
+  echo "[deploy] Claude.ai subscription login required; run: claude auth login" >&2
+  exit 78
+fi
+unset CLAUDE_AUTH_JSON
+
+for AUTH_SOURCE in "$HOME/.codex" "$HOME/.claude"; do
+  [ -d "$AUTH_SOURCE" ] && [ ! -L "$AUTH_SOURCE" ] || {
+    echo "[deploy] a real login directory is missing; complete codex/claude login first" >&2
+    exit 78
+  }
+done
+[ -f "$HOME/.claude.json" ] && [ ! -L "$HOME/.claude.json" ] || {
+  echo "[deploy] Claude login state is missing; run: claude auth login" >&2
+  exit 78
+}
+
 REPOSITORY="${INFINITY_FORGE_REPOSITORY:-$($GH_BIN repo view --json nameWithOwner --jq .nameWithOwner)}"
 TASK_DATA_DIR="${INFINITY_FORGE_TASK_DATA_DIR:-$HOME/.hermes/infinity-forge}"
 TASK_SETTINGS_DB="$TASK_DATA_DIR/task-settings.db"
 CONFIRMED_TASKS_DB="$TASK_SETTINGS_DB.task-outbox.db"
 HERMES_DB="$HOME/.hermes/kanban.db"
+STABLE_RUNNER="$HOME/.hermes/infinity-forge/bin/subscription-runner.py"
+CONFIGURE_SCRIPT="$REPO_DIR/forge/scripts/configure-subscription-runtime.py"
+CLAUDE_MCP_CONFIG="$TASK_DATA_DIR/subscription-runtime/claude-mcp.json"
 mkdir -p "$TASK_DATA_DIR"
 
 # Plugin bootstrap은 사용자 Hermes home 아래의 이 고정 경로만 신뢰한다.
@@ -212,6 +267,26 @@ restore_plugin_state() {
   PLUGIN_STATE_CHANGED=false
 }
 
+PACKAGE_CHANGED=false
+CONFIGURE_APPLIED=false
+DEPLOY_BACKUP="$(mktemp -d "$TASK_DATA_DIR/.subscription-deploy-backup.XXXXXX")"
+BACKUP_DESTINATIONS=()
+BACKUP_PATHS=()
+PROFILE_LINK_DESTINATIONS=()
+PROFILE_LINK_BACKUPS=()
+backup_managed_path() {
+  DESTINATION="$1"
+  INDEX="${#BACKUP_DESTINATIONS[@]}"
+  BACKUP="$DEPLOY_BACKUP/$INDEX"
+  BACKUP_DESTINATIONS+=("$DESTINATION")
+  if [ -e "$DESTINATION" ] || [ -L "$DESTINATION" ]; then
+    cp -a -- "$DESTINATION" "$BACKUP"
+    BACKUP_PATHS+=("$BACKUP")
+  else
+    BACKUP_PATHS+=("")
+  fi
+}
+
 cleanup_deploy_temporaries() {
   if [ -n "$PACKAGE_TEMP" ]; then
     case "$PACKAGE_TEMP" in
@@ -261,6 +336,30 @@ restore_runtime_after_error() {
       systemctl --user stop "forge-$T.timer" >/dev/null 2>&1 || true
       systemctl --user stop "forge-$T.service" >/dev/null 2>&1 || true
     done
+    if [ "$CONFIGURE_APPLIED" = true ]; then
+      "$HERMES_PY" "$CONFIGURE_SCRIPT" rollback --hermes-root "$HOME/.hermes" >/dev/null 2>&1 || true
+    fi
+    for ((I=${#PROFILE_LINK_DESTINATIONS[@]}-1; I>=0; I--)); do
+      DST="${PROFILE_LINK_DESTINATIONS[$I]}"
+      BACKUP="${PROFILE_LINK_BACKUPS[$I]}"
+      rm -f -- "$DST"
+      if [ -n "$BACKUP" ] && { [ -e "$BACKUP" ] || [ -L "$BACKUP" ]; }; then
+        mv -- "$BACKUP" "$DST" || true
+      fi
+    done
+    for ((I=${#BACKUP_DESTINATIONS[@]}-1; I>=0; I--)); do
+      DST="${BACKUP_DESTINATIONS[$I]}"
+      BACKUP="${BACKUP_PATHS[$I]}"
+      rm -rf -- "$DST"
+      if [ -n "$BACKUP" ] && { [ -e "$BACKUP" ] || [ -L "$BACKUP" ]; }; then
+        mkdir -p -- "$(dirname "$DST")"
+        cp -a -- "$BACKUP" "$DST" || true
+      fi
+    done
+    if [ "$PACKAGE_CHANGED" = true ] && [ -n "${CHANGE_PACKAGE:-}" ]; then
+      "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" restore \
+        --hermes-root "$HERMES_ROOT" --package "$CHANGE_PACKAGE" >/dev/null 2>&1 || true
+    fi
     if ! restore_forge_environment; then
       echo "[deploy] WARNING: runtime settings rollback needs manual review: $ENV_BACKUP" >&2
     else
@@ -290,6 +389,7 @@ restore_runtime_after_error() {
   else
     cleanup_deploy_temporaries
   fi
+  rm -rf -- "$DEPLOY_BACKUP"
   return "$STATUS"
 }
 trap restore_runtime_after_error EXIT
@@ -384,6 +484,9 @@ if [ ! -f "$CHANGE_PACKAGE/installed-files-list.json" ]; then
 fi
 EXPECTED_PACKAGE_VERSION="$CHANGE_PACKAGE_VERSION" CHANGE_PACKAGE="$CHANGE_PACKAGE" "$HERMES_PY" -c \
   'import json, os, pathlib; payload=json.loads((pathlib.Path(os.environ["CHANGE_PACKAGE"]) / "installed-files-list.json").read_text(encoding="utf-8")); assert payload["source_version"] == os.environ["EXPECTED_PACKAGE_VERSION"]'
+if ! grep -Fq "INFINITY_FORGE_SUBSCRIPTION_WORKER_V1" "$HERMES_ROOT/hermes_cli/kanban_db.py"; then
+  PACKAGE_CHANGED=true
+fi
 "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" install \
   --hermes-root "$HERMES_ROOT" \
   --package "$CHANGE_PACKAGE"
@@ -650,6 +753,15 @@ done
 for S in easy-answer code-problem-doc; do
   [ -d "forge/skills/$S" ] && cp -r "forge/skills/$S" ~/.hermes/skills/
 done
+# 구독 runner를 명시적으로 선택하는 두 스킬은 기본 gateway와 네 역할 모두에 둔다.
+for S in codex claude-code; do
+  backup_managed_path "$HOME/.hermes/skills/$S"
+  cp -r "forge/skills/$S" "$HOME/.hermes/skills/"
+  for P in builder reviewer deep_checker fix; do
+    backup_managed_path "$HOME/.hermes/profiles/$P/skills/$S"
+    cp -r "forge/skills/$S" "$HOME/.hermes/profiles/$P/skills/"
+  done
+done
 # reviewer 추가 (문제 리포트 문서화)
 [ -d forge/skills/code-problem-doc ] && cp -r forge/skills/code-problem-doc ~/.hermes/profiles/reviewer/skills/
 # 역할 전용 스킬
@@ -658,19 +770,30 @@ done
 [ -d forge/skills/deep-check ]  && cp -r forge/skills/deep-check  ~/.hermes/profiles/deep_checker/skills/
 [ -d forge/skills/fix-task ]    && cp -r forge/skills/fix-task    ~/.hermes/profiles/fix/skills/
 
-echo "[deploy] 프로필 home 인증 링크 보정 (codex·gh·git)..."
+echo "[deploy] 프로필 home 인증 링크 보정 (codex·claude·gh·git)..."
 # hermes 프로필은 자체 HOME(~/.hermes/profiles/<P>/home)으로 실행되어
 # 실계정의 ~/.codex(코덱스 로그인)·~/.config/gh(gh 인증)·~/.gitconfig가 안 보인다 → symlink로 연결
 for P in builder reviewer deep_checker fix; do
   PH=~/.hermes/profiles/$P/home
   mkdir -p "$PH/.config"
   # 주의: 대상이 이미 '실제 디렉토리'면 ln -sfn이 그 안에 링크를 만들어버린다 → 치우고 링크
-  for PAIR in ".codex:$HOME/.codex" ".config/gh:$HOME/.config/gh" ".gitconfig:$HOME/.gitconfig"; do
+  for PAIR in ".codex:$HOME/.codex" ".claude:$HOME/.claude" ".claude.json:$HOME/.claude.json" ".config/gh:$HOME/.config/gh" ".gitconfig:$HOME/.gitconfig"; do
     DST="$PH/${PAIR%%:*}"; SRC="${PAIR#*:}"
-    if [ -e "$DST" ] && [ ! -L "$DST" ]; then mv "$DST" "$DST.bak.$(date +%s)"; fi
-    ln -sfn "$SRC" "$DST"
+    BACKUP=""
+    if [ -e "$DST" ] || [ -L "$DST" ]; then
+      BACKUP="$DST.bak.$(date -u +%Y%m%dT%H%M%SZ).$$"
+      # RISK(security): preserve the exact credential item before replacing it with a link.
+      mv -- "$DST" "$BACKUP"
+    fi
+    PROFILE_LINK_DESTINATIONS+=("$DST")
+    PROFILE_LINK_BACKUPS+=("$BACKUP")
+    ln -s -- "$SRC" "$DST"
   done
 done
+
+mkdir -p "$(dirname "$STABLE_RUNNER")"
+backup_managed_path "$STABLE_RUNNER"
+install -m 755 "$REPO_DIR/forge/scripts/subscription-runner.py" "$STABLE_RUNNER"
 
 echo "[deploy] hooks·scripts → ~/forge..."
 mkdir -p ~/forge/hooks
@@ -750,13 +873,24 @@ done
 echo "[deploy] 게이트웨이 스킬 리로드..."
 DROP_IN="$HOME/.config/systemd/user/hermes-gateway.service.d"
 mkdir -p "$DROP_IN"
+backup_managed_path "$DROP_IN/infinity-forge.conf"
 cat > "$DROP_IN/infinity-forge.conf" << UNIT
 [Service]
 Environment=PYTHONPATH=$REPO_DIR
 Environment=INFINITY_FORGE_REPOSITORY=$REPOSITORY
 Environment=INFINITY_FORGE_TASK_SETTINGS_DB=$TASK_SETTINGS_DB
 Environment=INFINITY_FORGE_GH_PATH=$GH_BIN
+Environment="INFINITY_FORGE_SUBSCRIPTION_ROUTING=1"
+Environment="INFINITY_FORGE_SUBSCRIPTION_PYTHON=$HERMES_PY"
+Environment="INFINITY_FORGE_SUBSCRIPTION_RUNNER=$STABLE_RUNNER"
+Environment="INFINITY_FORGE_CLAUDE_BIN=$CLAUDE_BIN"
+Environment="INFINITY_FORGE_CLAUDE_MCP_CONFIG=$CLAUDE_MCP_CONFIG"
+Environment="INFINITY_FORGE_REPO=$REPO_DIR"
 UNIT
+
+CONFIGURE_APPLIED=true
+"$HERMES_PY" "$CONFIGURE_SCRIPT" apply --forge-root "$REPO_DIR" --hermes-root "$HOME/.hermes"
+"$HERMES_PY" "$CONFIGURE_SCRIPT" verify --forge-root "$REPO_DIR" --hermes-root "$HOME/.hermes"
 systemctl --user daemon-reload
 cleanup_deploy_temporaries
 systemctl --user restart hermes-gateway
@@ -775,8 +909,10 @@ case "$CONFIG_BACKUP" in
   *) echo "[deploy] Hermes config backup path is invalid" >&2; exit 1 ;;
 esac
 CONFIG_BACKUP=""
+systemctl --user is-active --quiet hermes-gateway
 GATEWAY_WAS_ACTIVE=false
 trap - EXIT
+rm -rf -- "$DEPLOY_BACKUP"
 echo "[deploy] done: $(git rev-parse --short HEAD)"
 }
 main "$@"
