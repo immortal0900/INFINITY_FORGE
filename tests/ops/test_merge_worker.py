@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import importlib.util
 import json
+import multiprocessing
 from pathlib import Path
+import threading
 from typing import Any
 
 import pytest
@@ -1248,6 +1251,7 @@ def test_build_runtime_uses_the_shared_snapshot_loader_and_refresh_factory(
 class FakeProjectMergeStore:
     def __init__(self, timeline: list[str]) -> None:
         self.timeline = timeline
+        self.merge_attempt_created = True
         self.merged: list[str] = []
         self.partial: list[tuple[tuple[str, ...], str, tuple[str, ...]]] = []
         self.completed = False
@@ -1273,10 +1277,12 @@ class FakeProjectMergeStore:
         snapshot: ProjectMergeSnapshot,
         *,
         expected_head_commit: str,
+        occurred_at: datetime,
     ) -> Any:
         assert snapshot in task.projects
         assert snapshot.task_flow_state is not None
         assert expected_head_commit == snapshot.task_flow_state.current_commit
+        assert occurred_at == NOW
         self.timeline.append(f"guard:{snapshot.project.repository}")
         yield self
 
@@ -1417,6 +1423,103 @@ class OrderedProjectWriter(FakeMergeWriter):
             expected_commit,
             expected_base_commit=expected_base_commit,
         )
+
+
+class AmbiguousRaceWriter(FakeMergeWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ambiguous_started = threading.Event()
+        self.owner_thread: int | None = None
+        self._lock = threading.Lock()
+
+    def merge_expected_commit(
+        self,
+        pr_url: str,
+        expected_commit: str,
+        *,
+        expected_base_commit: str,
+    ) -> MergeWriteResult:
+        with self._lock:
+            call_number = len(self.merge_calls) + 1
+            self.merge_calls.append((pr_url, expected_commit, expected_base_commit))
+        if call_number == 1:
+            self.owner_thread = threading.get_ident()
+            self.ambiguous_started.set()
+            raise GateError("merge response was lost")
+        return MergeWriteResult(
+            expected_commit=expected_commit,
+            expected_base_commit=expected_base_commit,
+            merged_commit=MERGED,
+            merged_base_commit=expected_base_commit,
+            merged_head_commit=expected_commit,
+            already_merged=False,
+            recovered_by_readback=False,
+        )
+
+
+class AmbiguousRaceEvidenceReader:
+    def __init__(
+        self,
+        task: ProjectMergeTask,
+        *,
+        writer: AmbiguousRaceWriter,
+        release_recovery: threading.Event,
+    ) -> None:
+        self._by_url = {
+            snapshot.task_flow_state.pr_url: _project_evidence(snapshot)
+            for snapshot in task.projects
+            if snapshot.task_flow_state is not None
+        }
+        self._writer = writer
+        self._release_recovery = release_recovery
+
+    def get_merge_evidence(
+        self,
+        pr_url: str,
+        required_check_names: tuple[str, ...],
+        *,
+        include_safe_files: bool,
+    ) -> GitHubMergeEvidence:
+        assert required_check_names == ("eval",)
+        assert include_safe_files is False
+        if (
+            self._writer.ambiguous_started.is_set()
+            and self._writer.owner_thread == threading.get_ident()
+        ):
+            assert self._release_recovery.wait(timeout=10)
+        return self._by_url[pr_url]
+
+
+def _reserve_project_in_process(
+    task: ProjectMergeTask,
+    database_path: str,
+    project_id: str,
+    start: Any,
+    results: Any,
+) -> None:
+    snapshot = next(
+        item for item in task.projects if item.project.project_id == project_id
+    )
+    assert snapshot.task_flow_state is not None
+    proofs = tuple(
+        ProjectMergeProof(
+            project_id=item.project.project_id,
+            repository=item.project.repository,
+            decision=AUTO_MERGE_ALLOWED,
+            expected_head_commit=item.task_flow_state.current_commit,  # type: ignore[union-attr]
+        )
+        for item in task.projects
+    )
+    store = TaskDatabaseProjectMergeStore(database_path)
+    assert start.wait(timeout=20)
+    store.prepare_barrier(task, proofs, occurred_at=NOW)
+    with store.guard_project(
+        task,
+        snapshot,
+        expected_head_commit=snapshot.task_flow_state.current_commit,
+        occurred_at=NOW,
+    ) as reservation:
+        results.put(reservation.merge_attempt_created)
 
 
 def _project_merge_task(
@@ -1826,6 +1929,53 @@ def test_pending_retry_only_reconciles_and_starts_no_new_merge(
     assert any(item.action == "observed_merge" for item in report.tasks)
 
 
+def test_pending_exact_unmerged_readback_waits_without_failing_or_retrying(
+    tmp_path: Path,
+) -> None:
+    original = _project_merge_task(tmp_path)
+    pending = original.projects[0]
+    task = replace(
+        original,
+        projects=tuple(
+            replace(
+                snapshot,
+                project_state="waiting_for_help",
+                merge_attempt_pending=True,
+            )
+            if snapshot == pending
+            else snapshot
+            for snapshot in original.projects
+        ),
+    )
+    timeline: list[str] = []
+    store = FakeProjectMergeStore(timeline)
+    reader = ProjectEvidenceReader(
+        {
+            snapshot.task_flow_state.pr_url: [_project_evidence(snapshot)]
+            for snapshot in task.projects
+            if snapshot.task_flow_state is not None
+        }
+    )
+    writer = OrderedProjectWriter(timeline)
+
+    report = run_project_merge_tasks(
+        (task,),
+        evidence_reader=reader,
+        merge_writer=writer,
+        merge_store=store,
+        required_check="eval",
+        environment={"AUTO_MERGE_ENABLED": "true"},
+        clock=lambda: NOW,
+    )
+
+    assert report.ok is False
+    assert writer.merge_calls == []
+    assert store.failed == []
+    assert store.partial == []
+    assert store.pending == [pending.project.project_id]
+    assert any(item.action == "reconciliation_pending" for item in report.tasks)
+
+
 def test_lost_merge_response_converges_from_exact_remote_readback(
     tmp_path: Path,
 ) -> None:
@@ -2044,6 +2194,7 @@ def test_database_project_guard_rechecks_head_and_records_terminal_partial(
         task,
         first,
         expected_head_commit=first_state.current_commit,
+        occurred_at=NOW,
     ) as guard:
         guard.mark_merged(first, result, occurred_at=NOW)
     store.finish_partial(
@@ -2191,6 +2342,185 @@ def test_database_store_keeps_unknown_merge_nonterminal_and_retryable(
     assert terminal is None
 
 
+def test_two_workers_never_repeat_same_reserved_remote_merge(
+    tmp_path: Path,
+) -> None:
+    task = _project_merge_task(tmp_path)
+    database_path = tmp_path / "task.db"
+    _insert_project_merge_task_database(database_path, task)
+    target_id = (task.settings.merge_order or ())[0]
+    target = next(
+        snapshot
+        for snapshot in task.projects
+        if snapshot.project.project_id == target_id
+    )
+    assert target.task_flow_state is not None
+    writer = AmbiguousRaceWriter()
+    release_recovery = threading.Event()
+    reader = AmbiguousRaceEvidenceReader(
+        task,
+        writer=writer,
+        release_recovery=release_recovery,
+    )
+
+    def worker() -> MergeRunReport:
+        return run_project_merge_tasks(
+            (task,),
+            evidence_reader=reader,
+            merge_writer=writer,
+            merge_store=TaskDatabaseProjectMergeStore(database_path),
+            required_check="eval",
+            environment={"AUTO_MERGE_ENABLED": "true"},
+            clock=lambda: NOW,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(worker)
+        assert writer.ambiguous_started.wait(timeout=10)
+        with TaskDatabase(database_path).read() as connection:
+            reserved = connection.execute(
+                """
+                SELECT state, pr_url, head_commit, merge_commit
+                FROM task_projects
+                WHERE request_id = ? AND project_id = ?
+                """,
+                (task.request.request_id, target.project.project_id),
+            ).fetchone()
+        assert reserved is not None
+        assert tuple(reserved) == (
+            "waiting_for_help",
+            target.task_flow_state.pr_url,
+            target.task_flow_state.current_commit,
+            None,
+        )
+        second = pool.submit(worker)
+        try:
+            second_report = second.result(timeout=10)
+        finally:
+            release_recovery.set()
+        first_report = first.result(timeout=10)
+
+    target_calls = [
+        call for call in writer.merge_calls if call[0] == target.task_flow_state.pr_url
+    ]
+    assert len(target_calls) == 1
+    assert any(
+        item.action == "reconciliation_pending"
+        for item in (*first_report.tasks, *second_report.tasks)
+    )
+
+
+def test_two_processes_create_only_one_exact_merge_reservation(
+    tmp_path: Path,
+) -> None:
+    task = _project_merge_task(tmp_path)
+    database_path = tmp_path / "task.db"
+    _insert_project_merge_task_database(database_path, task)
+    project_id = (task.settings.merge_order or ())[0]
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_reserve_project_in_process,
+            args=(task, str(database_path), project_id, start, results),
+        )
+        for _ in range(2)
+    ]
+
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=30)
+
+    assert [process.exitcode for process in processes] == [0, 0]
+    ownership = sorted(results.get(timeout=10) for _ in processes)
+    assert ownership == [False, True]
+
+
+def test_crash_after_reservation_recovers_by_readback_without_new_write(
+    tmp_path: Path,
+) -> None:
+    task = _project_merge_task(tmp_path)
+    database_path = tmp_path / "task.db"
+    _insert_project_merge_task_database(database_path, task)
+    store = TaskDatabaseProjectMergeStore(database_path)
+    proofs = tuple(
+        ProjectMergeProof(
+            snapshot.project.project_id,
+            snapshot.project.repository,
+            AUTO_MERGE_ALLOWED,
+            snapshot.task_flow_state.current_commit,  # type: ignore[union-attr]
+        )
+        for snapshot in task.projects
+    )
+    store.prepare_barrier(task, proofs, occurred_at=NOW)
+    target_id = (task.settings.merge_order or ())[0]
+    target = next(
+        snapshot
+        for snapshot in task.projects
+        if snapshot.project.project_id == target_id
+    )
+    assert target.task_flow_state is not None
+    with store.guard_project(
+        task,
+        target,
+        expected_head_commit=target.task_flow_state.current_commit,
+        occurred_at=NOW,
+    ) as reservation:
+        assert reservation.merge_attempt_created is True
+        # Simulate a process exit after durable intent, before GitHub write.
+
+    retry_task = replace(
+        task,
+        projects=tuple(
+            replace(
+                snapshot,
+                project_state="waiting_for_help",
+                merge_attempt_pending=True,
+            )
+            if snapshot == target
+            else snapshot
+            for snapshot in task.projects
+        ),
+    )
+    writer = OrderedProjectWriter([])
+    report = run_project_merge_tasks(
+        (retry_task,),
+        evidence_reader=ProjectEvidenceReader(
+            {
+                snapshot.task_flow_state.pr_url: [_project_evidence(snapshot)]
+                for snapshot in retry_task.projects
+                if snapshot.task_flow_state is not None
+            }
+        ),
+        merge_writer=writer,
+        merge_store=TaskDatabaseProjectMergeStore(database_path),
+        required_check="eval",
+        environment={"AUTO_MERGE_ENABLED": "true"},
+        clock=lambda: NOW,
+    )
+
+    with TaskDatabase(database_path).read() as connection:
+        state = connection.execute(
+            """
+            SELECT state, pr_url, head_commit, merge_commit
+            FROM task_projects WHERE request_id = ? AND project_id = ?
+            """,
+            (task.request.request_id, target_id),
+        ).fetchone()
+    assert report.ok is False
+    assert writer.merge_calls == []
+    assert state is not None
+    assert tuple(state) == (
+        "waiting_for_help",
+        target.task_flow_state.pr_url,
+        target.task_flow_state.current_commit,
+        None,
+    )
+
+
 def test_database_project_guard_rejects_head_tampering_before_remote_write(
     tmp_path: Path,
 ) -> None:
@@ -2220,6 +2550,7 @@ def test_database_project_guard_rejects_head_tampering_before_remote_write(
             task,
             first,
             expected_head_commit=first.task_flow_state.current_commit,  # type: ignore[union-attr]
+            occurred_at=NOW,
         ):
             pass
 
@@ -2256,3 +2587,62 @@ def test_database_barrier_rejects_project_state_change_before_any_merge(
             (task.request.request_id,),
         ).fetchall()
     assert all(tuple(row) == (None, None) for row in proofs_after)
+
+
+@pytest.mark.parametrize("event_type", ("stop_requested", "revision_requested"))
+def test_database_reservation_rejects_lifecycle_change_after_barrier(
+    tmp_path: Path,
+    event_type: str,
+) -> None:
+    task = _project_merge_task(tmp_path)
+    database_path = tmp_path / "task.db"
+    _insert_project_merge_task_database(database_path, task)
+    store = TaskDatabaseProjectMergeStore(database_path)
+    proofs = tuple(
+        ProjectMergeProof(
+            snapshot.project.project_id,
+            snapshot.project.repository,
+            AUTO_MERGE_ALLOWED,
+            snapshot.task_flow_state.current_commit,  # type: ignore[union-attr]
+        )
+        for snapshot in task.projects
+    )
+    store.prepare_barrier(task, proofs, occurred_at=NOW)
+    target = task.projects[0]
+    assert target.task_flow_state is not None
+    with TaskDatabase(database_path).transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO task_events (
+                request_id, task_settings_hash, project_id, event_type,
+                event_key, event_json, occurred_at
+            ) VALUES (?, ?, NULL, ?, ?, ?, ?)
+            """,
+            (
+                task.request.request_id,
+                task.settings.task_settings_hash,
+                event_type,
+                f"{event_type}:test",
+                json.dumps({"reason": "test"}, sort_keys=True),
+                NOW.isoformat(),
+            ),
+        )
+
+    with pytest.raises(Exception, match="blocked|lifecycle|state"):
+        with store.guard_project(
+            task,
+            target,
+            expected_head_commit=target.task_flow_state.current_commit,
+            occurred_at=NOW,
+        ):
+            pass
+
+    with TaskDatabase(database_path).read() as connection:
+        state = connection.execute(
+            """
+            SELECT state FROM task_projects
+            WHERE request_id = ? AND project_id = ?
+            """,
+            (task.request.request_id, target.project.project_id),
+        ).fetchone()
+    assert state is not None and state[0] == target.project_state

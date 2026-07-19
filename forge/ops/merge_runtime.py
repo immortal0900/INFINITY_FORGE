@@ -223,6 +223,7 @@ class ProjectMergeStore(Protocol):
         snapshot: ProjectMergeSnapshot,
         *,
         expected_head_commit: str,
+        occurred_at: datetime,
     ) -> AbstractContextManager[ProjectMergeGuard]: ...
 
     def finish_merged(
@@ -245,6 +246,8 @@ class ProjectMergeStore(Protocol):
 
 
 class ProjectMergeGuard(Protocol):
+    merge_attempt_created: bool
+
     def mark_merged(
         self,
         snapshot: ProjectMergeSnapshot,
@@ -323,7 +326,7 @@ class TaskDatabaseProjectMergeStore:
                     raise MergeRuntimeError("stored Project merge proof changed")
                 return
             if (
-                row[0] != snapshot.project_state
+                row[0] not in {snapshot.project_state, "waiting_for_help"}
                 or row[1] not in {None, state.pr_url}
                 or row[2] not in {None, state.current_commit}
                 or row[3] is not None
@@ -335,7 +338,8 @@ class TaskDatabaseProjectMergeStore:
                 SET state = 'merged', pr_url = ?, head_commit = ?,
                     merge_commit = ?, updated_at = ?
                 WHERE request_id = ? AND project_id = ?
-                  AND task_settings_hash = ? AND state = ?
+                  AND task_settings_hash = ?
+                  AND state IN (?, 'waiting_for_help')
                   AND (pr_url IS NULL OR pr_url = ?)
                   AND (head_commit IS NULL OR head_commit = ?)
                   AND merge_commit IS NULL
@@ -504,9 +508,16 @@ class TaskDatabaseProjectMergeStore:
                     """,
                     (task.request.request_id, snapshot.project.project_id),
                 ).fetchone()
+                if row is None:
+                    raise MergeRuntimeError("stored Project merge proof changed")
+                if row[0] in {"waiting_for_help", "merged"}:
+                    if row[1] != state.pr_url or row[2] != state.current_commit:
+                        raise MergeRuntimeError(
+                            "stored Project reservation proof changed"
+                        )
+                    continue
                 if (
-                    row is None
-                    or row[0] != snapshot.project_state
+                    row[0] != snapshot.project_state
                     or row[1] not in {None, state.pr_url}
                     or row[2] not in {None, state.current_commit}
                 ):
@@ -542,6 +553,7 @@ class TaskDatabaseProjectMergeStore:
         snapshot: ProjectMergeSnapshot,
         *,
         expected_head_commit: str,
+        occurred_at: datetime,
     ) -> Iterator[ProjectMergeGuard]:
         state = snapshot.task_flow_state
         if state is None or expected_head_commit != state.current_commit:
@@ -561,17 +573,58 @@ class TaskDatabaseProjectMergeStore:
                     task.settings.task_settings_hash,
                 ),
             ).fetchone()
-            if (
-                row is None
-                or row[0] != snapshot.project_state
-                or row[1] != state.pr_url
-                or row[2] != expected_head_commit
-                or (row[0] != "merged" and row[3] is not None)
-            ):
+            if row is None or row[1] != state.pr_url or row[2] != expected_head_commit:
                 raise MergeRuntimeError(
                     "Project state or head changed before the merge write"
                 )
-            yield _TaskDatabaseProjectMergeGuard(connection, task, snapshot)
+            merge_attempt_created = False
+            if row[0] == snapshot.project_state and row[0] in {
+                "ready",
+                "running",
+                "reviewing",
+            }:
+                if row[3] is not None:
+                    raise MergeRuntimeError("Project merge reservation is corrupt")
+                reserved = connection.execute(
+                    """
+                    UPDATE task_projects
+                    SET state = 'waiting_for_help', updated_at = ?
+                    WHERE request_id = ? AND project_id = ?
+                      AND task_settings_hash = ? AND state = ?
+                      AND pr_url = ? AND head_commit = ?
+                      AND merge_commit IS NULL
+                    """,
+                    (
+                        _v2_timestamp(occurred_at),
+                        task.request.request_id,
+                        snapshot.project.project_id,
+                        task.settings.task_settings_hash,
+                        snapshot.project_state,
+                        state.pr_url,
+                        expected_head_commit,
+                    ),
+                )
+                if reserved.rowcount != 1:
+                    raise MergeRuntimeError(
+                        "Project merge reservation could not be recorded"
+                    )
+                merge_attempt_created = True
+            elif row[0] == "waiting_for_help" and row[3] is None:
+                merge_attempt_created = False
+            elif row[0] == "merged" and row[3] is not None:
+                merge_attempt_created = False
+            else:
+                raise MergeRuntimeError(
+                    "Project state does not permit a merge reservation"
+                )
+        # The reservation transaction must commit before the remote call. A
+        # second worker can only observe this durable state and read back.
+        yield _TaskDatabaseProjectMergeGuard(
+            self._database,
+            task,
+            snapshot,
+            merge_attempt_created,
+        )
 
     def finish_merged(
         self,
@@ -833,9 +886,10 @@ class TaskDatabaseProjectMergeStore:
 
 @dataclass(slots=True)
 class _TaskDatabaseProjectMergeGuard:
-    connection: sqlite3.Connection
+    database: TaskDatabase
     task: ProjectMergeTask
     expected: ProjectMergeSnapshot
+    merge_attempt_created: bool
 
     def mark_merged(
         self,
@@ -850,40 +904,59 @@ class _TaskDatabaseProjectMergeGuard:
         if state is None:
             raise MergeRuntimeError("Project merge result has no replayed proof")
         timestamp = _v2_timestamp(occurred_at)
-        row = self.connection.execute(
-            """
-            SELECT state, merge_commit FROM task_projects
-            WHERE request_id = ? AND project_id = ?
-            """,
-            (self.task.request.request_id, snapshot.project.project_id),
-        ).fetchone()
-        if row is None:
-            raise MergeRuntimeError("Project disappeared after merge readback")
-        if row[0] == "merged":
-            if row[1] != result.merged_commit:
-                raise MergeRuntimeError("stored Project merge commit changed")
-            return
-        updated = self.connection.execute(
-            """
-            UPDATE task_projects
-            SET state = 'merged', merge_commit = ?, updated_at = ?
-            WHERE request_id = ? AND project_id = ?
-              AND task_settings_hash = ?
-              AND state IN ('ready', 'running', 'reviewing')
-              AND pr_url = ? AND head_commit = ? AND merge_commit IS NULL
-            """,
-            (
-                result.merged_commit,
-                timestamp,
-                self.task.request.request_id,
-                snapshot.project.project_id,
-                self.task.settings.task_settings_hash,
-                state.pr_url,
-                result.expected_commit,
-            ),
-        )
-        if updated.rowcount != 1:
-            raise MergeRuntimeError("Project merge result could not be recorded")
+        with self.database.transaction() as connection:
+            TaskDatabaseProjectMergeStore._require_exact_task(connection, self.task)
+            row = connection.execute(
+                """
+                SELECT state, pr_url, head_commit, merge_commit
+                FROM task_projects
+                WHERE request_id = ? AND project_id = ?
+                  AND task_settings_hash = ?
+                """,
+                (
+                    self.task.request.request_id,
+                    snapshot.project.project_id,
+                    self.task.settings.task_settings_hash,
+                ),
+            ).fetchone()
+            if row is None:
+                raise MergeRuntimeError("Project disappeared after merge readback")
+            if row[0] == "merged":
+                if tuple(row[1:]) != (
+                    state.pr_url,
+                    result.expected_commit,
+                    result.merged_commit,
+                ):
+                    raise MergeRuntimeError("stored Project merge commit changed")
+                return
+            if (
+                row[0] != "waiting_for_help"
+                or row[1] != state.pr_url
+                or row[2] != result.expected_commit
+                or row[3] is not None
+            ):
+                raise MergeRuntimeError("Project merge reservation changed")
+            updated = connection.execute(
+                """
+                UPDATE task_projects
+                SET state = 'merged', merge_commit = ?, updated_at = ?
+                WHERE request_id = ? AND project_id = ?
+                  AND task_settings_hash = ?
+                  AND state = 'waiting_for_help'
+                  AND pr_url = ? AND head_commit = ? AND merge_commit IS NULL
+                """,
+                (
+                    result.merged_commit,
+                    timestamp,
+                    self.task.request.request_id,
+                    snapshot.project.project_id,
+                    self.task.settings.task_settings_hash,
+                    state.pr_url,
+                    result.expected_commit,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise MergeRuntimeError("Project merge result could not be recorded")
 
 
 def _v2_timestamp(value: datetime) -> str:
@@ -1405,15 +1478,20 @@ def _run_project_task(
         state = snapshot.task_flow_state
         assert state is not None
         write_started = False
+        reservation_created: bool | None = None
         try:
-            # RISK(race): each remote write is enclosed by a fresh exact
-            # settings/revision/Project/head guard. Cross-repository merging
-            # cannot be atomic, so a later failure becomes partially_merged.
+            # RISK(race): the exact settings/Project/PR/head reservation is
+            # committed before GitHub is called. Only its creator may write;
+            # every later worker is readback-only. Cross-repository merging
+            # remains non-atomic, so an exact later failure can be partial.
+            reservation_time = _read_time(clock)
             with merge_store.guard_project(
                 task,
                 snapshot,
                 expected_head_commit=proof.expected_head_commit,
+                occurred_at=reservation_time,
             ) as guard:
+                reservation_created = guard.merge_attempt_created
                 write_time = _read_time(clock)
                 fresh = evidence_reader.get_merge_evidence(
                     state.pr_url,
@@ -1435,6 +1513,41 @@ def _run_project_task(
                     )
                 if fresh_proof.already_merged:
                     result = _observed_project_merge_result(fresh)
+                elif not reservation_created:
+                    merge_store.mark_reconciliation_pending(
+                        task,
+                        snapshot,
+                        occurred_at=write_time,
+                    )
+                    reports.append(
+                        _project_report(
+                            snapshot,
+                            decision=CHECK_ERROR,
+                            action="reconciliation_pending",
+                            reason=(
+                                "another worker already reserved this exact merge; "
+                                "this worker performed readback only"
+                            ),
+                            tested_commit=proof.expected_head_commit,
+                        )
+                    )
+                    remaining = tuple(order[index + 1 :])
+                    reports.extend(
+                        _project_report(
+                            by_project[remaining_id],
+                            decision=WAIT,
+                            action="none",
+                            reason=(
+                                "automatic merge stopped behind an existing "
+                                "Project reservation"
+                            ),
+                            tested_commit=proof_by_project[
+                                remaining_id
+                            ].expected_head_commit,
+                        )
+                        for remaining_id in remaining
+                    )
+                    return tuple(reports)
                 else:
                     write_started = True
                     result = merge_writer.merge_expected_commit(
@@ -1489,7 +1602,7 @@ def _run_project_task(
                 continue
             failure_detail = f"{failure_detail}; remote readback: {recovery.detail}"
             remaining = tuple(order[index + 1 :])
-            if recovery.status == "unknown":
+            if recovery.status == "unknown" or reservation_created is False:
                 merge_store.mark_reconciliation_pending(
                     task,
                     snapshot,
@@ -1670,18 +1783,16 @@ def _resolve_pending_project_task(
     pending = tuple(
         snapshot for snapshot in task.projects if snapshot.merge_attempt_pending
     )
-    unknown = tuple(
+    unresolved = tuple(
         snapshot
         for snapshot in pending
         if snapshot.project.project_id not in observed
-        and not _is_exact_unmerged_project_evidence(
-            snapshot,
-            evidence_by_project.get(snapshot.project.project_id),
-        )
     )
-    if unknown:
-        unknown_ids = {snapshot.project.project_id for snapshot in unknown}
-        for snapshot in unknown:
+    if unresolved:
+        unresolved_ids = {
+            snapshot.project.project_id for snapshot in unresolved
+        }
+        for snapshot in unresolved:
             merge_store.mark_reconciliation_pending(
                 task,
                 snapshot,
@@ -1693,67 +1804,7 @@ def _resolve_pending_project_task(
                 proof=proof_by_project[snapshot.project.project_id],
                 observed=observed.get(snapshot.project.project_id),
                 reconciliation_pending=(
-                    snapshot.project.project_id in unknown_ids
-                ),
-            )
-            for snapshot in task.projects
-        )
-
-    exact_unmerged = tuple(
-        snapshot
-        for snapshot in pending
-        if snapshot.project.project_id not in observed
-    )
-    if exact_unmerged:
-        failed = exact_unmerged[0]
-        failed_id = failed.project.project_id
-        merged_ids = tuple(
-            snapshot.project.project_id
-            for snapshot in task.projects
-            if snapshot.project.project_id in observed
-            or snapshot.project_state == "merged"
-        )
-        remaining_ids = tuple(
-            snapshot.project.project_id
-            for snapshot in task.projects
-            if snapshot.project.project_id not in {*merged_ids, failed_id}
-        )
-        reason = "exact remote readback confirmed the pending Project was not merged"
-        if merged_ids:
-            merge_store.finish_partial(
-                task,
-                merged_project_ids=merged_ids,
-                failed_project_id=failed_id,
-                remaining_project_ids=remaining_ids,
-                reason=reason,
-                occurred_at=_read_time(clock),
-            )
-        else:
-            merge_store.mark_failed(
-                task,
-                failed,
-                reason=reason,
-                occurred_at=_read_time(clock),
-            )
-        return tuple(
-            _project_report(
-                snapshot,
-                decision=(CHECK_ERROR if snapshot == failed else WAIT),
-                action=("error" if snapshot == failed else "none"),
-                reason=(
-                    reason
-                    if snapshot == failed
-                    else "no new merge starts during reconciliation"
-                ),
-                tested_commit=(
-                    None
-                    if snapshot.task_flow_state is None
-                    else snapshot.task_flow_state.current_commit
-                ),
-                merge_commit=(
-                    observed[snapshot.project.project_id].merged_commit
-                    if snapshot.project.project_id in observed
-                    else None
+                    snapshot.project.project_id in unresolved_ids
                 ),
             )
             for snapshot in task.projects
