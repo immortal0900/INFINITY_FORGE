@@ -545,3 +545,19 @@ def test_local_deploy_verifies_complete_runtime_and_smokes_workers() -> None:
         assert contract in deploy
     assert 'REPOSITORY="$(cd "$REPO_DIR" && "$GH_BIN" repo view' in deploy
     assert "repo view --repo" not in deploy
+
+
+def test_every_deploy_layer_applies_and_reads_back_hermes_tool_visibility() -> None:
+    linux = DEPLOY.read_text(encoding="utf-8")
+    windows = WINDOWS_DEPLOY.read_text(encoding="utf-8")
+    coordinator = LOCAL_DEPLOY.read_text(encoding="utf-8")
+
+    for script in (linux, windows, coordinator):
+        assert "forge.ops.hermes_toolsets" in script
+        assert "verify" in script
+        for profile in ("builder", "reviewer", "deep_checker", "fix"):
+            assert profile in script
+    for action in ("backup", "apply", "restore", "verify"):
+        assert f" {action}" in linux
+    for action in ("Backup", "Apply", "Restore", "Verify"):
+        assert f"Toolset{action}" in windows

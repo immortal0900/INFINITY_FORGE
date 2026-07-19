@@ -133,6 +133,14 @@ PLUGIN_BACKUP=""
 PLUGIN_STATE_CHANGED=false
 ENV_BACKUP=""
 ENV_CHANGED=false
+CONFIG_BACKUP=""
+CONFIG_CHANGED=false
+TOOLSET_PROFILE_ARGS=(
+  --worker-home "$HOME/.hermes/profiles/builder"
+  --worker-home "$HOME/.hermes/profiles/reviewer"
+  --worker-home "$HOME/.hermes/profiles/deep_checker"
+  --worker-home "$HOME/.hermes/profiles/fix"
+)
 
 restore_forge_environment() {
   [ "$ENV_CHANGED" = true ] || return 0
@@ -161,6 +169,13 @@ for key, previous in backup.items():
     if get_key(str(env_path), key) != expected:
         raise RuntimeError("Infinity Forge runtime settings rollback failed")
 PY
+}
+
+restore_hermes_toolsets() {
+  [ "$CONFIG_CHANGED" = true ] || return 0
+  [ -n "$CONFIG_BACKUP" ] && [ -d "$CONFIG_BACKUP" ] || return 1
+  PYTHONPATH="$FORGE_RELEASE" "$HERMES_PY" -m forge.ops.hermes_toolsets \
+    restore --backup "$CONFIG_BACKUP"
 }
 
 restore_plugin_state() {
@@ -228,6 +243,11 @@ cleanup_deploy_temporaries() {
       "$TASK_DATA_DIR"/.env-backup.*) rm -f -- "$ENV_BACKUP" ;;
     esac
   fi
+  if [ -n "$CONFIG_BACKUP" ] && [ "$CONFIG_CHANGED" = false ]; then
+    case "$CONFIG_BACKUP" in
+      "$TASK_DATA_DIR"/.config-backup.*) rm -rf -- "$CONFIG_BACKUP" ;;
+    esac
+  fi
 }
 
 restore_runtime_after_error() {
@@ -245,6 +265,11 @@ restore_runtime_after_error() {
       echo "[deploy] WARNING: runtime settings rollback needs manual review: $ENV_BACKUP" >&2
     else
       ENV_CHANGED=false
+    fi
+    if ! restore_hermes_toolsets; then
+      echo "[deploy] WARNING: Hermes tool visibility rollback needs manual review: $CONFIG_BACKUP" >&2
+    else
+      CONFIG_CHANGED=false
     fi
     if ! restore_plugin_state; then
       echo "[deploy] WARNING: plugin rollback needs manual review" >&2
@@ -467,6 +492,13 @@ if any(get_key(str(env_path), key) != value for key, value in expected.items()):
     raise RuntimeError("Infinity Forge runtime settings were not saved")
 PY
 
+# Plugin enable also writes config.yaml. Snapshot the default profile before
+# that first mutation; worker snapshots are appended after missing profiles exist.
+CONFIG_BACKUP="$(mktemp -d "$TASK_DATA_DIR/.config-backup.XXXXXX")"
+chmod 700 "$CONFIG_BACKUP"
+PYTHONPATH="$FORGE_RELEASE" "$HERMES_PY" -m forge.ops.hermes_toolsets \
+  backup --backup "$CONFIG_BACKUP" --main-home "$HOME/.hermes"
+CONFIG_CHANGED=true
 (cd "$HOME" && env -u PYTHONPATH -u PYTHONHOME "$HERMES_PY" -m hermes_cli.main plugins enable infinity-forge --no-allow-tool-override)
 TASK_SETTINGS_DB="$TASK_SETTINGS_DB" PYTHONPATH="$FORGE_RELEASE" "$HERMES_PY" -c \
   "import os; from forge.ops.task_settings import TaskSettingsStore; from forge.ops.task_outbox import TaskOutbox, task_outbox_path; store=TaskSettingsStore(os.environ['TASK_SETTINGS_DB']); TaskOutbox(task_outbox_path(store.database_path))"
@@ -595,6 +627,15 @@ done
 for P in builder reviewer deep_checker fix; do
   mkdir -p "$HOME/.hermes/profiles/$P/skills" "$HOME/.hermes/profiles/$P/home/.config"
 done
+
+# Preserve every worker's post-provisioning baseline, then enforce and read
+# back the one-way visibility boundary through Hermes' config API.
+PYTHONPATH="$FORGE_RELEASE" "$HERMES_PY" -m forge.ops.hermes_toolsets \
+  backup --backup "$CONFIG_BACKUP" "${TOOLSET_PROFILE_ARGS[@]}"
+PYTHONPATH="$FORGE_RELEASE" "$HERMES_PY" -m forge.ops.hermes_toolsets \
+  apply --main-home "$HOME/.hermes" "${TOOLSET_PROFILE_ARGS[@]}"
+PYTHONPATH="$FORGE_RELEASE" "$HERMES_PY" -m forge.ops.hermes_toolsets \
+  verify --main-home "$HOME/.hermes" "${TOOLSET_PROFILE_ARGS[@]}"
 
 echo "[deploy] skills → Hermes profiles..."
 # 공용 스킬: 게이트웨이(기본) + 네 작업 역할
@@ -728,6 +769,12 @@ case "$ENV_BACKUP" in
 esac
 ENV_BACKUP=""
 ENV_CHANGED=false
+CONFIG_CHANGED=false
+case "$CONFIG_BACKUP" in
+  "$TASK_DATA_DIR"/.config-backup.*) rm -rf -- "$CONFIG_BACKUP" ;;
+  *) echo "[deploy] Hermes config backup path is invalid" >&2; exit 1 ;;
+esac
+CONFIG_BACKUP=""
 GATEWAY_WAS_ACTIVE=false
 trap - EXIT
 echo "[deploy] done: $(git rev-parse --short HEAD)"

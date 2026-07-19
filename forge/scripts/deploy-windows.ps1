@@ -567,6 +567,83 @@ function Enable-InfinityForgePlugin {
   }
 }
 
+function Get-InfinityForgeWorkerHomes {
+  param([Parameter(Mandatory = $true)][pscustomobject]$Paths)
+  return @(
+    "builder", "reviewer", "deep_checker", "fix" | ForEach-Object {
+      Join-Path $Paths.ProfilesRoot $_
+    }
+  )
+}
+
+function Invoke-InfinityForgeToolsetCommand {
+  param(
+    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
+    [Parameter(Mandatory = $true)][string]$ReleasePath,
+    [Parameter(Mandatory = $true)][ValidateSet("backup", "apply", "restore", "verify")][string]$Action,
+    [string]$BackupPath
+  )
+  $arguments = @("-m", "forge.ops.hermes_toolsets", $Action)
+  if ($Action -in @("backup", "restore")) {
+    if ([string]::IsNullOrWhiteSpace($BackupPath)) {
+      throw "Hermes toolset $Action requires a backup path."
+    }
+    $arguments += @("--backup", $BackupPath)
+  }
+  if ($Action -ne "restore") {
+    $arguments += @("--main-home", $Paths.HermesHome)
+    foreach ($workerHome in @(Get-InfinityForgeWorkerHomes -Paths $Paths)) {
+      $arguments += @("--worker-home", $workerHome)
+    }
+  }
+  Invoke-WithReleasePythonPath -ReleasePath $ReleasePath -Action {
+    & $Paths.HermesPython @arguments | Out-Host
+    Assert-ExternalCommand "Hermes toolset $Action failed."
+  }
+}
+
+function New-InfinityForgeToolsetBackup {
+  param(
+    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
+    [Parameter(Mandatory = $true)][string]$ReleasePath
+  )
+  New-Item -ItemType Directory -Force -Path $Paths.StateRoot | Out-Null
+  $backup = Join-Path $Paths.StateRoot (
+    ".toolset-backup-$PID-$([guid]::NewGuid().ToString('N'))"
+  )
+  Invoke-InfinityForgeToolsetCommand -Paths $Paths -ReleasePath $ReleasePath `
+    -Action "backup" -BackupPath $backup
+  return $backup
+}
+
+function Invoke-InfinityForgeToolsetApply {
+  param(
+    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
+    [Parameter(Mandatory = $true)][string]$ReleasePath
+  )
+  Invoke-InfinityForgeToolsetCommand -Paths $Paths -ReleasePath $ReleasePath `
+    -Action "apply"
+}
+
+function Invoke-InfinityForgeToolsetVerify {
+  param(
+    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
+    [Parameter(Mandatory = $true)][string]$ReleasePath
+  )
+  Invoke-InfinityForgeToolsetCommand -Paths $Paths -ReleasePath $ReleasePath `
+    -Action "verify"
+}
+
+function Invoke-InfinityForgeToolsetRestore {
+  param(
+    [Parameter(Mandatory = $true)][pscustomobject]$Paths,
+    [Parameter(Mandatory = $true)][string]$ReleasePath,
+    [Parameter(Mandatory = $true)][string]$BackupPath
+  )
+  Invoke-InfinityForgeToolsetCommand -Paths $Paths -ReleasePath $ReleasePath `
+    -Action "restore" -BackupPath $BackupPath
+}
+
 function Test-ForgeWindowsRuntime {
   param(
     [Parameter(Mandatory = $true)][pscustomobject]$Paths,
@@ -655,6 +732,7 @@ for database in databases:
       $Paths.TaskOutboxDB $Paths.KanbanDB
     Assert-ExternalCommand "Windows Infinity Forge runtime verification failed."
   }
+  Invoke-InfinityForgeToolsetVerify -Paths $Paths -ReleasePath $ReleasePath
   $gatewayRunning = Test-HermesGatewayRunning -Paths $Paths
   if ($gatewayRunning -ne $expectedGatewayRunning) {
     throw "Windows Hermes Gateway running state was not preserved."
@@ -678,6 +756,12 @@ function Restore-WindowsDeploymentTransaction {
     if ($Transaction.OldPackageRestored) {
       Invoke-HermesChange -Paths $Paths -ReleasePath $ReleasePath `
         -Action "install" -Package $Transaction.OldPackage
+    }
+    if ($Transaction.ToolsetChanged -and
+        $null -ne $Transaction.ToolsetBackup) {
+      Invoke-InfinityForgeToolsetRestore -Paths $Paths `
+        -ReleasePath $ReleasePath -BackupPath $Transaction.ToolsetBackup
+      $Transaction.ToolsetChanged = $false
     }
     if ($Transaction.PluginInstalled -and
         (Test-Path -LiteralPath $Paths.PluginDir)) {
@@ -724,6 +808,8 @@ function Invoke-ForgeWindowsApply {
     OldPackageRestored = $false
     PluginBackup = $null
     PluginInstalled = $false
+    ToolsetBackup = $null
+    ToolsetChanged = $false
   }
   try {
     if ($gatewayWasRunning) { Stop-HermesGateway -Paths $Paths }
@@ -743,7 +829,11 @@ function Invoke-ForgeWindowsApply {
     Set-InfinityForgeEnvironment -Paths $Paths -ReleasePath $releasePath
     Initialize-InfinityForgeDatabases -Paths $Paths -ReleasePath $releasePath
     Install-InfinityForgeProfilesAndSkills -Paths $Paths -ReleasePath $releasePath
+    $transaction.ToolsetBackup = New-InfinityForgeToolsetBackup `
+      -Paths $Paths -ReleasePath $releasePath
+    $transaction.ToolsetChanged = $true
     Enable-InfinityForgePlugin -Paths $Paths -ReleasePath $releasePath
+    Invoke-InfinityForgeToolsetApply -Paths $Paths -ReleasePath $releasePath
     if ($gatewayWasRunning) { Start-HermesGateway -Paths $Paths }
     Test-ForgeWindowsRuntime -Paths $Paths -ReleasePath $releasePath `
       -PackagePath $package.Path -expectedGatewayRunning $gatewayWasRunning
@@ -753,6 +843,12 @@ function Invoke-ForgeWindowsApply {
       Remove-DeploymentPath -Path $transaction.PluginBackup `
         -ExpectedParent $Paths.PluginRoot -ExpectedPrefix "infinity-forge.backup-"
       $transaction.PluginBackup = $null
+    }
+    if ($null -ne $transaction.ToolsetBackup) {
+      Remove-DeploymentPath -Path $transaction.ToolsetBackup `
+        -ExpectedParent $Paths.StateRoot -ExpectedPrefix ".toolset-backup-"
+      $transaction.ToolsetBackup = $null
+      $transaction.ToolsetChanged = $false
     }
   } catch {
     Restore-WindowsDeploymentTransaction -Paths $Paths `
