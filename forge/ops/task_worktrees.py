@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import subprocess
 from collections.abc import Callable
@@ -13,7 +15,8 @@ from .task_projects import TaskProject, TaskProjectError, normalize_github_remot
 
 
 _PROJECT_ID = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
-_BRANCH = re.compile(r"^forge/task-[0-9a-f]{8}-[0-9a-f]{12}$", re.ASCII)
+_BRANCH = re.compile(r"^forge/task-[0-9a-f]{64}$", re.ASCII)
+_COMMIT = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
 
 
 class TaskWorktreeError(RuntimeError):
@@ -40,7 +43,10 @@ def task_branch_name(request_id: str, project_id: str) -> str:
         raise TaskWorktreeError("request_id must be a canonical UUID")
     if not isinstance(project_id, str) or _PROJECT_ID.fullmatch(project_id) is None:
         raise TaskWorktreeError("project_id must be a lowercase SHA-256")
-    return f"forge/task-{request_id[:8]}-{project_id[:12]}"
+    identity = hashlib.sha256(
+        f"{request_id}\0{project_id}".encode("ascii")
+    ).hexdigest()
+    return f"forge/task-{identity}"
 
 
 class TaskWorktreeManager:
@@ -64,13 +70,25 @@ class TaskWorktreeManager:
         if not isinstance(project, TaskProject):
             raise TypeError("project must be a TaskProject")
         branch = task_branch_name(request_id, project.project_id)
-        name = f"{project.repository.rsplit('/', 1)[1]}-{branch.rsplit('-', 2)[-2]}-{project.project_id[:12]}"
-        return (self._root / name).resolve()
+        identity = branch.removeprefix("forge/task-")
+        destination = self._root / f"task-{identity[:24]}"
+        self._require_path_within_root(destination)
+        return destination
 
-    def prepare(self, request_id: str, project: TaskProject) -> TaskWorktree:
+    def prepare(
+        self,
+        request_id: str,
+        project: TaskProject,
+        *,
+        expected_head_commit: str | None = None,
+    ) -> TaskWorktree:
         """Create or replay one worktree without touching original checkout files."""
 
-        planned = self.inspect(request_id, project)
+        planned = self.inspect(
+            request_id,
+            project,
+            expected_head_commit=expected_head_commit,
+        )
         workspace = Path(project.workspace)
         if planned.worktree_path.is_dir():
             return planned
@@ -97,9 +115,11 @@ class TaskWorktreeManager:
                     planned.branch_name,
                 )
             self._require_exact_worktree(
+                workspace,
                 planned.worktree_path,
                 planned.branch_name,
                 project.base_commit,
+                expected_head_commit or project.base_commit,
             )
         finally:
             after = self._git(
@@ -112,12 +132,25 @@ class TaskWorktreeManager:
                 raise TaskWorktreeError("original checkout state changed")
         return planned
 
-    def inspect(self, request_id: str, project: TaskProject) -> TaskWorktree:
+    def inspect(
+        self,
+        request_id: str,
+        project: TaskProject,
+        *,
+        expected_head_commit: str | None = None,
+    ) -> TaskWorktree:
         """Validate and plan a worktree without creating a branch or directory."""
 
         if not isinstance(project, TaskProject):
             raise TypeError("project must be a TaskProject")
         workspace = Path(project.workspace)
+        if expected_head_commit is not None and (
+            not isinstance(expected_head_commit, str)
+            or _COMMIT.fullmatch(expected_head_commit) is None
+        ):
+            raise TaskWorktreeError(
+                "expected_head_commit must be a lowercase 40-hex commit"
+            )
         branch = task_branch_name(request_id, project.project_id)
         if _BRANCH.fullmatch(branch) is None:
             raise TaskWorktreeError("task branch name is invalid")
@@ -127,16 +160,47 @@ class TaskWorktreeManager:
             self._require_workspace(workspace)
             self._require_remote(project, workspace)
             self._require_confirmed_base(project, workspace)
+            legacy_branch = (
+                f"forge/task-{request_id[:8]}-{project.project_id[:12]}"
+            )
+            legacy_path = self._root / (
+                f"{project.repository.rsplit('/', 1)[1]}-"
+                f"{request_id[:8]}-{project.project_id[:12]}"
+            )
+            if (
+                self._branch_commit(workspace, legacy_branch) is not None
+                or self._registered_branch_path(workspace, legacy_branch) is not None
+                or legacy_path.exists()
+            ):
+                raise TaskWorktreeError("legacy task identity collision")
             existing_branch = self._branch_commit(workspace, branch)
-            if existing_branch is not None and existing_branch != project.base_commit:
-                raise TaskWorktreeError("task branch collision has a different commit")
             registered = self._registered_branch_path(workspace, branch)
             if registered is not None and registered != destination:
                 raise TaskWorktreeError("task branch collision is registered elsewhere")
+            if (
+                existing_branch is not None
+                and existing_branch != project.base_commit
+                and registered is None
+            ):
+                raise TaskWorktreeError("task branch collision has a different commit")
             if registered is None and destination.exists():
                 raise TaskWorktreeError("task worktree path collision")
+            if (
+                registered is None
+                and expected_head_commit is not None
+                and expected_head_commit != project.base_commit
+            ):
+                raise TaskWorktreeError(
+                    "recorded result HEAD has no registered task worktree"
+                )
             if registered is not None:
-                self._require_exact_worktree(destination, branch, project.base_commit)
+                self._require_exact_worktree(
+                    workspace,
+                    destination,
+                    branch,
+                    project.base_commit,
+                    expected_head_commit or project.base_commit,
+                )
         finally:
             after = self._git(
                 workspace,
@@ -202,7 +266,10 @@ class TaskWorktreeManager:
         found: list[Path] = []
         for line in (*output.splitlines(), ""):
             if line.startswith("worktree "):
-                current_path = Path(line.removeprefix("worktree ")).resolve()
+                raw_path = Path(line.removeprefix("worktree "))
+                if not raw_path.is_absolute():
+                    raise TaskWorktreeError("Git worktree metadata path is not absolute")
+                current_path = raw_path.absolute()
             elif line == f"branch refs/heads/{branch}" and current_path is not None:
                 found.append(current_path)
             elif not line:
@@ -213,23 +280,67 @@ class TaskWorktreeManager:
 
     def _require_exact_worktree(
         self,
+        source_workspace: Path,
         destination: Path,
         branch: str,
         base_commit: str,
+        expected_head_commit: str,
     ) -> None:
+        self._require_path_within_root(destination)
         if not destination.is_dir():
             raise TaskWorktreeError("task worktree was not created")
         root = Path(self._git(destination, "rev-parse", "--show-toplevel")).resolve()
         current_branch = self._git(destination, "symbolic-ref", "--short", "HEAD")
         current_commit = self._git(destination, "rev-parse", "HEAD")
         status = self._git(destination, "status", "--porcelain=v1", "--untracked-files=all")
+        ancestry = self._run(
+            destination,
+            "merge-base",
+            "--is-ancestor",
+            base_commit,
+            "HEAD",
+            check=False,
+        )
+        source_common = self._git_path(
+            source_workspace,
+            self._git(source_workspace, "rev-parse", "--git-common-dir"),
+        )
+        destination_common = self._git_path(
+            destination,
+            self._git(destination, "rev-parse", "--git-common-dir"),
+        )
         if (
-            root != destination
+            root != destination.resolve()
             or current_branch != branch
-            or current_commit != base_commit
+            or ancestry.returncode != 0
+            or current_commit != expected_head_commit
             or status
+            or source_common != destination_common
         ):
+            if current_commit != expected_head_commit:
+                raise TaskWorktreeError(
+                    "task worktree does not match recorded result HEAD"
+                )
             raise TaskWorktreeError("task worktree readback does not match Project")
+
+    def _require_path_within_root(self, destination: Path) -> None:
+        absolute = destination.absolute()
+        resolved = destination.resolve(strict=False)
+        if not resolved.is_relative_to(self._root):
+            raise TaskWorktreeError(
+                "task worktree escapes the configured worktree root"
+            )
+        if destination.exists() and resolved != absolute:
+            raise TaskWorktreeError(
+                "task worktree link escapes the configured worktree root"
+            )
+
+    @staticmethod
+    def _git_path(workspace: Path, value: str) -> Path:
+        path = Path(value)
+        if not path.is_absolute():
+            path = workspace / path
+        return path.resolve()
 
     def _read_remote_repository(self, workspace: Path, remote_name: str) -> str:
         return normalize_github_remote(
@@ -256,6 +367,7 @@ class TaskWorktreeManager:
                 check=check,
                 text=True,
                 encoding="utf-8",
+                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
                 timeout=30,
             )
         except (subprocess.SubprocessError, OSError) as error:

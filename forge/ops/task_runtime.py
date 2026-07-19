@@ -76,7 +76,7 @@ from .task_settings_v2 import (
     TaskSettingsV2,
     TaskSettingsV2Error,
 )
-from .task_worktrees import TaskWorktree, TaskWorktreeManager
+from .task_worktrees import TaskWorktree, TaskWorktreeError, TaskWorktreeManager
 
 
 ROOT_CARD_FORMAT = "forge-task-card/v1"
@@ -1222,12 +1222,7 @@ def _project_payload(project: TaskProject) -> dict[str, str]:
 
 
 def _project_json(project: TaskProject) -> str:
-    return json.dumps(
-        _project_payload(project),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return _canonical_json(_project_payload(project))
 
 
 class _ProjectRuntimeRegistry:
@@ -1248,15 +1243,38 @@ class _ProjectRuntimeRegistry:
         }
     )
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
+        self._read_only = read_only
+        self._database: TaskDatabase | None = None
+        if read_only:
+            self._path = _require_existing_file(path, "v2 Task")
+            return
         try:
             self._database = TaskDatabase(path)
         except TaskDatabaseError as error:
             raise GateError("v2 Task database could not be opened") from error
+        self._path = self._database.database_path
+
+    @contextmanager
+    def _read(self) -> Iterator[sqlite3.Connection]:
+        if self._database is not None:
+            with self._database.read() as connection:
+                yield connection
+            return
+        try:
+            connection = sqlite3.connect(
+                f"{self._path.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+        except sqlite3.Error as error:
+            raise GateError("v2 Task database could not be opened read-only") from error
+        with closing(connection):
+            yield connection
 
     def list_active(self) -> tuple[ProjectRuntimeSnapshot, ...]:
         try:
-            with self._database.read() as connection:
+            with self._read() as connection:
                 rows = connection.execute(
                     """
                     SELECT r.request_json, s.settings_json, p.project_id,
@@ -1288,6 +1306,7 @@ class _ProjectRuntimeRegistry:
                 snapshots = tuple(
                     self._snapshot_from_row(connection, row) for row in rows
                 )
+                self._require_complete_project_sets(connection, snapshots)
         except (sqlite3.Error, TaskDatabaseError) as error:
             raise GateError("v2 Project registry scan failed") from error
         return tuple(
@@ -1296,32 +1315,102 @@ class _ProjectRuntimeRegistry:
             if snapshot.project_state in self._RUNNABLE_STATES
         )
 
+    def _require_complete_project_sets(
+        self,
+        connection: sqlite3.Connection,
+        snapshots: tuple[ProjectRuntimeSnapshot, ...],
+    ) -> None:
+        active_rows = connection.execute(
+            """
+            SELECT r.request_json, s.settings_json
+            FROM task_settings_v2 AS s
+            JOIN task_requests AS r ON r.request_id = s.request_id
+            WHERE EXISTS (
+                SELECT 1 FROM task_events AS active_event
+                WHERE active_event.request_id = s.request_id
+                  AND active_event.task_settings_hash = s.task_settings_hash
+                  AND active_event.event_type = 'active'
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM task_events AS barrier_event
+                WHERE barrier_event.request_id = s.request_id
+                  AND barrier_event.event_type IN (
+                      'revision_requested', 'stop_requested', 'changing',
+                      'stopping', 'cancelled', 'expired', 'merged',
+                      'replaced', 'partially_merged'
+                  )
+            )
+            ORDER BY r.request_id
+            """
+        ).fetchall()
+        actual: dict[str, set[str]] = {}
+        for snapshot in snapshots:
+            actual.setdefault(snapshot.request.request_id, set()).add(
+                snapshot.project.project_id
+            )
+        expected_request_ids: set[str] = set()
+        for row in active_rows:
+            try:
+                request = TaskRequestV2.from_json(row[0])
+                settings = TaskSettingsV2.from_json(row[1], request=request)
+            except TaskSettingsV2Error as error:
+                raise GateError("stored v2 Task settings are invalid") from error
+            self._require_exact_record_rows(connection, request, settings)
+            self._require_active_events(connection, request, settings)
+            expected_ids = {project.project_id for project in settings.projects}
+            if actual.get(request.request_id, set()) != expected_ids:
+                raise GateError(
+                    "v2 Task registry does not contain the complete Project set"
+                )
+            expected_request_ids.add(request.request_id)
+        if set(actual) != expected_request_ids:
+            raise GateError("v2 Task registry contains an unexpected Project set")
+
     @contextmanager
     def guard(self, expected: ProjectRuntimeSnapshot) -> Iterator[sqlite3.Connection]:
+        if self._database is None:
+            try:
+                with self._read() as connection:
+                    current = self._guard_snapshot(connection, expected)
+                    if current != expected:
+                        raise GateError(
+                            "v2 Project or settings changed before a safe point"
+                        )
+                    yield connection
+            except sqlite3.Error as error:
+                raise GateError("v2 Project read-only guard failed") from error
+            return
         try:
             with self._database.transaction() as connection:
-                row = connection.execute(
-                    """
-                    SELECT r.request_json, s.settings_json, p.project_id,
-                           p.project_json, p.state, p.branch_name,
-                           p.worktree_path
-                    FROM task_settings_v2 AS s
-                    JOIN task_requests AS r ON r.request_id = s.request_id
-                    JOIN task_projects AS p
-                      ON p.request_id = s.request_id
-                     AND p.task_settings_hash = s.task_settings_hash
-                    WHERE s.request_id = ? AND p.project_id = ?
-                    """,
-                    (expected.request.request_id, expected.project.project_id),
-                ).fetchone()
-                if row is None:
-                    raise GateError("v2 Project disappeared before a safe point")
-                current = self._snapshot_from_row(connection, row)
+                current = self._guard_snapshot(connection, expected)
                 if current != expected:
                     raise GateError("v2 Project or settings changed before a safe point")
                 yield connection
         except TaskDatabaseError as error:
             raise GateError("v2 Project safe-point guard failed") from error
+
+    def _guard_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        expected: ProjectRuntimeSnapshot,
+    ) -> ProjectRuntimeSnapshot:
+        row = connection.execute(
+            """
+            SELECT r.request_json, s.settings_json, p.project_id,
+                   p.project_json, p.state, p.branch_name,
+                   p.worktree_path
+            FROM task_settings_v2 AS s
+            JOIN task_requests AS r ON r.request_id = s.request_id
+            JOIN task_projects AS p
+              ON p.request_id = s.request_id
+             AND p.task_settings_hash = s.task_settings_hash
+            WHERE s.request_id = ? AND p.project_id = ?
+            """,
+            (expected.request.request_id, expected.project.project_id),
+        ).fetchone()
+        if row is None:
+            raise GateError("v2 Project disappeared before a safe point")
+        return self._snapshot_from_row(connection, row)
 
     def record_worktree(
         self,
@@ -1584,6 +1673,7 @@ def _project_step_spec(
 class _ProjectReplay:
     status: str
     next_spec: ProjectTaskCardSpec | None
+    expected_head_commit: str | None
 
 
 def _project_cards(
@@ -1652,7 +1742,11 @@ def _replay_project_flow(
     if not roots:
         if cards:
             raise GateError("Project step card exists without its Build root")
-        return _ProjectReplay("missing", _project_root_spec(snapshot))
+        return _ProjectReplay(
+            "missing",
+            _project_root_spec(snapshot),
+            snapshot.project.base_commit,
+        )
     if len(roots) != 1:
         raise GateError("more than one Project Build root exists")
     root = roots[0]
@@ -1673,7 +1767,7 @@ def _replay_project_flow(
             raise GateError("done Hermes Project card has no completed result")
         if len(cards) != 1:
             raise GateError("Project child exists before its parent completed")
-        return _ProjectReplay("waiting", None)
+        return _ProjectReplay("waiting", None, None)
     if root.status != "done":
         raise GateError("Hermes Project card has a result but is not done")
     try:
@@ -1719,7 +1813,7 @@ def _replay_project_flow(
         if not children:
             if len(visited) != len(cards):
                 raise GateError("Hermes Project flow contains an orphan card")
-            return _ProjectReplay("running", expected_spec)
+            return _ProjectReplay("running", expected_spec, state.current_commit)
         if len(children) != 1:
             raise GateError("Hermes Project card has more than one child")
         child = children[0]
@@ -1742,7 +1836,7 @@ def _replay_project_flow(
                 raise GateError("done Hermes Project card has no completed result")
             if len(visited) != len(cards):
                 raise GateError("Hermes Project flow contains a child after a running card")
-            return _ProjectReplay("waiting", None)
+            return _ProjectReplay("waiting", None, None)
         if child.status != "done":
             raise GateError("Hermes Project card has a result but is not done")
         child_run = child_runs[0]
@@ -1784,7 +1878,7 @@ def _replay_project_flow(
         last_source_hash = child_source_hash
     if len(visited) != len(cards):
         raise GateError("Hermes Project flow has cards after terminal state")
-    return _ProjectReplay(state.status.value, None)
+    return _ProjectReplay(state.status.value, None, state.current_commit)
 
 
 def load_project_runtime_snapshots(
@@ -1793,6 +1887,32 @@ def load_project_runtime_snapshots(
     """Enumerate every active Project from the v2 DB registry."""
 
     return _ProjectRuntimeRegistry(settings_db).list_active()
+
+
+def _read_project_worktree(
+    manager: TaskWorktreeManager,
+    request_id: str,
+    project: TaskProject,
+    *,
+    expected_head_commit: str,
+    dry_run: bool,
+) -> TaskWorktree:
+    """Translate worktree identity failures into the worker gate contract."""
+
+    try:
+        if dry_run:
+            return manager.inspect(
+                request_id,
+                project,
+                expected_head_commit=expected_head_commit,
+            )
+        return manager.prepare(
+            request_id,
+            project,
+            expected_head_commit=expected_head_commit,
+        )
+    except TaskWorktreeError as error:
+        raise GateError(str(error)) from error
 
 
 def run_project_task_flow_worker(
@@ -1808,7 +1928,7 @@ def run_project_task_flow_worker(
 ) -> tuple[ProjectWorkerReport, ...]:
     """Prepare and dispatch every active v2 Project independently."""
 
-    registry = _ProjectRuntimeRegistry(settings_db)
+    registry = _ProjectRuntimeRegistry(settings_db, read_only=dry_run)
     snapshots = registry.list_active()
     store = HermesStore(_require_existing_file(hermes_db, "Hermes"))
     all_cards = store.list_project_runtime_cards()
@@ -1817,39 +1937,43 @@ def run_project_task_flow_worker(
         worktree_root,
         remote_repository=remote_repository,
     )
+    pending: list[
+        tuple[
+            ProjectRuntimeSnapshot,
+            TaskWorktree | None,
+            _ProjectReplay,
+            ProjectTaskCardSpec | None,
+        ]
+    ] = []
     reports: list[ProjectWorkerReport] = []
     for original in snapshots:
         snapshot = original
-        if dry_run:
-            with registry.guard(original):
-                prepared = worktrees.inspect(
-                    snapshot.request.request_id,
-                    snapshot.project,
-                )
-                if snapshot.branch_name is None or snapshot.worktree_path is None:
+        prepared: TaskWorktree | None = None
+        if snapshot.branch_name is None or snapshot.worktree_path is None:
+            if dry_run:
+                with registry.guard(original):
+                    prepared = _read_project_worktree(
+                        worktrees,
+                        snapshot.request.request_id,
+                        snapshot.project,
+                        expected_head_commit=snapshot.project.base_commit,
+                        dry_run=True,
+                    )
                     snapshot = replace(
                         snapshot,
                         branch_name=prepared.branch_name,
                         worktree_path=prepared.worktree_path.as_posix(),
                     )
-                elif (
-                    prepared.branch_name != snapshot.branch_name
-                    or prepared.worktree_path.as_posix() != snapshot.worktree_path
-                ):
-                    raise GateError("Project worktree readback changed")
-        else:
-            with registry.guard(snapshot) as connection:
-                prepared = worktrees.prepare(
-                    snapshot.request.request_id,
-                    snapshot.project,
-                )
-                if snapshot.branch_name is None or snapshot.worktree_path is None:
+            else:
+                with registry.guard(snapshot) as connection:
+                    prepared = _read_project_worktree(
+                        worktrees,
+                        snapshot.request.request_id,
+                        snapshot.project,
+                        expected_head_commit=snapshot.project.base_commit,
+                        dry_run=False,
+                    )
                     snapshot = registry.record_worktree(connection, snapshot, prepared)
-                elif (
-                    prepared.branch_name != snapshot.branch_name
-                    or prepared.worktree_path.as_posix() != snapshot.worktree_path
-                ):
-                    raise GateError("Project worktree readback changed")
         project_cards = _project_cards(all_cards, snapshot)
         with registry.guard(original if dry_run else snapshot):
             replay = _replay_project_flow(
@@ -1859,7 +1983,36 @@ def run_project_task_flow_worker(
                 github=github,
             )
         spec = replay.next_spec
+        if replay.expected_head_commit is not None:
+            if dry_run:
+                with registry.guard(original):
+                    prepared = _read_project_worktree(
+                        worktrees,
+                        snapshot.request.request_id,
+                        snapshot.project,
+                        expected_head_commit=replay.expected_head_commit,
+                        dry_run=True,
+                    )
+            else:
+                with registry.guard(snapshot):
+                    prepared = _read_project_worktree(
+                        worktrees,
+                        snapshot.request.request_id,
+                        snapshot.project,
+                        expected_head_commit=replay.expected_head_commit,
+                        dry_run=False,
+                    )
+            if (
+                prepared.branch_name != snapshot.branch_name
+                or prepared.worktree_path.as_posix() != snapshot.worktree_path
+            ):
+                raise GateError("Project worktree readback changed")
+        pending.append((snapshot, prepared, replay, spec))
+
+    for snapshot, prepared, replay, spec in pending:
         if spec is not None and not dry_run:
+            if prepared is None:
+                raise GateError("Project card cannot start without exact worktree HEAD")
             with registry.guard(snapshot):
                 if not store.has_project_idempotency_key(spec.idempotency_key):
                     create(build_project_create_argv(spec, prepared.worktree_path))

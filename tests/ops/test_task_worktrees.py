@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import os
 from pathlib import Path
 
 import pytest
@@ -163,3 +164,100 @@ def test_inspect_validates_without_creating_branch_or_worktree(tmp_path: Path) -
         check=False,
     )
     assert result.returncode != 0
+
+
+def test_prepare_replays_clean_descendant_commit_in_recorded_worktree(
+    tmp_path: Path,
+) -> None:
+    _remote, _workspace, project = _project_repo(tmp_path)
+    manager = _manager(tmp_path)
+    prepared = manager.prepare(REQUEST_ID, project)
+    _git(prepared.worktree_path, "config", "user.name", "Test User")
+    _git(prepared.worktree_path, "config", "user.email", "test@example.com")
+    (prepared.worktree_path / "result.txt").write_text("built\n", encoding="utf-8")
+    _git(prepared.worktree_path, "add", "result.txt")
+    _git(prepared.worktree_path, "commit", "-m", "build result")
+    advanced = _git(prepared.worktree_path, "rev-parse", "HEAD")
+
+    replayed = manager.prepare(
+        REQUEST_ID,
+        project,
+        expected_head_commit=advanced,
+    )
+
+    assert replayed == prepared
+    assert _git(replayed.worktree_path, "rev-parse", "HEAD") == advanced
+
+
+def test_prepare_rejects_descendant_not_equal_to_recorded_result_head(
+    tmp_path: Path,
+) -> None:
+    _remote, _workspace, project = _project_repo(tmp_path)
+    manager = _manager(tmp_path)
+    prepared = manager.prepare(REQUEST_ID, project)
+    _git(prepared.worktree_path, "config", "user.name", "Test User")
+    _git(prepared.worktree_path, "config", "user.email", "test@example.com")
+    (prepared.worktree_path / "result.txt").write_text("built\n", encoding="utf-8")
+    _git(prepared.worktree_path, "add", "result.txt")
+    _git(prepared.worktree_path, "commit", "-m", "recorded build")
+    recorded_head = _git(prepared.worktree_path, "rev-parse", "HEAD")
+    (prepared.worktree_path / "injected.txt").write_text("foreign\n", encoding="utf-8")
+    _git(prepared.worktree_path, "add", "injected.txt")
+    _git(prepared.worktree_path, "commit", "-m", "unrecorded injection")
+
+    with pytest.raises(TaskWorktreeError, match="recorded result HEAD"):
+        manager.prepare(
+            REQUEST_ID,
+            project,
+            expected_head_commit=recorded_head,
+        )
+
+
+def test_branch_identity_uses_full_request_entropy(tmp_path: Path) -> None:
+    _remote, _workspace, project = _project_repo(tmp_path)
+    same_prefix = "4485be21-ffff-4fff-8fff-ffffffffffff"
+
+    first = task_branch_name(REQUEST_ID, project.project_id)
+    second = task_branch_name(same_prefix, project.project_id)
+
+    assert first != second
+    assert _manager(tmp_path).worktree_path(REQUEST_ID, project) != _manager(
+        tmp_path
+    ).worktree_path(same_prefix, project)
+
+
+def test_prepare_rejects_legacy_short_identity_branch(tmp_path: Path) -> None:
+    _remote, workspace, project = _project_repo(tmp_path)
+    legacy = f"forge/task-{REQUEST_ID[:8]}-{project.project_id[:12]}"
+    _git(workspace, "branch", legacy, project.base_commit)
+
+    with pytest.raises(TaskWorktreeError, match="legacy.*collision"):
+        _manager(tmp_path).prepare(REQUEST_ID, project)
+
+
+def test_registered_worktree_cannot_escape_configured_root_through_link(
+    tmp_path: Path,
+) -> None:
+    _remote, workspace, project = _project_repo(tmp_path)
+    manager = _manager(tmp_path)
+    expected = manager.worktree_path(REQUEST_ID, project)
+    outside = tmp_path / "outside-worktree"
+    branch = task_branch_name(REQUEST_ID, project.project_id)
+    _git(workspace, "worktree", "add", "-b", branch, str(outside), project.base_commit)
+    expected.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(expected), str(outside)],
+            check=True,
+            capture_output=True,
+        )
+    else:
+        os.symlink(outside, expected, target_is_directory=True)
+    try:
+        with pytest.raises(TaskWorktreeError, match="configured worktree root"):
+            manager.prepare(REQUEST_ID, project)
+    finally:
+        if os.name == "nt":
+            os.rmdir(expected)
+        else:
+            expected.unlink()

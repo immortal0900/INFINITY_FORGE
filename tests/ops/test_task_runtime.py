@@ -1222,6 +1222,7 @@ def _activated_v2(
                     "base_commit": project.base_commit,
                     "host_id": project.host_id,
                 },
+                ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -1387,6 +1388,53 @@ def test_v2_worker_dry_run_does_not_create_worktrees_or_update_registry(
     assert rows == [("ready", None, None), ("ready", None, None)]
 
 
+def test_v2_worker_rejects_missing_project_row_before_any_write(
+    tmp_path: Path,
+) -> None:
+    settings_db, hermes_db, request, _settings = _activated_v2(tmp_path)
+    with sqlite3.connect(settings_db) as connection:
+        connection.execute(
+            "DELETE FROM task_projects WHERE project_id = ?",
+            (request.projects[1].project_id,),
+        )
+    calls: list[tuple[str, ...]] = []
+    worktree_root = tmp_path / "worktrees"
+
+    with pytest.raises(GateError, match="complete Project set"):
+        run_project_task_flow_worker(
+            settings_db=settings_db,
+            hermes_db=hermes_db,
+            hermes_path="hermes",
+            github=FakeGitHub(),
+            worktree_root=worktree_root,
+            create_card=lambda argv: calls.append(tuple(argv)),
+            remote_repository=lambda workspace, _remote: f"example/{workspace.name}",
+        )
+
+    assert calls == []
+    assert not worktree_root.exists()
+
+
+def test_v2_dry_run_missing_database_creates_nothing(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-parent" / "task.db"
+    hermes_db = tmp_path / "hermes.db"
+    _create_hermes_db(hermes_db)
+
+    with pytest.raises(GateError, match="does not exist"):
+        run_project_task_flow_worker(
+            settings_db=missing,
+            hermes_db=hermes_db,
+            hermes_path="hermes",
+            github=FakeGitHub(),
+            worktree_root=tmp_path / "worktrees",
+            dry_run=True,
+            create_card=lambda _argv: None,
+        )
+
+    assert not missing.exists()
+    assert not missing.parent.exists()
+
+
 def _insert_v2_root(
     hermes_db: Path,
     call: tuple[str, ...],
@@ -1411,6 +1459,7 @@ def _v2_build_summary(
     project: TaskProject,
     *,
     pr_repository: str | None = None,
+    built_commit: str = "f" * 40,
 ) -> dict[str, object]:
     repository = pr_repository or project.repository
     return {
@@ -1418,12 +1467,28 @@ def _v2_build_summary(
         "task_settings_hash": settings.task_settings_hash,
         "pr_url": f"https://github.com/{repository}/pull/7",
         "built_base_commit": project.base_commit,
-        "built_commit": "f" * 40,
+        "built_commit": built_commit,
         "changed_files": ["src/task.py"],
         "completed_items": ["Each Project gets its own PR."],
         "remaining_items": [],
         "checks_by_item": {"Each Project gets its own PR.": "tests pass"},
     }
+
+
+def _commit_v2_worktree(
+    root_call: tuple[str, ...],
+    *,
+    filename: str,
+) -> str:
+    worktree = Path(
+        root_call[root_call.index("--workspace") + 1].removeprefix("dir:")
+    )
+    _git_v2(worktree, "config", "user.name", "Test User")
+    _git_v2(worktree, "config", "user.email", "test@example.com")
+    (worktree / filename).write_text(f"{filename}\n", encoding="utf-8")
+    _git_v2(worktree, "add", filename)
+    _git_v2(worktree, "commit", "-m", f"add {filename}")
+    return _git_v2(worktree, "rev-parse", "HEAD")
 
 
 def test_v2_worker_rejects_pull_request_for_another_project_repository(
@@ -1482,7 +1547,12 @@ def test_one_v2_project_completion_does_not_complete_parent_task(
     )
     project = request.projects[0]
     call = next(item for item in initial_calls if project.repository in item[2])
-    summary = _v2_build_summary(settings, project)
+    built_commit = _commit_v2_worktree(call, filename="built.txt")
+    summary = _v2_build_summary(
+        settings,
+        project,
+        built_commit=built_commit,
+    )
     _insert_v2_root(hermes_db, call, summary=summary)
     github = FakeGitHub()
     github.prs[summary["pr_url"]] = PullRequestWriteState(
@@ -1491,7 +1561,7 @@ def test_one_v2_project_completion_does_not_complete_parent_task(
         pr_number=7,
         base_commit=project.base_commit,
         base_ref=project.base_branch,
-        head_commit="f" * 40,
+        head_commit=built_commit,
         is_open=True,
         is_merged=False,
         merged_commit=None,
@@ -1541,7 +1611,12 @@ def test_v2_build_completion_creates_review_for_same_project_and_worktree(
     )
     project = request.projects[0]
     root = next(item for item in roots if project.repository in item[2])
-    summary = _v2_build_summary(settings, project)
+    built_commit = _commit_v2_worktree(root, filename="built.txt")
+    summary = _v2_build_summary(
+        settings,
+        project,
+        built_commit=built_commit,
+    )
     _insert_v2_root(hermes_db, root, summary=summary, task_id="project-one-root")
     github = FakeGitHub()
     github.prs[summary["pr_url"]] = PullRequestWriteState(
@@ -1550,7 +1625,7 @@ def test_v2_build_completion_creates_review_for_same_project_and_worktree(
         pr_number=7,
         base_commit=project.base_commit,
         base_ref=project.base_branch,
-        head_commit="f" * 40,
+        head_commit=built_commit,
         is_open=True,
         is_merged=False,
         merged_commit=None,
@@ -1571,3 +1646,65 @@ def test_v2_build_completion_creates_review_for_same_project_and_worktree(
     body = json.loads(review[review.index("--body") + 1])
     assert body["project"] == json.loads(root[root.index("--body") + 1])["project"]
     assert body["step"] == "review"
+
+
+def test_v2_worker_rejects_unrecorded_descendant_before_review_card_write(
+    tmp_path: Path,
+) -> None:
+    settings_db, hermes_db, request, settings = _activated_v2(
+        tmp_path,
+        flow=TaskFlow.BUILD_REVIEW,
+    )
+    kwargs = {
+        "settings_db": settings_db,
+        "hermes_db": hermes_db,
+        "hermes_path": "hermes",
+        "worktree_root": tmp_path / "worktrees",
+        "remote_repository": lambda workspace, _remote: f"example/{workspace.name}",
+    }
+    roots: list[tuple[str, ...]] = []
+    run_project_task_flow_worker(
+        **kwargs,
+        github=FakeGitHub(),
+        create_card=lambda argv: roots.append(tuple(argv)),
+    )
+    project = request.projects[0]
+    root = next(item for item in roots if project.repository in item[2])
+    recorded_head = _commit_v2_worktree(root, filename="recorded.txt")
+    summary = _v2_build_summary(
+        settings,
+        project,
+        built_commit=recorded_head,
+    )
+    _insert_v2_root(
+        hermes_db,
+        root,
+        summary=summary,
+        task_id="project-one-root",
+    )
+    injected_head = _commit_v2_worktree(root, filename="injected.txt")
+    assert injected_head != recorded_head
+    github = FakeGitHub()
+    github.prs[summary["pr_url"]] = PullRequestWriteState(
+        pr_url=summary["pr_url"],
+        repository=project.repository,
+        pr_number=7,
+        base_commit=project.base_commit,
+        base_ref=project.base_branch,
+        head_commit=recorded_head,
+        is_open=True,
+        is_merged=False,
+        merged_commit=None,
+        merged_base_commit=None,
+        merged_head_commit=None,
+    )
+    writes: list[tuple[str, ...]] = []
+
+    with pytest.raises(GateError, match="recorded result HEAD"):
+        run_project_task_flow_worker(
+            **kwargs,
+            github=github,
+            create_card=lambda argv: writes.append(tuple(argv)),
+        )
+
+    assert writes == []
