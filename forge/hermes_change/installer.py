@@ -2581,6 +2581,38 @@ const waitForSourceEventLock = (deadline: number): void => {
   sleepForSourceEventLock()
 }
 
+const readActiveSourceEventLockOwner = (deadline: number): ForgeSourceEventLockOwner | null => {
+  try {
+    return readSourceEventLockOwner(forgeSourceEventLockPath)
+  } catch (error) {
+    const isTurnoverError = (candidate: unknown): boolean => {
+      const code = candidate && typeof candidate === 'object' && 'code' in candidate
+        ? (candidate as { code?: unknown }).code
+        : null
+      const status = candidate && typeof candidate === 'object' && 'status' in candidate
+        ? (candidate as { status?: unknown }).status
+        : null
+      return code === 'ENOENT' || (process.platform === 'win32' && status === 3)
+    }
+    if (!isTurnoverError(error)) throw error
+    if (existsSync(forgeSourceEventLockPath)) {
+      // A new owner may have published between the failed read and this
+      // check. Accept it only after the complete path/ACL/metadata checks.
+      try {
+        return readSourceEventLockOwner(forgeSourceEventLockPath)
+      } catch (replacementError) {
+        if (!isTurnoverError(replacementError) || existsSync(forgeSourceEventLockPath)) {
+          throw replacementError
+        }
+      }
+    }
+    // The incumbent atomically renamed its lock away. The global deadline
+    // bounds this retry; present corrupt metadata or unsafe ACLs stayed fatal.
+    waitForSourceEventLock(deadline)
+    return null
+  }
+}
+
 const clearDeadSourceEventReclaim = (): void => {
   const reclaimOwner = readSourceEventLockOwner(forgeSourceEventReclaimPath)
   const currentIdentity = readProcessStartIdentity(reclaimOwner.pid)
@@ -2601,7 +2633,8 @@ const acquireSourceEventLock = (): ForgeSourceEventLockOwner => {
     const owner = sourceEventLockOwner()
     if (publishSourceEventOwnerDirectory(forgeSourceEventLockPath, owner)) return owner
 
-    const observed = readSourceEventLockOwner(forgeSourceEventLockPath)
+    const observed = readActiveSourceEventLockOwner(deadline)
+    if (!observed) continue
     const currentIdentity = readProcessStartIdentity(observed.pid)
     if (currentIdentity === observed.processStartIdentity) {
       waitForSourceEventLock(deadline)
