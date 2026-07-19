@@ -22,6 +22,7 @@ from forge.ops.process_identity import (
     ProcessIdentity,
     ProcessMemberIdentity,
     ProcessScopeKind,
+    task_cgroup_scope_id,
 )
 
 
@@ -135,7 +136,10 @@ def _identity(binding: ProcessBinding, pid: int) -> ProcessIdentity:
         pid=pid,
         start_identity=member.start_identity,
         scope_kind=ProcessScopeKind.CGROUP,
-        scope_id="/forge/test",
+        scope_id=task_cgroup_scope_id(
+            binding,
+            delegated_parent_scope="/forge-dispatcher.service",
+        ),
         control_group_id=None,
         members=(member,),
     )

@@ -23,8 +23,11 @@ from forge.ops.process_identity import (
     ProcessBinding,
     ProcessIdentity,
     ProcessIdentityError,
+    ProcessIdentityMismatch,
     ProcessMemberIdentity,
     ProcessScopeKind,
+    process_binding_token,
+    task_cgroup_scope_id,
 )
 from forge.ops.surface_events import SurfaceEventStore, TrustedTurnContext
 from forge.ops.task_database import TaskDatabase
@@ -456,6 +459,10 @@ class FakeProcesses:
 
     def stop(self, identity, *, current_host: str):
         self.calls.append(identity.to_json())
+        raise AssertionError("no process identity was expected")
+
+    def validate(self, identity, *, current_host: str):
+        del identity, current_host
         raise AssertionError("no process identity was expected")
 
 
@@ -972,28 +979,44 @@ class ProcessBackend:
     def scope_members(self, identity: ProcessIdentity):
         return self.members
 
+    def supports_graceful(self, identity: ProcessIdentity) -> bool:
+        del identity
+        return True
+
     def signal_scope(self, identity: ProcessIdentity, *, force: bool) -> None:
         self.signals.append(force)
         if force:
             self.members = ()
 
 
+class RejectingDelegatedParentBackend(ProcessBackend):
+    def scope_members(self, identity: ProcessIdentity):
+        del identity
+        raise ProcessIdentityMismatch(
+            "delegated parent does not match the dispatcher cgroup"
+        )
+
+
 def _process_identity() -> ProcessIdentity:
     member = ProcessMemberIdentity(pid=901, start_identity="boot:10")
+    binding = ProcessBinding(
+        request_id=REQUEST_ID,
+        task_settings_hash="b" * 64,
+        project_id="c" * 64,
+        task_id="card-1",
+        run_id="run-1",
+        host_id=OWNER_HOST,
+    )
     return ProcessIdentity(
-        binding=ProcessBinding(
-            request_id=REQUEST_ID,
-            task_settings_hash="b" * 64,
-            project_id="c" * 64,
-            task_id="card-1",
-            run_id="run-1",
-            host_id=OWNER_HOST,
-        ),
+        binding=binding,
         platform="posix",
         pid=901,
         start_identity=member.start_identity,
         scope_kind=ProcessScopeKind.CGROUP,
-        scope_id="/forge/test",
+        scope_id=task_cgroup_scope_id(
+            binding,
+            delegated_parent_scope="/forge-dispatcher.service",
+        ),
         control_group_id=None,
         members=(member,),
     )
@@ -1051,20 +1074,24 @@ def _durable_process_identity(
             ).fetchone()[0]
         )
     member = ProcessMemberIdentity(pid=901, start_identity="boot:10")
+    binding = ProcessBinding(
+        request_id=request.request_id,
+        task_settings_hash=settings_hash,
+        project_id=request.projects[0].project_id,
+        task_id="card-1",
+        run_id="durable-run",
+        host_id=OWNER_HOST,
+    )
     return ProcessIdentity(
-        binding=ProcessBinding(
-            request_id=request.request_id,
-            task_settings_hash=settings_hash,
-            project_id=request.projects[0].project_id,
-            task_id="card-1",
-            run_id="durable-run",
-            host_id=OWNER_HOST,
-        ),
+        binding=binding,
         platform="posix",
         pid=member.pid,
         start_identity=member.start_identity,
         scope_kind=ProcessScopeKind.CGROUP,
-        scope_id="/forge/test",
+        scope_id=task_cgroup_scope_id(
+            binding,
+            delegated_parent_scope="/forge-dispatcher.service",
+        ),
         control_group_id=None,
         members=(member,),
     )
@@ -1126,6 +1153,69 @@ def test_reconcile_rejects_process_group_before_archiving_its_card(
         prs,
         cards,
     ).reconcile(stop_id)
+
+    assert result.state == "cleanup_incomplete"
+    assert cards.calls == []
+
+
+def test_reconcile_rejects_a_shared_cgroup_before_archiving_its_card(
+    tmp_path: Path,
+) -> None:
+    database, request, stop_id = _seed_stop(tmp_path)
+    identity = _durable_process_identity(database, request)
+    raw = json.loads(identity.to_json())
+    raw["scope_id"] = "/shared"
+    _insert_runtime_identity(
+        database,
+        identity,
+        row_run_id=identity.binding.run_id,
+        raw_identity=_canonical(raw),
+    )
+    prs = FakePullRequests()
+    _set_pr(database, request, 0, merged=False, reader=prs)
+    cards = FakeCards()
+
+    result = _reconciler(
+        database,
+        FakeIssues(request),
+        prs,
+        cards,
+    ).reconcile(stop_id)
+
+    assert result.state == "cleanup_incomplete"
+    assert cards.calls == []
+
+
+def test_reconcile_validates_delegated_parent_before_archiving_its_card(
+    tmp_path: Path,
+) -> None:
+    database, request, stop_id = _seed_stop(tmp_path)
+    identity = _durable_process_identity(database, request)
+    raw = json.loads(identity.to_json())
+    raw["scope_id"] = (
+        "/system.slice/other.service/infinity-forge/"
+        f"{process_binding_token(identity.binding)}"
+    )
+    _insert_runtime_identity(
+        database,
+        identity,
+        row_run_id=identity.binding.run_id,
+        raw_identity=_canonical(raw),
+    )
+    prs = FakePullRequests()
+    _set_pr(database, request, 0, merged=False, reader=prs)
+    cards = FakeCards()
+    reconciler = TaskStopReconciler(
+        database,
+        issue_client=FakeIssues(request),
+        pull_request_reader=prs,
+        kanban_stopper=cards,
+        process_stopper=ProcessTreeStopper(RejectingDelegatedParentBackend(())),
+        current_host=OWNER_HOST,
+        clock=lambda: NOW,
+    )
+
+    result = reconciler.reconcile(stop_id)
 
     assert result.state == "cleanup_incomplete"
     assert cards.calls == []

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import json
 import math
 import os
@@ -18,7 +19,9 @@ from uuid import UUID
 
 
 _FORMAT_VERSION = "forge-process-identity/v1"
+_BINDING_TOKEN_FORMAT = "forge-process-binding-token/v1"
 _SHA256_LENGTH = 64
+_TASK_CGROUP_SEGMENT = "infinity-forge"
 
 
 class ProcessIdentityError(RuntimeError):
@@ -55,6 +58,55 @@ class ProcessBinding:
         _bounded_text(self.task_id, "task_id", maximum=512)
         _bounded_text(self.run_id, "run_id", maximum=512)
         _canonical_uuid(self.host_id, "host_id")
+
+
+def process_binding_token(binding: ProcessBinding) -> str:
+    """Return the versioned canonical hash that binds one exact worker run."""
+
+    if not isinstance(binding, ProcessBinding):
+        raise TypeError("binding must be ProcessBinding")
+    canonical = json.dumps(
+        {
+            "format_version": _BINDING_TOKEN_FORMAT,
+            "host_id": binding.host_id,
+            "project_id": binding.project_id,
+            "request_id": binding.request_id,
+            "run_id": binding.run_id,
+            "task_id": binding.task_id,
+            "task_settings_hash": binding.task_settings_hash,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def task_cgroup_scope_id(
+    binding: ProcessBinding,
+    *,
+    delegated_parent_scope: str,
+) -> str:
+    """Build the exact Task child beneath the dispatcher's delegated cgroup."""
+
+    parent = _canonical_cgroup_scope(
+        delegated_parent_scope,
+        "delegated_parent_scope",
+    )
+    scope_id = f"{parent}/{_TASK_CGROUP_SEGMENT}/{process_binding_token(binding)}"
+    return _bounded_text(scope_id, "Task cgroup scope_id", maximum=512)
+
+
+def task_job_name(
+    binding: ProcessBinding,
+    *,
+    namespace: str = "Local",
+) -> str:
+    """Build the exact Windows Job name for one ProcessBinding."""
+
+    if namespace not in {"Local", "Global"}:
+        raise ValueError("Windows Job namespace must be Local or Global")
+    return f"{namespace}\\InfinityForge-{process_binding_token(binding)}"
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -114,6 +166,11 @@ class ProcessIdentity:
             if self.control_group_id != self.pid:
                 raise ValueError("Windows control group must be led by the root PID")
             _validate_job_name(self.scope_id)
+            if self.scope_id not in {
+                task_job_name(self.binding, namespace="Local"),
+                task_job_name(self.binding, namespace="Global"),
+            }:
+                raise ValueError("Windows Job name does not match its ProcessBinding")
         elif self.control_group_id is not None:
             raise ValueError("control_group_id is only valid for Windows Jobs")
         if self.scope_kind in {ProcessScopeKind.PROCESS_GROUP, ProcessScopeKind.CGROUP}:
@@ -124,10 +181,8 @@ class ProcessIdentity:
                 raise ValueError("process-group identity must be a positive integer")
             if int(self.scope_id) != self.pid:
                 raise ValueError("process group must be led by the root PID")
-        if self.scope_kind is ProcessScopeKind.CGROUP and (
-            not self.scope_id.startswith("/") or self.scope_id == "/"
-        ):
-            raise ValueError("cgroup identity must be an absolute non-root path")
+        if self.scope_kind is ProcessScopeKind.CGROUP:
+            _task_cgroup_parent_scope(self.binding, self.scope_id)
 
     def to_json(self) -> str:
         """Serialize the exact durable runtime value."""
@@ -249,6 +304,8 @@ class ProcessStopResult:
 class ProcessScopeBackend(Protocol):
     """Minimal boundary used by exact tree termination."""
 
+    def supports_graceful(self, identity: ProcessIdentity) -> bool: ...
+
     def scope_members(
         self, identity: ProcessIdentity
     ) -> tuple[ProcessMemberIdentity, ...]: ...
@@ -284,16 +341,12 @@ def terminate_exact_process_tree(
     poll_interval_seconds = _finite_positive_number(
         poll_interval_seconds, "poll_interval_seconds"
     )
-    if identity.binding != expected:
-        raise ProcessIdentityMismatch("recorded process belongs to another Task or run")
-    if identity.binding.host_id != current_host:
-        raise ProcessIdentityMismatch("recorded process belongs to another owner host")
-    if identity.scope_kind is ProcessScopeKind.PROCESS_GROUP:
-        raise ProcessIdentityError(
-            "exact worker stop requires a Linux cgroup or Windows Job boundary"
-        )
-
-    current, authorized_members = _initial_scope_members(identity, backend)
+    current, authorized_members = _validate_exact_process_tree(
+        identity,
+        expected=expected,
+        current_host=current_host,
+        backend=backend,
+    )
     if not current:
         return ProcessStopResult(
             identity=identity,
@@ -303,8 +356,33 @@ def terminate_exact_process_tree(
             remaining_members=(),
         )
 
-    # RISK(side-effect): signaling is allowed only after every live PID/start
-    # pair was proven to be a subset of the durable Task-bound scope.
+    graceful = backend.supports_graceful(identity)
+    if not isinstance(graceful, bool):
+        raise ProcessIdentityError("process backend graceful capability is invalid")
+    if not graceful:
+        # RISK(side-effect): Windows and Linux runtimes without pidfd support
+        # use only the exact Job/cgroup kernel handle. No PID-number fallback
+        # is permitted.
+        forced = _signal_or_gone(identity, backend, force=True)
+        remaining = _wait_for_zero(
+            identity,
+            backend,
+            authorized_members=authorized_members,
+            timeout_seconds=force_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            monotonic=monotonic,
+            sleep=sleep,
+        )
+        return ProcessStopResult(
+            identity=identity,
+            term_sent=False,
+            forced=forced,
+            already_stopped=False,
+            remaining_members=remaining,
+        )
+
+    # RISK(side-effect): graceful signaling is allowed only after every live
+    # PID/start pair was proven inside the durable Task cgroup.
     term_sent = _signal_or_gone(identity, backend, force=False)
     remaining = _wait_for_zero(
         identity,
@@ -336,6 +414,47 @@ def terminate_exact_process_tree(
         already_stopped=False,
         remaining_members=remaining,
     )
+
+
+def validate_exact_process_tree(
+    identity: ProcessIdentity,
+    *,
+    expected: ProcessBinding,
+    current_host: str,
+    backend: ProcessScopeBackend,
+) -> tuple[ProcessMemberIdentity, ...]:
+    """Prove exact Task authority and OS boundary without sending a signal."""
+
+    current, _authorized = _validate_exact_process_tree(
+        identity,
+        expected=expected,
+        current_host=current_host,
+        backend=backend,
+    )
+    return current
+
+
+def _validate_exact_process_tree(
+    identity: ProcessIdentity,
+    *,
+    expected: ProcessBinding,
+    current_host: str,
+    backend: ProcessScopeBackend,
+) -> tuple[tuple[ProcessMemberIdentity, ...], dict[int, str]]:
+    if not isinstance(identity, ProcessIdentity):
+        raise TypeError("identity must be ProcessIdentity")
+    if not isinstance(expected, ProcessBinding):
+        raise TypeError("expected must be ProcessBinding")
+    _canonical_uuid(current_host, "current_host")
+    if identity.binding != expected:
+        raise ProcessIdentityMismatch("recorded process belongs to another Task or run")
+    if identity.binding.host_id != current_host:
+        raise ProcessIdentityMismatch("recorded process belongs to another owner host")
+    if identity.scope_kind is ProcessScopeKind.PROCESS_GROUP:
+        raise ProcessIdentityError(
+            "exact worker stop requires a Linux cgroup or Windows Job boundary"
+        )
+    return _initial_scope_members(identity, backend)
 
 
 def _signal_or_gone(
@@ -438,6 +557,7 @@ class PosixProcessBackend:
         proc_root: str | Path = "/proc",
         cgroup_root: str | Path = "/sys/fs/cgroup",
         boot_id: str | None = None,
+        dispatcher_pid: int | None = None,
         kill_group: Callable[[int, int], None] | None = None,
         kill_process: Callable[[int, int], None] | None = None,
     ) -> None:
@@ -455,6 +575,18 @@ class PosixProcessBackend:
         self._pidfd_open = getattr(os, "pidfd_open", None)
         self._pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
         self._close_fd = os.close
+        self._dispatcher_pid = (
+            os.getpid()
+            if dispatcher_pid is None
+            else _positive_int(dispatcher_pid, "dispatcher_pid")
+        )
+
+    def supports_graceful(self, identity: ProcessIdentity) -> bool:
+        if identity.scope_kind is ProcessScopeKind.PROCESS_GROUP:
+            return False
+        if identity.scope_kind is not ProcessScopeKind.CGROUP:
+            raise ProcessIdentityError("POSIX backend received a non-POSIX scope")
+        return self._pidfd_open is not None and self._pidfd_send_signal is not None
 
     def capture_process_group(
         self,
@@ -488,24 +620,43 @@ class PosixProcessBackend:
         binding: ProcessBinding,
         *,
         pid: int,
+        delegated_parent_scope: str,
+        scope_id: str,
+        binding_token: str,
     ) -> ProcessIdentity:
         """Capture the worker's exact Linux cgroup v2 boundary."""
 
         _positive_int(pid, "pid")
+        expected_token = process_binding_token(binding)
+        if _lower_sha256(binding_token, "binding_token") != expected_token:
+            raise ProcessIdentityError("cgroup binding token does not match its Task")
+        try:
+            expected_scope = task_cgroup_scope_id(
+                binding,
+                delegated_parent_scope=delegated_parent_scope,
+            )
+        except (TypeError, ValueError) as error:
+            raise ProcessIdentityError("delegated Task cgroup scope is invalid") from error
+        if scope_id != expected_scope:
+            raise ProcessIdentityError("scope_id is not the exact Task cgroup")
+        self._require_delegated_parent(delegated_parent_scope)
         root = self._snapshot(pid)
         if root is None:
             raise ProcessIdentityError("worker PID is not running")
-        cgroup = self._process_cgroup(pid)
-        if cgroup is None:
+        current_cgroup = self._process_cgroup(pid)
+        if current_cgroup is None:
             raise ProcessIdentityError("worker has no cgroup v2 identity")
-        members = self._cgroup_members(cgroup)
+        if current_cgroup != expected_scope:
+            raise ProcessIdentityMismatch("worker PID is outside the exact Task cgroup")
+        self._require_task_cgroup_kill(expected_scope)
+        members = self._cgroup_members(expected_scope)
         return ProcessIdentity(
             binding=binding,
             platform="posix",
             pid=pid,
             start_identity=root[2],
             scope_kind=ProcessScopeKind.CGROUP,
-            scope_id=cgroup,
+            scope_id=expected_scope,
             control_group_id=None,
             members=members,
         )
@@ -521,6 +672,7 @@ class PosixProcessBackend:
                 raise ProcessIdentityError("invalid process-group identity") from error
             return self._group_members(group_id)
         if identity.scope_kind is ProcessScopeKind.CGROUP:
+            self._require_exact_task_cgroup(identity)
             return self._cgroup_members(identity.scope_id)
         raise ProcessIdentityError("POSIX backend received a non-POSIX scope")
 
@@ -531,6 +683,7 @@ class PosixProcessBackend:
             )
         if identity.scope_kind is not ProcessScopeKind.CGROUP:
             raise ProcessIdentityError("POSIX backend received a non-POSIX scope")
+        self._require_exact_task_cgroup(identity)
         if force:
             control = self._cgroup_control(identity.scope_id, "cgroup.kill")
             # RISK(side-effect): cgroup.kill is used only for the already
@@ -543,6 +696,53 @@ class PosixProcessBackend:
             )
         for member in self.scope_members(identity):
             self._signal_cgroup_member(identity, member)
+
+    def _require_exact_task_cgroup(self, identity: ProcessIdentity) -> None:
+        try:
+            delegated_parent = _task_cgroup_parent_scope(
+                identity.binding,
+                identity.scope_id,
+            )
+        except (TypeError, ValueError) as error:
+            raise ProcessIdentityError("recorded Task cgroup scope is invalid") from error
+        self._require_delegated_parent(delegated_parent)
+        self._require_task_cgroup_kill(identity.scope_id)
+
+    def _require_task_cgroup_kill(self, scope_id: str) -> None:
+        task_directory = self._cgroup_directory(scope_id)
+        kill_control = self._checked_cgroup_file(task_directory, "cgroup.kill")
+        if not os.access(kill_control, os.W_OK):
+            raise ProcessIdentityError("exact Task cgroup.kill is not writable")
+
+    def _require_delegated_parent(self, delegated_parent_scope: str) -> None:
+        try:
+            parent_scope = _canonical_cgroup_scope(
+                delegated_parent_scope,
+                "delegated_parent_scope",
+            )
+        except (TypeError, ValueError) as error:
+            raise ProcessIdentityError("delegated cgroup parent is invalid") from error
+        dispatcher_scope = self._process_cgroup(self._dispatcher_pid)
+        if dispatcher_scope != parent_scope:
+            raise ProcessIdentityMismatch(
+                "delegated parent does not match the dispatcher cgroup"
+            )
+        parent = self._cgroup_directory(parent_scope)
+        if not os.access(parent, os.W_OK | os.X_OK):
+            raise ProcessIdentityError("dispatcher cgroup is not delegated for child control")
+        direct_members = self._read_cgroup_process_ids(parent)
+        if self._dispatcher_pid not in direct_members:
+            raise ProcessIdentityMismatch(
+                "dispatcher PID is not in the delegated parent cgroup"
+            )
+        for filename in ("cgroup.controllers", "cgroup.subtree_control"):
+            control = self._checked_cgroup_file(parent, filename)
+            try:
+                control.read_text(encoding="ascii")
+            except (OSError, UnicodeError) as error:
+                raise ProcessIdentityError(
+                    "dispatcher cgroup delegation controls are unavailable"
+                ) from error
 
     def _signal_cgroup_member(
         self,
@@ -678,27 +878,12 @@ class PosixProcessBackend:
         directories = self._cgroup_descendants(root)
         process_ids: set[int] = set()
         for directory in directories:
-            control = self._checked_cgroup_file(directory, "cgroup.procs")
             try:
-                lines = control.read_text(encoding="ascii").splitlines()
-            except FileNotFoundError:
+                process_ids.update(self._read_cgroup_process_ids(directory))
+            except ProcessLookupError:
                 if directory == root:
-                    raise ProcessLookupError(cgroup) from None
+                    raise
                 continue
-            except (OSError, UnicodeError) as error:
-                raise ProcessIdentityError(
-                    "cannot read exact cgroup membership"
-                ) from error
-            for raw_pid in lines:
-                if (
-                    not raw_pid
-                    or not raw_pid.isascii()
-                    or not raw_pid.isdigit()
-                    or int(raw_pid) <= 0
-                ):
-                    raise ProcessIdentityError("cgroup.procs contains an invalid PID")
-                pid = int(raw_pid)
-                process_ids.add(pid)
 
         members: list[ProcessMemberIdentity] = []
         for pid in sorted(process_ids):
@@ -725,6 +910,26 @@ class PosixProcessBackend:
                 "cgroup populated readback conflicts with descendant membership"
             )
         return tuple(members)
+
+    def _read_cgroup_process_ids(self, directory: Path) -> tuple[int, ...]:
+        control = self._checked_cgroup_file(directory, "cgroup.procs")
+        try:
+            lines = control.read_text(encoding="ascii").splitlines()
+        except FileNotFoundError:
+            raise ProcessLookupError(str(directory)) from None
+        except (OSError, UnicodeError) as error:
+            raise ProcessIdentityError("cannot read exact cgroup membership") from error
+        process_ids: set[int] = set()
+        for raw_pid in lines:
+            if (
+                not raw_pid
+                or not raw_pid.isascii()
+                or not raw_pid.isdigit()
+                or int(raw_pid) <= 0
+            ):
+                raise ProcessIdentityError("cgroup.procs contains an invalid PID")
+            process_ids.add(int(raw_pid))
+        return tuple(sorted(process_ids))
 
     def _cgroup_descendants(self, root: Path) -> tuple[Path, ...]:
         directories: list[Path] = []
@@ -798,11 +1003,24 @@ class PosixProcessBackend:
 
     @staticmethod
     def _checked_cgroup_file(directory: Path, filename: str) -> Path:
-        if filename not in {"cgroup.procs", "cgroup.events", "cgroup.kill"}:
+        if filename not in {
+            "cgroup.controllers",
+            "cgroup.events",
+            "cgroup.kill",
+            "cgroup.procs",
+            "cgroup.subtree_control",
+        }:
             raise ProcessIdentityError("unsupported cgroup control file")
         candidate = directory / filename
         if candidate.is_symlink():
             raise ProcessIdentityError("cgroup control file is a symbolic link")
+        try:
+            if not candidate.is_file():
+                raise ProcessIdentityError(f"{filename} cgroup control is unavailable")
+        except OSError as error:
+            raise ProcessIdentityError(
+                f"cannot inspect {filename} cgroup control"
+            ) from error
         return candidate
 
     def _cgroup_control(self, cgroup: str, filename: str) -> Path:
@@ -816,16 +1034,19 @@ class WindowsJobApi(Protocol):
 
     def job_breakaway_flags(self, job_name: str) -> int: ...
 
-    def send_control_break(self, group_id: int) -> None: ...
-
     def terminate_job(self, job_name: str) -> None: ...
 
 
 class WindowsJobBackend:
-    """Named Windows Job plus CREATE_NEW_PROCESS_GROUP adapter."""
+    """Named Windows Job adapter with force-only exact-handle termination."""
 
     def __init__(self, *, api: WindowsJobApi | None = None) -> None:
         self._api = api if api is not None else _CtypesWindowsJobApi()
+
+    def supports_graceful(self, identity: ProcessIdentity) -> bool:
+        if identity.scope_kind is not ProcessScopeKind.WINDOWS_JOB:
+            raise ProcessIdentityError("Windows backend received a non-Job scope")
+        return False
 
     def capture_job(
         self,
@@ -838,6 +1059,11 @@ class WindowsJobBackend:
         _positive_int(pid, "pid")
         _positive_int(control_group_id, "control_group_id")
         _validate_job_name(job_name)
+        if job_name not in {
+            task_job_name(binding, namespace="Local"),
+            task_job_name(binding, namespace="Global"),
+        }:
+            raise ProcessIdentityError("Windows Job name does not match its Task")
         self._require_contained_job(job_name)
         members = self._job_members(job_name)
         root = next((member for member in members if member.pid == pid), None)
@@ -866,13 +1092,13 @@ class WindowsJobBackend:
         if identity.scope_kind is not ProcessScopeKind.WINDOWS_JOB:
             raise ProcessIdentityError("Windows backend received a non-Job scope")
         self._require_contained_job(identity.scope_id)
-        if force:
-            # RISK(side-effect): TerminateJobObject is restricted to the exact
-            # named Job whose recorded PID/start membership was just checked.
-            self._api.terminate_job(identity.scope_id)
-        else:
-            assert identity.control_group_id is not None
-            self._api.send_control_break(identity.control_group_id)
+        if not force:
+            raise ProcessIdentityError(
+                "Windows Job has no exact graceful signal; force is required"
+            )
+        # RISK(side-effect): TerminateJobObject is restricted to the exact
+        # binding-derived named Job whose membership was just checked.
+        self._api.terminate_job(identity.scope_id)
 
     def _job_members(self, job_name: str) -> tuple[ProcessMemberIdentity, ...]:
         _validate_job_name(job_name)
@@ -910,7 +1136,6 @@ class _CtypesWindowsJobApi:
     _BREAKAWAY_MASK = (
         _JOB_OBJECT_LIMIT_BREAKAWAY_OK | _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
     )
-    _CTRL_BREAK_EVENT = 1
     _MAX_JOB_QUERY_ATTEMPTS = 8
     _MAX_JOB_PROCESS_CAPACITY = 65_536
 
@@ -951,11 +1176,6 @@ class _CtypesWindowsJobApi:
             ctypes.POINTER(wintypes.DWORD),
         ]
         self._kernel32.QueryInformationJobObject.restype = wintypes.BOOL
-        self._kernel32.GenerateConsoleCtrlEvent.argtypes = [
-            wintypes.DWORD,
-            wintypes.DWORD,
-        ]
-        self._kernel32.GenerateConsoleCtrlEvent.restype = wintypes.BOOL
         self._kernel32.TerminateJobObject.argtypes = [
             wintypes.HANDLE,
             wintypes.UINT,
@@ -1109,12 +1329,6 @@ class _CtypesWindowsJobApi:
         finally:
             self._kernel32.CloseHandle(handle)
 
-    def send_control_break(self, group_id: int) -> None:
-        if not self._kernel32.GenerateConsoleCtrlEvent(
-            self._CTRL_BREAK_EVENT, group_id
-        ):
-            raise OSError(ctypes.get_last_error(), "GenerateConsoleCtrlEvent failed")
-
     def terminate_job(self, job_name: str) -> None:
         handle = self._open_job(job_name, self._JOB_OBJECT_TERMINATE)
         try:
@@ -1153,6 +1367,38 @@ def _validate_job_name(value: object) -> str:
     ):
         raise ValueError("job_name must use an InfinityForge Job namespace")
     return job_name
+
+
+def _canonical_cgroup_scope(value: object, label: str) -> str:
+    scope = _bounded_text(value, label, maximum=512)
+    if (
+        not scope.startswith("/")
+        or scope == "/"
+        or scope.endswith("/")
+        or "\x00" in scope
+        or "\\" in scope
+        or any(ord(character) < 32 or ord(character) == 127 for character in scope)
+        or any(part in {"", ".", ".."} for part in scope[1:].split("/"))
+    ):
+        raise ValueError(f"{label} must be a canonical absolute non-root cgroup path")
+    return scope
+
+
+def _task_cgroup_parent_scope(binding: ProcessBinding, scope_id: str) -> str:
+    scope = _canonical_cgroup_scope(scope_id, "scope_id")
+    suffix = f"/{_TASK_CGROUP_SEGMENT}/{process_binding_token(binding)}"
+    if not scope.endswith(suffix):
+        raise ValueError("Task cgroup scope does not match its ProcessBinding")
+    parent = scope[: -len(suffix)]
+    if not parent:
+        raise ValueError("Task cgroup requires a delegated non-root parent")
+    parent = _canonical_cgroup_scope(parent, "delegated parent scope")
+    if task_cgroup_scope_id(
+        binding,
+        delegated_parent_scope=parent,
+    ) != scope:
+        raise ValueError("Task cgroup scope is not canonical")
+    return parent
 
 
 def _is_same_or_descendant_cgroup(candidate: str, root: str) -> bool:
@@ -1255,5 +1501,9 @@ __all__ = [
     "ProcessScopeKind",
     "ProcessStopResult",
     "WindowsJobBackend",
+    "process_binding_token",
+    "task_cgroup_scope_id",
+    "task_job_name",
     "terminate_exact_process_tree",
+    "validate_exact_process_tree",
 ]

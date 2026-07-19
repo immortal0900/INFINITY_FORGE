@@ -26,10 +26,12 @@ from .kanban_stop import (
 )
 from .process_identity import (
     ProcessIdentity,
+    ProcessMemberIdentity,
     ProcessScopeBackend,
     ProcessScopeKind,
     ProcessStopResult,
     terminate_exact_process_tree,
+    validate_exact_process_tree,
 )
 from .surface_events import TrustedTurnContext
 from .task_database import TaskDatabase, TaskDatabaseError
@@ -191,6 +193,10 @@ class StopKanbanController(Protocol):
 
 
 class StopProcessController(Protocol):
+    def validate(
+        self, identity: ProcessIdentity, *, current_host: str
+    ) -> tuple[ProcessMemberIdentity, ...]: ...
+
     def stop(
         self, identity: ProcessIdentity, *, current_host: str
     ) -> ProcessStopResult: ...
@@ -262,6 +268,19 @@ class ProcessTreeStopper:
             term_timeout_seconds=self._term_timeout_seconds,
             force_timeout_seconds=self._force_timeout_seconds,
             poll_interval_seconds=self._poll_interval_seconds,
+        )
+
+    def validate(
+        self,
+        identity: ProcessIdentity,
+        *,
+        current_host: str,
+    ) -> tuple[ProcessMemberIdentity, ...]:
+        return validate_exact_process_tree(
+            identity,
+            expected=identity.binding,
+            current_host=current_host,
+            backend=self._backend,
         )
 
 
@@ -1439,6 +1458,9 @@ class TaskStopReconciler:
         for _attempt in range(3):
             authority = self._service.guard_stop_cleanup(authority.stop_request_id)
             runtime_identities = self._active_runtime_identities(authority, projects)
+            identities = {
+                identity.to_json(): identity for identity in runtime_identities
+            }
             if any(
                 identity.scope_kind is ProcessScopeKind.PROCESS_GROUP
                 for identity in runtime_identities
@@ -1449,24 +1471,9 @@ class TaskStopReconciler:
                 raise TaskStopError(
                     "exact worker Stop requires a Linux cgroup or Windows Job"
                 )
-            cards = self._kanban.archive(authority)
-            if cards.request_id != authority.request_id or not cards.all_cards_terminal:
-                raise TaskStopError("Task Stop cards did not become terminal")
-            archived.update(cards.archived_card_ids)
-            preserved.update(cards.preserved_card_ids)
-            identities = {
-                identity.to_json(): identity for identity in runtime_identities
-            }
-            for captured in cards.captured_runs:
-                if captured.process_identity is not None:
-                    captured_json = captured.process_identity.to_json()
-                    if captured_json not in identities:
-                        raise TaskStopError(
-                            "Kanban worker has no durable Task runtime identity"
-                        )
             if identities and self._processes is None:
                 raise TaskStopError("active Task Stop requires a process controller")
-            for identity_json, identity in sorted(identities.items()):
+            for identity in identities.values():
                 if (
                     identity.binding.request_id != authority.request_id
                     or identity.binding.task_settings_hash
@@ -1476,6 +1483,24 @@ class TaskStopReconciler:
                     not in {project.project_id for project in projects}
                 ):
                     raise TaskStopError("recorded process is outside Stop authority")
+                assert self._processes is not None
+                self._processes.validate(
+                    identity,
+                    current_host=self._current_host,
+                )
+            cards = self._kanban.archive(authority)
+            if cards.request_id != authority.request_id or not cards.all_cards_terminal:
+                raise TaskStopError("Task Stop cards did not become terminal")
+            archived.update(cards.archived_card_ids)
+            preserved.update(cards.preserved_card_ids)
+            for captured in cards.captured_runs:
+                if captured.process_identity is not None:
+                    captured_json = captured.process_identity.to_json()
+                    if captured_json not in identities:
+                        raise TaskStopError(
+                            "Kanban worker has no durable Task runtime identity"
+                        )
+            for identity_json, identity in sorted(identities.items()):
                 assert self._processes is not None
                 result = self._processes.stop(
                     identity,
