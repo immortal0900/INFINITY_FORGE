@@ -1544,6 +1544,22 @@ def change_tui_gateway_source(source: str) -> str:
             "def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any, source_event_id: str | None = None) -> dict:",
             label="TUI busy source event parameter",
         )
+        source = _insert_after_line_in_unique_block(
+            source,
+            block_start="def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any, source_event_id: str | None = None) -> dict:",
+            expected="if agent.steer(text):",
+            addition=(
+                "    # A successful steer becomes the authenticated input for the",
+                "    # next model iteration; never retain the preceding event ID.",
+                "    _forge_steer_context = getattr(agent, \"_infinity_forge_trusted_turn_context\", {})",
+                "    _forge_steer_context = dict(_forge_steer_context) if isinstance(_forge_steer_context, dict) else {}",
+                "    _forge_steer_context[\"source_event_id\"] = source_event_id or \"\"",
+                "    setattr(agent, \"_infinity_forge_trusted_turn_context\", _forge_steer_context)",
+                "    session[\"_infinity_forge_source_event_id\"] = source_event_id or \"\"",
+            ),
+            max_lines=28,
+            label="TUI steered source event binding",
+        )
         source = _replace_unique_line(
             source,
             "_enqueue_prompt(session, text, transport)",
@@ -2246,7 +2262,7 @@ def change_tui_app_overlays_source(source: str) -> str:
 
 _TUI_SOURCE_EVENT_OUTBOX = r'''import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, closeSync, constants, existsSync, fsyncSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeSync } from 'node:fs'
+import { chmodSync, closeSync, constants, existsSync, fsyncSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, parse, resolve, sep } from 'node:path'
 
@@ -2268,7 +2284,16 @@ const forgeSourceEventPath = join(
   'tui-source-events.json',
 )
 const forgeSourceEventLockPath = join(forgeSourceEventHome, '.infinity-forge-source-events.lock')
+const forgeSourceEventReclaimPath = `${forgeSourceEventLockPath}.reclaim`
+const forgeSourceEventLockOwnerName = 'owner.json'
 const forgeSourceEventLockTimeoutMs = 30_000
+
+type ForgeSourceEventLockOwner = {
+  format: 'forge-source-event-lock/v1'
+  nonce: string
+  pid: number
+  processStartIdentity: string
+}
 
 const sleepForSourceEventLock = (): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
@@ -2356,25 +2381,30 @@ const restrictOwnerOnlyWindows = (path: string): void => {
 }
 
 const ensureOwnerOnlyPath = (path: string, mode: number): void => {
-  if (process.platform === 'win32') {
-    let lastError: unknown = null
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      try {
-        verifyOwnerOnlyWindows(path)
-        return
-      } catch (error) {
-        lastError = error
-      }
-      try {
-        restrictOwnerOnlyWindows(path)
-      } catch (error) {
-        lastError = error
-      }
-      sleepForSourceEventLock()
+  let lastError: unknown = null
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      verifyOwnerOnlyPath(path, mode)
+      return
+    } catch (error) {
+      lastError = error
     }
-    throw new Error('Infinity Forge TUI source-event ACL is not owner-only', { cause: lastError })
+    try {
+      if (process.platform === 'win32') restrictOwnerOnlyWindows(path)
+      else chmodSync(path, mode)
+    } catch (error) {
+      lastError = error
+    }
+    sleepForSourceEventLock()
   }
-  chmodSync(path, mode)
+  throw new Error('Infinity Forge TUI source-event ACL is not owner-only', { cause: lastError })
+}
+
+const verifyOwnerOnlyPath = (path: string, mode: number): void => {
+  if (process.platform === 'win32') {
+    verifyOwnerOnlyWindows(path)
+    return
+  }
   const info = statSync(path)
   const expectedUid = typeof process.getuid === 'function' ? process.getuid() : info.uid
   if ((info.mode & 0o777) !== mode || info.uid !== expectedUid) {
@@ -2400,34 +2430,212 @@ const fsyncSourceEventDirectory = (directory = dirname(forgeSourceEventPath)): v
   }
 }
 
+const readProcessStartIdentity = (pid: number): string | null => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new Error('Infinity Forge TUI source-event lock PID is invalid')
+  }
+  if (process.platform === 'win32') {
+    const script = [
+      `$process = Get-Process -Id ${pid} -ErrorAction SilentlyContinue`,
+      "if ($null -eq $process) { Write-Output 'MISSING'; exit 0 }",
+      "try { Write-Output ('win:' + $process.StartTime.ToUniversalTime().Ticks) } catch { exit 4 }",
+    ].join('\n')
+    let output: string
+    try {
+      output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', windowsHide: true }).trim()
+    } catch (error) {
+      throw new Error('Infinity Forge TUI source-event process identity is unavailable', { cause: error })
+    }
+    if (output === 'MISSING') return null
+    if (!/^win:\d+$/.test(output)) throw new Error('Infinity Forge TUI source-event process identity is invalid')
+    return output
+  }
+  if (process.platform === 'linux') {
+    let value: string
+    try {
+      value = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw new Error('Infinity Forge TUI source-event process identity is unavailable', { cause: error })
+    }
+    const closing = value.lastIndexOf(')')
+    const fields = closing >= 0 ? value.slice(closing + 2).trim().split(/\s+/) : []
+    if (!/^\d+$/.test(fields[19] ?? '')) throw new Error('Infinity Forge TUI source-event process identity is invalid')
+    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()
+    if (!/^[0-9a-f-]{36}$/i.test(bootId)) throw new Error('Infinity Forge TUI source-event boot identity is invalid')
+    return `linux:${bootId}:${fields[19]}`
+  }
+  try {
+    const started = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' }).trim()
+    if (!started || started.length > 128 || [...started].some(character => character.charCodeAt(0) < 32)) {
+      throw new Error('invalid process start output')
+    }
+    return `posix:${started}`
+  } catch (error) {
+    try {
+      process.kill(pid, 0)
+    } catch (probeError) {
+      if ((probeError as NodeJS.ErrnoException).code === 'ESRCH') return null
+    }
+    throw new Error('Infinity Forge TUI source-event process identity is unavailable', { cause: error })
+  }
+}
+
+const forgeSourceEventProcessStartIdentity = readProcessStartIdentity(process.pid)
+if (!forgeSourceEventProcessStartIdentity) throw new Error('Infinity Forge TUI source-event process identity is missing')
+
+const sourceEventLockOwner = (): ForgeSourceEventLockOwner => ({
+  format: 'forge-source-event-lock/v1',
+  nonce: randomUUID(),
+  pid: process.pid,
+  processStartIdentity: forgeSourceEventProcessStartIdentity,
+})
+
+const sameSourceEventLockOwner = (left: ForgeSourceEventLockOwner, right: ForgeSourceEventLockOwner): boolean => (
+  left.format === right.format && left.nonce === right.nonce && left.pid === right.pid && left.processStartIdentity === right.processStartIdentity
+)
+
+const readSourceEventLockOwner = (directory: string): ForgeSourceEventLockOwner => {
+  assertSafeSourceEventPath(directory)
+  verifyOwnerOnlyPath(directory, 0o700)
+  const entries = readdirSync(directory)
+  if (entries.length !== 1 || entries[0] !== forgeSourceEventLockOwnerName) {
+    throw new Error('Infinity Forge TUI source-event lock metadata is corrupt')
+  }
+  const ownerPath = join(directory, forgeSourceEventLockOwnerName)
+  assertSafeSourceEventPath(ownerPath)
+  verifyOwnerOnlyPath(ownerPath, 0o600)
+  const descriptor = openSync(ownerPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0))
+  let value: unknown
+  try {
+    const opened = fstatSync(descriptor)
+    const named = lstatSync(ownerPath)
+    if (!opened.isFile() || named.isSymbolicLink() || opened.dev !== named.dev || opened.ino !== named.ino) {
+      throw new Error('Infinity Forge TUI source-event lock metadata path changed')
+    }
+    value = JSON.parse(readFileSync(descriptor, 'utf8'))
+  } finally {
+    closeSync(descriptor)
+  }
+  const fields = value && typeof value === 'object' ? Object.keys(value).sort().join(',') : ''
+  const owner = value as Partial<ForgeSourceEventLockOwner>
+  if (fields !== 'format,nonce,pid,processStartIdentity' || owner.format !== 'forge-source-event-lock/v1' || typeof owner.nonce !== 'string' || !/^[0-9a-f-]{36}$/i.test(owner.nonce) || !Number.isSafeInteger(owner.pid) || (owner.pid ?? 0) <= 0 || typeof owner.processStartIdentity !== 'string' || !owner.processStartIdentity || owner.processStartIdentity.length > 512 || [...owner.processStartIdentity].some(character => character.charCodeAt(0) < 32)) {
+    throw new Error('Infinity Forge TUI source-event lock metadata is corrupt')
+  }
+  return owner as ForgeSourceEventLockOwner
+}
+
+const removeSourceEventOwnerDirectory = (directory: string, owner: ForgeSourceEventLockOwner, label: string): void => {
+  const confirmed = readSourceEventLockOwner(directory)
+  if (!sameSourceEventLockOwner(confirmed, owner)) {
+    throw new Error(`Infinity Forge TUI source-event ${label} owner changed`)
+  }
+  const quarantine = `${directory}.${label}.${randomUUID()}`
+  renameSync(directory, quarantine)
+  const moved = readSourceEventLockOwner(quarantine)
+  if (!sameSourceEventLockOwner(moved, owner)) {
+    if (!existsSync(directory)) renameSync(quarantine, directory)
+    throw new Error(`Infinity Forge TUI source-event ${label} owner changed`)
+  }
+  unlinkSync(join(quarantine, forgeSourceEventLockOwnerName))
+  rmdirSync(quarantine)
+  fsyncSourceEventDirectory(forgeSourceEventHome)
+}
+
+const publishSourceEventOwnerDirectory = (directory: string, owner: ForgeSourceEventLockOwner): boolean => {
+  const candidate = `${directory}.candidate.${owner.nonce}`
+  assertSafeSourceEventPath(candidate)
+  mkdirSync(candidate, { mode: 0o700 })
+  try {
+    ensureOwnerOnlyPath(candidate, 0o700)
+    const ownerPath = join(candidate, forgeSourceEventLockOwnerName)
+    const descriptor = openSync(ownerPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600)
+    try {
+      writeSync(descriptor, JSON.stringify(owner), undefined, 'utf8')
+      fsyncSync(descriptor)
+    } finally {
+      closeSync(descriptor)
+    }
+    ensureOwnerOnlyPath(ownerPath, 0o600)
+    fsyncSourceEventDirectory(candidate)
+    try {
+      renameSync(candidate, directory)
+    } catch (error) {
+      if (!existsSync(directory)) throw error
+      return false
+    }
+    fsyncSourceEventDirectory(forgeSourceEventHome)
+    return true
+  } finally {
+    if (existsSync(candidate)) {
+      const candidateOwner = readSourceEventLockOwner(candidate)
+      if (!sameSourceEventLockOwner(candidateOwner, owner)) throw new Error('Infinity Forge TUI source-event lock candidate changed')
+      unlinkSync(join(candidate, forgeSourceEventLockOwnerName))
+      rmdirSync(candidate)
+    }
+  }
+}
+
+const waitForSourceEventLock = (deadline: number): void => {
+  if (Date.now() >= deadline) throw new Error('Infinity Forge TUI source-event lock timed out')
+  sleepForSourceEventLock()
+}
+
+const clearDeadSourceEventReclaim = (): void => {
+  const reclaimOwner = readSourceEventLockOwner(forgeSourceEventReclaimPath)
+  const currentIdentity = readProcessStartIdentity(reclaimOwner.pid)
+  if (currentIdentity === reclaimOwner.processStartIdentity) return
+  removeSourceEventOwnerDirectory(forgeSourceEventReclaimPath, reclaimOwner, 'dead-reclaim')
+}
+
+const acquireSourceEventLock = (): ForgeSourceEventLockOwner => {
+  const deadline = Date.now() + forgeSourceEventLockTimeoutMs
+  while (true) {
+    assertSafeSourceEventPath(forgeSourceEventLockPath)
+    assertSafeSourceEventPath(forgeSourceEventReclaimPath)
+    if (existsSync(forgeSourceEventReclaimPath)) {
+      clearDeadSourceEventReclaim()
+      if (existsSync(forgeSourceEventReclaimPath)) waitForSourceEventLock(deadline)
+      continue
+    }
+    const owner = sourceEventLockOwner()
+    if (publishSourceEventOwnerDirectory(forgeSourceEventLockPath, owner)) return owner
+
+    const observed = readSourceEventLockOwner(forgeSourceEventLockPath)
+    const currentIdentity = readProcessStartIdentity(observed.pid)
+    if (currentIdentity === observed.processStartIdentity) {
+      waitForSourceEventLock(deadline)
+      continue
+    }
+
+    const reclaimOwner = sourceEventLockOwner()
+    if (!publishSourceEventOwnerDirectory(forgeSourceEventReclaimPath, reclaimOwner)) {
+      waitForSourceEventLock(deadline)
+      continue
+    }
+    try {
+      const confirmed = readSourceEventLockOwner(forgeSourceEventLockPath)
+      const confirmedIdentity = readProcessStartIdentity(confirmed.pid)
+      if (sameSourceEventLockOwner(confirmed, observed) && confirmedIdentity !== confirmed.processStartIdentity) {
+        removeSourceEventOwnerDirectory(forgeSourceEventLockPath, confirmed, 'dead-lock')
+      }
+    } finally {
+      removeSourceEventOwnerDirectory(forgeSourceEventReclaimPath, reclaimOwner, 'reclaim-release')
+    }
+  }
+}
+
 const withSourceEventLock = <T>(action: () => T): T => {
   assertSafeSourceEventPath(forgeSourceEventHome)
   mkdirSync(forgeSourceEventHome, { mode: 0o700, recursive: true })
   assertSafeSourceEventPath(forgeSourceEventHome)
   ensureOwnerOnlyPath(forgeSourceEventHome, 0o700)
-  const deadline = Date.now() + forgeSourceEventLockTimeoutMs
-  let acquired = false
-  while (!acquired) {
-    assertSafeSourceEventPath(forgeSourceEventLockPath)
-    try {
-      mkdirSync(forgeSourceEventLockPath, { mode: 0o700 })
-      ensureOwnerOnlyPath(forgeSourceEventLockPath, 0o700)
-      acquired = true
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      if (Date.now() >= deadline) {
-        throw new Error('Infinity Forge TUI source-event lock timed out')
-      }
-      sleepForSourceEventLock()
-    }
-  }
+  const owner = acquireSourceEventLock()
   try {
     ensureSourceEventDirectory()
     return action()
   } finally {
-    assertSafeSourceEventPath(forgeSourceEventLockPath)
-    rmdirSync(forgeSourceEventLockPath)
-    fsyncSourceEventDirectory(forgeSourceEventHome)
+    removeSourceEventOwnerDirectory(forgeSourceEventLockPath, owner, 'lock-release')
   }
 }
 
@@ -2591,6 +2799,22 @@ _DESKTOP_SOURCE_EVENT_OUTBOX = r'''type ForgeDesktopSourceEvent = {
 }
 
 const forgeDesktopSourceEventKey = 'forge-surface-event/v1'
+const forgeDesktopSourceEventLockName = 'infinity-forge:desktop-source-events:v1'
+
+const withDesktopSourceEventLock = async <T>(action: () => Promise<T> | T): Promise<T> => {
+  const locks = globalThis.navigator?.locks
+  if (!locks || typeof locks.request !== 'function') {
+    throw new Error('Infinity Forge Desktop source-event lock is unavailable')
+  }
+  return locks.request(
+    forgeDesktopSourceEventLockName,
+    { mode: 'exclusive' },
+    async lock => {
+      if (!lock) throw new Error('Infinity Forge Desktop source-event lock was not acquired')
+      return action()
+    },
+  )
+}
 
 const readDesktopSourceEvents = (): ForgeDesktopSourceEvent[] => {
   const raw = globalThis.localStorage.getItem(forgeDesktopSourceEventKey)
@@ -2611,29 +2835,31 @@ const payloadHash = async (payload: string): Promise<string> => {
 
 const prepareSourceEvent = async (sessionId: string, liveSessionId: string, payload: string): Promise<ForgeDesktopSourceEvent> => {
   const hash = await payloadHash(payload)
-  const pending = readDesktopSourceEvents()
-  const prior = [...pending].reverse().find(event => event.sessionId === sessionId && event.payloadHash === hash)
-  if (prior) return prior
-  const event = { id: `desktop:${globalThis.crypto.randomUUID()}`, liveSessionId, payloadHash: hash, sessionId }
-  globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify([...pending, event]))
-  return event
+  return withDesktopSourceEventLock(() => {
+    const pending = readDesktopSourceEvents()
+    const prior = [...pending].reverse().find(event => event.sessionId === sessionId && event.payloadHash === hash)
+    if (prior) return prior
+    const event = { id: `desktop:${globalThis.crypto.randomUUID()}`, liveSessionId, payloadHash: hash, sessionId }
+    globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify([...pending, event]))
+    return event
+  })
 }
 
-const rebindSourceEvent = (sourceEventId: string, liveSessionId: string): void => {
-  const pending = readDesktopSourceEvents()
-  const index = pending.findIndex(event => event.id === sourceEventId)
-  if (index < 0) throw new Error('Infinity Forge Desktop source event is not pending')
-  pending[index] = { ...pending[index]!, liveSessionId }
-  globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify(pending))
-}
+const rebindSourceEvent = async (sourceEventId: string, liveSessionId: string): Promise<void> => withDesktopSourceEventLock(() => {
+    const pending = readDesktopSourceEvents()
+    const index = pending.findIndex(event => event.id === sourceEventId)
+    if (index < 0) throw new Error('Infinity Forge Desktop source event is not pending')
+    pending[index] = { ...pending[index]!, liveSessionId }
+    globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify(pending))
+  })
 
-export const acknowledgeSourceEvent = (sourceEventId: string): void => {
-  const pending = readDesktopSourceEvents()
-  const retained = pending.filter(event => event.id !== sourceEventId)
-  if (retained.length !== pending.length) {
-    globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify(retained))
-  }
-}
+export const acknowledgeSourceEvent = async (sourceEventId: string): Promise<void> => withDesktopSourceEventLock(() => {
+    const pending = readDesktopSourceEvents()
+    const retained = pending.filter(event => event.id !== sourceEventId)
+    if (retained.length !== pending.length) {
+      globalThis.localStorage.setItem(forgeDesktopSourceEventKey, JSON.stringify(retained))
+    }
+  })
 '''
 
 
@@ -2668,7 +2894,7 @@ def change_desktop_submit_source(source: str) -> str:
     source = _insert_after_unique_line(
         source,
         "if (recoveredId) {",
-        ("rebindSourceEvent(sourceEvent.id, recoveredId)",),
+        ("await rebindSourceEvent(sourceEvent.id, recoveredId)",),
         label="Desktop recovered source event binding",
     )
     return source.replace(
@@ -2872,7 +3098,7 @@ def change_desktop_gateway_event_source(source: str) -> str:
         source,
         "completeAssistantMessage(sessionId, finalText)",
         (
-            "if (typeof payload?.source_event_id === 'string') acknowledgeSourceEvent(payload.source_event_id)",
+            "if (typeof payload?.source_event_id === 'string') void acknowledgeSourceEvent(payload.source_event_id).catch(error => console.error('Infinity Forge Desktop source-event acknowledgement failed', error))",
             "",
             "const choiceRequest = choiceRequestFromPayload(payload, sessionId)",
             "if (choiceRequest) setChoiceRequest(choiceRequest)",

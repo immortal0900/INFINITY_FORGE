@@ -1669,6 +1669,213 @@ def test_tui_outbox_serializes_processes_and_preserves_payloads_and_retries(
     assert _verify_owner_only_permissions(outbox_path)
 
 
+def test_tui_outbox_recovers_only_after_the_lock_owner_process_dies(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    module_path = tmp_path / "submissionCore.ts"
+    module_path.write_text(
+        installer.change_tui_submission_source(TUI_SUBMISSION_SOURCE),
+        encoding="utf-8",
+    )
+    hermes_home = tmp_path / "hermes-home"
+    lock_path = hermes_home / ".infinity-forge-source-events.lock"
+    runner_path = tmp_path / "prepare-once.mjs"
+    runner_path.write_text(
+        "\n".join(
+            (
+                f"import {{ prepareSourceEvent }} from {json.dumps(module_path.as_uri())}",
+                "const event = prepareSourceEvent('session-1', process.argv[2])",
+                "process.stdout.write(JSON.stringify(event))",
+            )
+        ),
+        encoding="utf-8",
+    )
+    environment = {**os.environ, "HERMES_HOME": str(hermes_home)}
+    bootstrap = subprocess.run(
+        [node, "--experimental-strip-types", str(runner_path), "bootstrap"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        timeout=30,
+    )
+    assert bootstrap.returncode == 0, bootstrap.stderr
+
+    holder_path = tmp_path / "hold-lock.mjs"
+    holder_path.write_text(
+        "\n".join(
+            (
+                "import { execFileSync } from 'node:child_process'",
+                "import { randomUUID } from 'node:crypto'",
+                "import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'",
+                "const lockPath = process.env.FORGE_TEST_LOCK_PATH",
+                "const restrictWindows = (path, isDirectory) => {",
+                "  if (process.platform !== 'win32') return",
+                "  const script = [",
+                "    '$item = if ($env:FORGE_ACL_DIRECTORY -eq \"1\") { New-Object System.IO.DirectoryInfo($env:FORGE_ACL_PATH) } else { New-Object System.IO.FileInfo($env:FORGE_ACL_PATH) }',",
+                "    '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User',",
+                "    '$acl = $item.GetAccessControl()',",
+                "    '$acl.SetAccessRuleProtection($true, $false)',",
+                "    'foreach ($existing in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRuleAll($existing) }',",
+                "    '$inheritance = if ($env:FORGE_ACL_DIRECTORY -eq \"1\") { [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit } else { [System.Security.AccessControl.InheritanceFlags]::None }',",
+                "    '$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)',",
+                "    '[void]$acl.AddAccessRule($rule)',",
+                "    '$item.SetAccessControl($acl)',",
+                "  ].join('\\n')",
+                "  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { env: { ...process.env, FORGE_ACL_DIRECTORY: isDirectory ? '1' : '0', FORGE_ACL_PATH: path }, windowsHide: true })",
+                "}",
+                "let processStartIdentity",
+                "if (process.platform === 'win32') {",
+                "  const script = `(Get-Process -Id ${process.pid}).StartTime.ToUniversalTime().Ticks`",
+                "  processStartIdentity = `win:${execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', windowsHide: true }).trim()}`",
+                "} else if (process.platform === 'linux') {",
+                "  const stat = (await import('node:fs')).readFileSync(`/proc/${process.pid}/stat`, 'utf8')",
+                "  const bootId = (await import('node:fs')).readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()",
+                "  processStartIdentity = `linux:${bootId}:${stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\\s+/)[19]}`",
+                "} else {",
+                "  processStartIdentity = `posix:${execFileSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf8' }).trim()}`",
+                "}",
+                "mkdirSync(lockPath, { mode: 0o700 })",
+                "chmodSync(lockPath, 0o700)",
+                "restrictWindows(lockPath, true)",
+                "const ownerPath = `${lockPath}/owner.json`",
+                "writeFileSync(ownerPath, JSON.stringify({ format: 'forge-source-event-lock/v1', nonce: randomUUID(), pid: process.pid, processStartIdentity }), { encoding: 'utf8', mode: 0o600 })",
+                "chmodSync(ownerPath, 0o600)",
+                "restrictWindows(ownerPath, false)",
+                "process.stdout.write('ready\\n')",
+                "setInterval(() => {}, 1000)",
+            )
+        ),
+        encoding="utf-8",
+    )
+    owner = subprocess.Popen(
+        [node, str(holder_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**environment, "FORGE_TEST_LOCK_PATH": str(lock_path)},
+    )
+    contender: subprocess.Popen[str] | None = None
+    try:
+        assert owner.stdout is not None
+        assert owner.stdout.readline().strip() == "ready"
+
+        contender = subprocess.Popen(
+            [node, "--experimental-strip-types", str(runner_path), "after-crash"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+        )
+        time.sleep(0.25)
+        assert contender.poll() is None, "a live owner lock was stolen"
+
+        owner.kill()
+        owner.wait(timeout=10)
+        stdout, stderr = contender.communicate(timeout=60)
+        assert contender.returncode == 0, stderr
+        assert json.loads(stdout)["id"].startswith("tui:")
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=10)
+        if contender is not None and contender.poll() is None:
+            contender.kill()
+            contender.wait(timeout=10)
+
+
+def test_desktop_outbox_serializes_renderer_read_modify_write(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    module_path = tmp_path / "submit.ts"
+    module_path.write_text(
+        installer.change_desktop_submit_source(DESKTOP_SUBMIT_SOURCE),
+        encoding="utf-8",
+    )
+    storage_path = tmp_path / "desktop-local-storage.json"
+    worker_path = tmp_path / "desktop-worker.mjs"
+    worker_path.write_text(
+        "\n".join(
+            (
+                "import { parentPort, workerData } from 'node:worker_threads'",
+                "import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'",
+                "const gate = new Int32Array(workerData.gate)",
+                "globalThis.localStorage = {",
+                "  getItem() {",
+                "    const captured = existsSync(workerData.storage) ? readFileSync(workerData.storage, 'utf8') : null",
+                "    const arrivals = Atomics.add(gate, 0, 1) + 1",
+                "    if (arrivals < 2) Atomics.wait(gate, 0, arrivals, 250)",
+                "    else Atomics.notify(gate, 0)",
+                "    return captured",
+                "  },",
+                "  setItem(_key, value) {",
+                "    const temporary = `${workerData.storage}.${workerData.index}.tmp`",
+                "    writeFileSync(temporary, value, 'utf8')",
+                "    renameSync(temporary, workerData.storage)",
+                "  }",
+                "}",
+                "globalThis.withSessionBusyRetry = async action => action()",
+                "globalThis.PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1000",
+                "globalThis.selectedStoredSessionIdRef = { current: null }",
+                f"const {{ submitPrompt }} = await import({json.dumps(module_path.as_uri())})",
+                "const keepAlive = setInterval(() => {}, 1000)",
+                "try {",
+                "  await submitPrompt(async (_method, payload) => { parentPort.postMessage(payload.source_event_id) }, 'live-session', workerData.payload, null)",
+                "} finally {",
+                "  clearInterval(keepAlive)",
+                "}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    runner_path = tmp_path / "desktop-concurrency.mjs"
+    runner_path.write_text(
+        "\n".join(
+            (
+                "import { Worker } from 'node:worker_threads'",
+                "const gate = new SharedArrayBuffer(4)",
+                "const run = (payload, index) => new Promise((resolve, reject) => {",
+                f"  const worker = new Worker(new URL({json.dumps(worker_path.as_uri())}), {{ workerData: {{ gate, index, payload, storage: {json.dumps(str(storage_path))} }} }})",
+                "  let id = ''",
+                "  worker.on('message', value => { id = value })",
+                "  worker.on('error', reject)",
+                "  worker.on('exit', code => code === 0 ? resolve(id) : reject(new Error(`worker exited ${code}`)))",
+                "})",
+                "const ids = await Promise.all([run('first', 1), run('second', 2)])",
+                "process.stdout.write(JSON.stringify(ids))",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [node, "--experimental-strip-types", str(runner_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(set(json.loads(result.stdout))) == 2
+    pending = json.loads(storage_path.read_text(encoding="utf-8"))
+    assert len(pending) == 2
+
+
 def test_clients_reuse_one_persisted_source_event_id_for_transport_retry() -> None:
     changed_tui = installer.change_tui_submission_source(TUI_SUBMISSION_SOURCE)
     changed_desktop = installer.change_desktop_submit_source(DESKTOP_SUBMIT_SOURCE)
@@ -1904,6 +2111,15 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     session["queued_prompt"] = {"text": text, "transport": transport}
 
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
+    mode = _load_busy_input_mode()
+    agent = session.get("agent")
+    if mode == "steer" and agent is not None and hasattr(agent, "steer"):
+        try:
+            if agent.steer(text):
+                session["last_active"] = time.time()
+                return _ok(rid, {"status": "steered"})
+        except Exception:
+            pass
     _enqueue_prompt(session, text, transport)
     return _ok(rid, {"status": "queued"})
 
@@ -1939,12 +2155,65 @@ run_thread = threading.Thread(target=run_after_agent_ready)
 
     changed = installer.change_tui_gateway_source(source)
 
-    assert "source_event_id = None" in changed
-    assert (
-        'session["queued_prompt"] = {"text": text, "transport": transport, '
-        '"source_event_id": source_event_id}'
-    ) in changed
-    assert 'queued.get("source_event_id")' in changed
+    namespace: dict[str, object] = {}
+    exec(changed, namespace)
+    session: dict[str, object] = {}
+    first_transport = object()
+    second_transport = object()
+
+    namespace["_enqueue_prompt"](
+        session,
+        "first",
+        first_transport,
+        "tui:first-event",
+    )
+    assert session["queued_prompt"] == {
+        "text": "first",
+        "transport": first_transport,
+        "source_event_id": "tui:first-event",
+    }
+
+    namespace["_enqueue_prompt"](
+        session,
+        "second",
+        second_transport,
+        "tui:second-event",
+    )
+    assert session["queued_prompt"] == {
+        "text": "first\n\nsecond",
+        "transport": second_transport,
+        "source_event_id": None,
+    }
+
+    class SteeringAgent:
+        def __init__(self) -> None:
+            self._infinity_forge_trusted_turn_context = {
+                "source_event_id": "tui:old-event",
+            }
+
+        @staticmethod
+        def steer(text: str) -> bool:
+            return text == "steer this"
+
+    agent = SteeringAgent()
+    steer_session = {"agent": agent}
+    namespace["_load_busy_input_mode"] = lambda: "steer"
+    namespace["_ok"] = lambda _rid, payload: payload
+
+    result = namespace["_handle_busy_submit"](
+        "request-1",
+        "live-session",
+        steer_session,
+        "steer this",
+        object(),
+        "tui:new-event",
+    )
+
+    assert result == {"status": "steered"}
+    assert agent._infinity_forge_trusted_turn_context["source_event_id"] == (
+        "tui:new-event"
+    )
+    assert steer_session["_infinity_forge_source_event_id"] == "tui:new-event"
 
 
 def test_tool_executor_strips_forged_identity_and_blocks_mutation_without_event(
