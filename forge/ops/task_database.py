@@ -1886,18 +1886,22 @@ def _publish_existing_database_artifact(
     destination: Path,
 ) -> None:
     _assert_safe_file(destination, required=True)
-    _assert_owner_only_sqlite_sidecars(destination)
+    _assert_existing_destination_is_standalone(destination)
     if not _verify_owner_only_permissions(destination):
         raise TaskDatabaseError("Task database backup permissions are unsafe")
-    old_file_hash = _file_sha256(destination)
-    old_content_hash: str | None = None
     target = _connect_database_file(destination, mode="rw")
     prepared_sidecars: tuple[_PreparedSidecar, ...] = ()
+    old_file_hash: str | None = None
+    old_content_hash: str | None = None
     committed = False
     try:
         target.execute("PRAGMA busy_timeout = 0")
         try:
-            _require_standalone_journal(target, "backup destination")
+            journal_mode = target.execute("PRAGMA journal_mode").fetchone()
+            if journal_mode is None or str(journal_mode[0]).casefold() != "delete":
+                raise TaskDatabaseError(
+                    "Task database backup destination must be standalone"
+                )
             target.execute("BEGIN EXCLUSIVE")
             prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
                 target,
@@ -1907,6 +1911,7 @@ def _publish_existing_database_artifact(
             raise TaskDatabaseError(
                 "Task database backup destination requires offline access"
             ) from error
+        old_file_hash = _file_sha256(destination)
         old_content_hash = _validate_exact_database(target)
         _replace_database_content(target, artifact.artifact)
         _validate_existing_backup_candidate(
@@ -1922,7 +1927,7 @@ def _publish_existing_database_artifact(
         finally:
             target.close()
             _remove_empty_precreated_sidecars(prepared_sidecars)
-        if old_content_hash is not None:
+        if old_file_hash is not None and old_content_hash is not None:
             _assert_existing_backup_unchanged(
                 destination,
                 expected_file_hash=old_file_hash,
@@ -1954,6 +1959,21 @@ def _publish_existing_database_artifact(
             )
             committed_error.__cause__ = error
             raise committed_error
+
+
+def _assert_existing_destination_is_standalone(destination: Path) -> None:
+    _assert_no_sqlite_sidecars(destination)
+    try:
+        with destination.open("rb") as stream:
+            header = stream.read(20)
+    except OSError as error:
+        raise TaskDatabaseError(
+            "Task database backup destination header could not be read"
+        ) from error
+    if len(header) < 20 or header[18:20] != b"\x01\x01":
+        raise TaskDatabaseError(
+            "Task database backup destination must be standalone DELETE journal"
+        )
 
 
 def _validate_existing_backup_candidate(

@@ -263,6 +263,16 @@ def _surface_event_ids(database: TaskDatabase) -> list[str]:
         ]
 
 
+def _sqlite_file_bytes(database_path: Path) -> dict[str, bytes]:
+    paths = {
+        "main": database_path,
+        "wal": Path(f"{database_path}-wal"),
+        "shm": Path(f"{database_path}-shm"),
+        "journal": Path(f"{database_path}-journal"),
+    }
+    return {name: path.read_bytes() for name, path in paths.items() if path.exists()}
+
+
 def _subprocess_environment() -> dict[str, str]:
     environment = os.environ.copy()
     repository_root = str(Path(__file__).resolve().parents[2])
@@ -609,18 +619,15 @@ def test_repeated_backup_does_not_replay_existing_destination_wal(
     _save_surface_event(database, "first-source-event")
     destination = database.backup(tmp_path / "backup.db")
     _leave_committed_wal(destination, "stale-destination-event")
+    before = _sqlite_file_bytes(destination)
     _replace_surface_events(database, "second-source-event")
 
-    database.backup(destination)
+    with pytest.raises(TaskDatabaseError, match="standalone"):
+        database.backup(destination)
 
-    assert not Path(f"{destination}-wal").exists()
-    assert not Path(f"{destination}-shm").exists()
-    assert not Path(f"{destination}-journal").exists()
+    assert _sqlite_file_bytes(destination) == before
     destination_database = TaskDatabase(destination)
-    assert _surface_event_ids(destination_database) == ["second-source-event"]
-    with destination_database.read() as connection:
-        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
-        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert _surface_event_ids(destination_database) == ["stale-destination-event"]
 
 
 def test_backup_rejects_foreign_key_invalid_live_database(tmp_path: Path) -> None:
@@ -752,6 +759,88 @@ def test_existing_backup_rolls_back_bytes_when_precommit_sync_fails(
 
     assert destination.read_bytes() == old_bytes
     assert _surface_event_ids(TaskDatabase(destination)) == ["old-backup-event"]
+
+
+def test_existing_wal_backup_is_rejected_without_changing_exact_files(
+    tmp_path: Path,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "old-backup-event")
+    destination = database.backup(tmp_path / "backup.db")
+    _leave_committed_wal(destination, "wal-backup-event")
+    before = _sqlite_file_bytes(destination)
+    assert set(before) == {"main", "wal", "shm"}
+    _replace_surface_events(database, "new-source-event")
+
+    with pytest.raises(TaskDatabaseError, match="standalone"):
+        database.backup(destination)
+
+    assert _sqlite_file_bytes(destination) == before
+    assert _surface_event_ids(TaskDatabase(destination)) == ["wal-backup-event"]
+
+
+def test_existing_backup_rollback_preserves_commit_after_standalone_precheck(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "old-backup-event")
+    destination = database.backup(tmp_path / "backup.db")
+    _replace_surface_events(database, "new-source-event")
+    precheck_finished = threading.Event()
+    allow_backup = threading.Event()
+    real_precheck = task_database_module._assert_existing_destination_is_standalone
+    real_sync = task_database_module._sync_file
+
+    def pause_after_precheck(path: Path) -> None:
+        real_precheck(path)
+        precheck_finished.set()
+        assert allow_backup.wait(timeout=5)
+
+    def fail_destination_sync(path: Path) -> None:
+        if path == destination:
+            raise TaskDatabaseError("forced post-writer sync failure")
+        real_sync(path)
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_assert_existing_destination_is_standalone",
+        pause_after_precheck,
+    )
+    monkeypatch.setattr(task_database_module, "_sync_file", fail_destination_sync)
+
+    def backup_outcome() -> BaseException | None:
+        try:
+            database.backup(destination)
+        except BaseException as error:  # noqa: BLE001 - assert the race outcome.
+            return error
+        return None
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(backup_outcome)
+        assert precheck_finished.wait(timeout=5)
+        try:
+            with sqlite3.connect(destination) as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute("DELETE FROM surface_events")
+                writer.execute(
+                    """
+                    INSERT INTO surface_events (
+                        source_event_id, subject_id, session_id, surface,
+                        payload_hash, state, received_at, retention_until
+                    ) VALUES (
+                        'post-precheck-event', 'user-1', 'session-1', 'cli', ?,
+                        'received', 'now', 'later'
+                    )
+                    """,
+                    ("e" * 64,),
+                )
+        finally:
+            allow_backup.set()
+        backup_error = future.result(timeout=10)
+
+    assert isinstance(backup_error, TaskDatabaseError)
+    assert _surface_event_ids(TaskDatabase(destination)) == ["post-precheck-event"]
 
 
 def test_existing_backup_rolls_back_bytes_when_precommit_acl_check_fails(
