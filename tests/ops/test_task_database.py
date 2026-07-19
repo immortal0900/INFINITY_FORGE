@@ -316,6 +316,11 @@ os._exit(0)
     wal_path = Path(f"{database_path}-wal")
     assert wal_path.is_file()
     assert wal_path.stat().st_size > 32
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{database_path}{suffix}")
+        if sidecar.exists():
+            task_database_module._apply_owner_only_permissions(sidecar)
+            assert task_database_module._verify_owner_only_permissions(sidecar)
 
 
 def _database_with_abrupt_wal(
@@ -501,6 +506,55 @@ def test_database_permissions_are_owner_only(tmp_path: Path) -> None:
         assert stat.S_IMODE(database.database_path.stat().st_mode) == 0o600
 
 
+def test_live_rollback_journal_is_owner_only_before_abrupt_exit(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "task-settings.db"
+    result_path = tmp_path / "journal-acl-result"
+    TaskDatabase(database_path)
+    script = '''
+import os
+import sys
+from pathlib import Path
+
+from forge.ops.task_database import TaskDatabase, _verify_owner_only_permissions
+
+database_path, result_path = map(Path, sys.argv[1:])
+database = TaskDatabase(database_path)
+with database.transaction() as connection:
+    connection.execute(
+        """
+        INSERT INTO surface_events (
+            source_event_id, subject_id, session_id, surface, payload_hash,
+            state, received_at, retention_until
+        ) VALUES (
+            'crash-event', 'user-1', 'session-1', 'cli', ?,
+            'received', 'now', 'later'
+        )
+        """,
+        ("d" * 64,),
+    )
+    journal = Path(f"{database_path}-journal")
+    result_path.write_text(
+        "owner-only" if journal.is_file() and _verify_owner_only_permissions(journal)
+        else "unsafe",
+        encoding="utf-8",
+    )
+    os._exit(0)
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(database_path), str(result_path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env=_subprocess_environment(),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result_path.read_text(encoding="utf-8") == "owner-only"
+
+
 def test_backup_restore_is_checked_and_does_not_replace_live_db_on_failure(
     tmp_path: Path,
 ) -> None:
@@ -592,6 +646,371 @@ def test_backup_rejects_foreign_key_invalid_live_database(tmp_path: Path) -> Non
     assert not destination.exists()
 
 
+def test_backup_fails_fast_with_active_destination_reader(tmp_path: Path) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "new-source-event")
+    destination = database.backup(tmp_path / "backup.db")
+    _replace_surface_events(database, "replacement-source-event")
+    ready_path = tmp_path / "reader-ready"
+    release_path = tmp_path / "reader-release"
+    reader_script = '''
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+database_path, ready_path, release_path = map(Path, sys.argv[1:])
+connection = sqlite3.connect(database_path)
+connection.execute("PRAGMA journal_mode = DELETE")
+connection.execute("BEGIN")
+connection.execute("SELECT COUNT(*) FROM surface_events").fetchone()
+ready_path.write_text("ready", encoding="utf-8")
+deadline = time.monotonic() + 10
+while not release_path.exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("reader release timed out")
+    time.sleep(0.01)
+connection.rollback()
+connection.close()
+'''
+    backup_script = '''
+import sys
+from pathlib import Path
+
+from forge.ops.task_database import TaskDatabase, TaskDatabaseError
+
+source, destination = map(Path, sys.argv[1:])
+try:
+    TaskDatabase(source).backup(destination)
+except TaskDatabaseError as error:
+    if "offline" not in str(error):
+        raise
+else:
+    raise RuntimeError("backup unexpectedly succeeded")
+'''
+    reader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            reader_script,
+            str(destination),
+            str(ready_path),
+            str(release_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_subprocess_environment(),
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready_path.exists() and reader.poll() is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert ready_path.exists()
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                backup_script,
+                str(database.database_path),
+                str(destination),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+            env=_subprocess_environment(),
+        )
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    finally:
+        release_path.touch()
+    stdout, stderr = reader.communicate(timeout=10)
+    assert reader.returncode == 0, f"{stdout}\n{stderr}"
+
+
+def test_existing_backup_rolls_back_bytes_when_precommit_sync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "old-backup-event")
+    destination = database.backup(tmp_path / "backup.db")
+    old_bytes = destination.read_bytes()
+    _replace_surface_events(database, "new-source-event")
+    real_sync = task_database_module._sync_file
+
+    def fail_destination_sync(path: Path) -> None:
+        if path == destination:
+            raise TaskDatabaseError("forced precommit sync failure")
+        real_sync(path)
+
+    monkeypatch.setattr(task_database_module, "_sync_file", fail_destination_sync)
+
+    with pytest.raises(TaskDatabaseError, match="sync failure"):
+        database.backup(destination)
+
+    assert destination.read_bytes() == old_bytes
+    assert _surface_event_ids(TaskDatabase(destination)) == ["old-backup-event"]
+
+
+def test_existing_backup_rolls_back_bytes_when_precommit_acl_check_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "old-backup-event")
+    destination = database.backup(tmp_path / "backup.db")
+    old_bytes = destination.read_bytes()
+    _replace_surface_events(database, "new-source-event")
+    real_verify = task_database_module._verify_owner_only_permissions
+    destination_checks = 0
+
+    def fail_candidate_acl(path: Path) -> bool:
+        nonlocal destination_checks
+        if path == destination:
+            destination_checks += 1
+            if destination_checks == 2:
+                return False
+        return real_verify(path)
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_verify_owner_only_permissions",
+        fail_candidate_acl,
+    )
+
+    with pytest.raises(TaskDatabaseError, match="permissions are unsafe"):
+        database.backup(destination)
+
+    assert destination.read_bytes() == old_bytes
+    assert _surface_event_ids(TaskDatabase(destination)) == ["old-backup-event"]
+
+
+def test_existing_backup_rolls_back_bytes_when_precommit_readback_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "old-backup-event")
+    destination = database.backup(tmp_path / "backup.db")
+    old_bytes = destination.read_bytes()
+    _replace_surface_events(database, "new-source-event")
+    real_validate = task_database_module._validate_exact_database
+    destination_validations = 0
+
+    def fail_candidate_readback(
+        connection: sqlite3.Connection,
+        *,
+        expected_content_hash: str | None = None,
+    ) -> str:
+        nonlocal destination_validations
+        if task_database_module._database_path_for_connection(connection) == destination:
+            destination_validations += 1
+            if destination_validations == 3:
+                raise TaskDatabaseError("forced precommit readback failure")
+        return real_validate(
+            connection,
+            expected_content_hash=expected_content_hash,
+        )
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_validate_exact_database",
+        fail_candidate_readback,
+    )
+
+    with pytest.raises(TaskDatabaseError, match="readback failure"):
+        database.backup(destination)
+
+    assert destination.read_bytes() == old_bytes
+    assert _surface_event_ids(TaskDatabase(destination)) == ["old-backup-event"]
+
+
+def test_new_backup_removes_partial_publication_when_link_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "source-event")
+    destination = tmp_path / "backup.db"
+
+    def fail_after_link(artifact: Path, published_path: Path) -> None:
+        os.link(artifact, published_path)
+        raise TaskDatabaseError("forced link finalization failure")
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_link_new_backup_artifact",
+        fail_after_link,
+    )
+
+    with pytest.raises(TaskDatabaseError, match="link finalization failure"):
+        database.backup(destination)
+
+    assert not destination.exists()
+    assert not Path(f"{destination}-journal").exists()
+    assert not Path(f"{destination}-wal").exists()
+    assert not Path(f"{destination}-shm").exists()
+
+
+def test_backup_reports_committed_cleanup_failure_with_retained_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "source-event")
+    destination = tmp_path / "backup.db"
+    retained: list[object] = []
+    real_remove = task_database_module._remove_database_artifact
+
+    def fail_cleanup(artifact: object) -> None:
+        retained.append(artifact)
+        raise TaskDatabaseError("forced backup cleanup failure")
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_remove_database_artifact",
+        fail_cleanup,
+    )
+
+    with pytest.raises(task_database_module.TaskDatabaseCommittedError) as captured:
+        database.backup(destination)
+
+    error = captured.value
+    assert error.committed is True
+    assert error.operation == "backup"
+    assert error.retained_artifact.is_file()
+    assert _surface_event_ids(TaskDatabase(destination)) == ["source-event"]
+    assert retained
+    real_remove(retained[0])
+
+
+def test_backup_restore_preserves_self_reference_and_sequence_high_water(
+    tmp_path: Path,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    base_request = "base-request"
+    replacement_request = "replacement-request"
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO task_requests (
+                request_id, format_version, request_json, request_hash,
+                management_repository, task_owner_host, confirmed_by,
+                confirmed_at, replaces_request_id
+            ) VALUES (?, 'forge-task-request/v2', '{}', ?, 'owner/management',
+                      'worker-1', 'user-1', 'now', NULL)
+            """,
+            (base_request, "1" * 64),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_requests (
+                request_id, format_version, request_json, request_hash,
+                management_repository, task_owner_host, confirmed_by,
+                confirmed_at, replaces_request_id
+            ) VALUES (?, 'forge-task-request/v2', '{}', ?, 'owner/management',
+                      'worker-1', 'user-1', 'later', ?)
+            """,
+            (replacement_request, "2" * 64, base_request),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events (
+                request_id, event_type, event_key, event_json, occurred_at
+            ) VALUES (?, 'request_prepared', 'prepared', '{}', 'later')
+            """,
+            (replacement_request,),
+        )
+        connection.execute(
+            "UPDATE sqlite_sequence SET seq = 1000 WHERE name = 'task_events'"
+        )
+    backup_path = database.backup(tmp_path / "backup.db")
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE task_requests SET request_json = '{\"changed\":true}'"
+        )
+
+    database.restore(backup_path)
+
+    with database.read() as connection:
+        chain = connection.execute(
+            """
+            SELECT request_id, replaces_request_id
+            FROM task_requests
+            ORDER BY replaces_request_id IS NOT NULL
+            """
+        ).fetchall()
+        sequence = connection.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'task_events'"
+        ).fetchone()
+        event_max = connection.execute("SELECT MAX(event_id) FROM task_events").fetchone()
+    assert [tuple(row) for row in chain] == [
+        (base_request, None),
+        (replacement_request, base_request),
+    ]
+    assert sequence is not None and sequence[0] == 1000
+    assert event_max is not None and sequence[0] > event_max[0]
+
+
+def test_backup_rejects_unexpected_sqlite_sequence_entry(tmp_path: Path) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('future_table', 999)"
+        )
+
+    with pytest.raises(TaskDatabaseError, match="unexpected sequence"):
+        database.backup(tmp_path / "backup.db")
+
+
+def test_backup_and_restore_sync_parent_directory_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    _save_surface_event(database, "archived-event")
+    synced: list[Path] = []
+    real_sync_directory = task_database_module._sync_directory
+
+    def record_directory_sync(directory: Path) -> None:
+        synced.append(directory)
+        real_sync_directory(directory)
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_sync_directory",
+        record_directory_sync,
+    )
+
+    backup_path = database.backup(tmp_path / "backup.db")
+    _replace_surface_events(database, "live-event")
+    database.restore(backup_path)
+
+    assert synced.count(tmp_path) >= 2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory descriptors are POSIX-only")
+def test_sync_directory_fsyncs_a_directory_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    synced_modes: list[int] = []
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        synced_modes.append(os.fstat(descriptor).st_mode)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(task_database_module.os, "fsync", record_fsync)
+
+    task_database_module._sync_directory(tmp_path)
+
+    assert len(synced_modes) == 1
+    assert stat.S_ISDIR(synced_modes[0])
+
+
 def _database_with_different_live_and_backup(
     tmp_path: Path,
 ) -> tuple[TaskDatabase, Path]:
@@ -610,6 +1029,31 @@ def test_restore_accepts_a_valid_abrupt_exit_wal_database(tmp_path: Path) -> Non
     assert _surface_event_ids(database) == ["archived-event"]
     assert not Path(f"{database.database_path}-wal").exists()
     assert not Path(f"{database.database_path}-shm").exists()
+
+
+def test_restore_rejects_unsafe_backup_sidecar_before_reading_live_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+    _leave_committed_wal(backup_path, "wal-backup-event")
+    real_verify = task_database_module._verify_owner_only_permissions
+
+    def reject_backup_sidecar(path: Path) -> bool:
+        if path in {Path(f"{backup_path}-wal"), Path(f"{backup_path}-shm")}:
+            return False
+        return real_verify(path)
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_verify_owner_only_permissions",
+        reject_backup_sidecar,
+    )
+
+    with pytest.raises(TaskDatabaseError, match="sidecar permissions"):
+        database.restore(backup_path)
+
+    assert _surface_event_ids(database) == ["live-event"]
 
 
 def test_restore_rolls_back_abrupt_exit_wal_data_after_publish_failure(
@@ -720,6 +1164,36 @@ def test_restore_rolls_back_live_database_when_candidate_quick_check_fails(
     assert database.verify_owner_only_permissions()
 
 
+def test_restore_reports_committed_cleanup_failure_with_retained_preimage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+    retained: list[object] = []
+    real_remove = task_database_module._remove_database_artifact
+
+    def fail_cleanup(artifact: object) -> None:
+        retained.append(artifact)
+        raise TaskDatabaseError("forced restore cleanup failure")
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_remove_database_artifact",
+        fail_cleanup,
+    )
+
+    with pytest.raises(task_database_module.TaskDatabaseCommittedError) as captured:
+        database.restore(backup_path)
+
+    error = captured.value
+    assert error.committed is True
+    assert error.operation == "restore"
+    assert error.retained_artifact.is_file()
+    assert _surface_event_ids(database) == ["archived-event"]
+    assert retained
+    real_remove(retained[0])
+
+
 def test_restore_rejects_a_concurrent_write_before_publish(tmp_path: Path) -> None:
     database, backup_path = _database_with_different_live_and_backup(tmp_path)
     writer_started = threading.Event()
@@ -754,40 +1228,44 @@ def test_restore_rejects_an_unmanaged_active_writer(tmp_path: Path) -> None:
     assert _surface_event_ids(database) == ["live-event"]
 
 
-def test_restore_rejects_unmanaged_writer_that_begins_after_preimage_before_publish(
+def test_restore_fails_bounded_with_active_delete_journal_reader(
+    tmp_path: Path,
+) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+
+    with sqlite3.connect(database.database_path) as reader:
+        assert reader.execute("PRAGMA journal_mode = DELETE").fetchone()[0] == "delete"
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM surface_events").fetchone()
+        started = time.monotonic()
+        with pytest.raises(TaskDatabaseError, match="offline"):
+            database.restore(backup_path)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 10
+    assert _surface_event_ids(database) == ["live-event"]
+
+
+def test_restore_gates_unmanaged_writer_before_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database, backup_path = _database_with_different_live_and_backup(tmp_path)
-    preimage_ready = threading.Event()
-    allow_restore = threading.Event()
+    staging_ready = threading.Event()
+    allow_staging = threading.Event()
+    writer_attempted = threading.Event()
     writer_finished = threading.Event()
-    original_capture = task_database_module._capture_restore_preimage
-    original_remove_sidecars = task_database_module._remove_sqlite_sidecars
+    original_validate = task_database_module._validate_supported_schema
 
-    def pause_after_preimage(
-        source: sqlite3.Connection,
-        database_path: Path,
-    ) -> object:
-        preimage = original_capture(source, database_path)
-        preimage_ready.set()
-        assert allow_restore.wait(timeout=5)
-        return preimage
-
-    def wait_for_writer_before_file_publish(path: Path) -> None:
-        if path == database.database_path:
-            assert writer_finished.wait(timeout=5)
-        original_remove_sidecars(path)
+    def pause_during_staging(connection: sqlite3.Connection) -> None:
+        staging_ready.set()
+        assert allow_staging.wait(timeout=5)
+        original_validate(connection)
 
     monkeypatch.setattr(
         task_database_module,
-        "_capture_restore_preimage",
-        pause_after_preimage,
-    )
-    monkeypatch.setattr(
-        task_database_module,
-        "_remove_sqlite_sidecars",
-        wait_for_writer_before_file_publish,
+        "_validate_supported_schema",
+        pause_during_staging,
     )
 
     def restore_outcome() -> BaseException | None:
@@ -797,35 +1275,40 @@ def test_restore_rejects_unmanaged_writer_that_begins_after_preimage_before_publ
             return error
         return None
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        restore_future = pool.submit(restore_outcome)
-        assert preimage_ready.wait(timeout=5)
-        allow_restore.set()
-        try:
-            with sqlite3.connect(database.database_path, timeout=5) as writer:
-                writer.execute("BEGIN IMMEDIATE")
-                writer.execute("DELETE FROM surface_events")
-                writer.execute(
-                    """
-                    INSERT INTO surface_events (
-                        source_event_id,
-                        subject_id,
-                        session_id,
-                        surface,
-                        payload_hash,
-                        state,
-                        received_at,
-                        retention_until
-                    ) VALUES (
-                        'concurrent-event', 'user-1', 'session-1', 'cli', ?,
-                        'received', 'now', 'later'
-                    )
-                    """,
-                    ("c" * 64,),
+    def unmanaged_write() -> None:
+        writer_attempted.set()
+        with sqlite3.connect(database.database_path, timeout=5) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("DELETE FROM surface_events")
+            writer.execute(
+                """
+                INSERT INTO surface_events (
+                    source_event_id,
+                    subject_id,
+                    session_id,
+                    surface,
+                    payload_hash,
+                    state,
+                    received_at,
+                    retention_until
+                ) VALUES (
+                    'concurrent-event', 'user-1', 'session-1', 'cli', ?,
+                    'received', 'now', 'later'
                 )
-        finally:
-            writer_finished.set()
+                """,
+                ("c" * 64,),
+            )
+        writer_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        restore_future = pool.submit(restore_outcome)
+        assert staging_ready.wait(timeout=5)
+        writer_future = pool.submit(unmanaged_write)
+        assert writer_attempted.wait(timeout=5)
+        writer_finished.wait(timeout=0.25)
+        allow_staging.set()
         restore_error = restore_future.result(timeout=10)
+        writer_future.result(timeout=10)
 
     assert restore_error is None
     assert _surface_event_ids(database) == ["concurrent-event"]

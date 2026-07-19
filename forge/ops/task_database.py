@@ -471,10 +471,31 @@ _EXPECTED_SCHEMA = {**_V1_EXPECTED_SCHEMA, **_V2_EXPECTED_SCHEMA}
 TASK_DATABASE_TABLES = frozenset(
     name for (object_type, name) in _EXPECTED_SCHEMA if object_type == "table"
 )
+_AUTOINCREMENT_TABLES = frozenset({"task_events", "task_settings_events"})
 
 
 class TaskDatabaseError(RuntimeError):
     """Raised when the shared Task database cannot be trusted."""
+
+
+class TaskDatabaseCommittedError(TaskDatabaseError):
+    """Report a successful commit whose retained artifact needs manual cleanup."""
+
+    committed = True
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        retained_artifact: Path,
+        detail: str,
+    ) -> None:
+        self.operation = operation
+        self.retained_artifact = retained_artifact
+        super().__init__(
+            f"Task database {operation} committed but {detail}; "
+            f"retained artifact: {retained_artifact}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,6 +509,13 @@ class _DatabaseArtifact:
         return self.artifact
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedSidecar:
+    path: Path
+    device: int
+    inode: int
+
+
 @dataclass(slots=True)
 class _OfflineRestoreGate:
     write_connection: sqlite3.Connection
@@ -495,6 +523,9 @@ class _OfflineRestoreGate:
 
     def close_snapshot(self) -> None:
         if self.snapshot_connection is None:
+            return
+        if self.snapshot_connection is self.write_connection:
+            self.snapshot_connection = None
             return
         try:
             self.snapshot_connection.rollback()
@@ -579,9 +610,16 @@ class TaskDatabase:
             _database_operation_lock(self._operation_lock_path),
             closing(self.connect()) as connection,
         ):
+            prepared_sidecars: tuple[_PreparedSidecar, ...] = ()
             try:
+                _assert_owner_only_sqlite_sidecars(self.database_path)
                 _begin_immediate(connection)
+                prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
+                    connection,
+                    self.database_path,
+                )
                 yield connection
+                _secure_existing_sqlite_sidecars(self.database_path)
                 connection.commit()
             except BaseException as error:
                 try:
@@ -595,6 +633,8 @@ class TaskDatabase:
                         "Task database operation failed"
                     ) from error
                 raise
+            finally:
+                _remove_empty_precreated_sidecars(prepared_sidecars)
 
     def quick_check(self, *, _operation_locked: bool = False) -> str:
         """Return ``ok`` only when SQLite verifies every database page."""
@@ -615,11 +655,15 @@ class TaskDatabase:
 
         destination = _prepare_output_path(destination_path)
         _require_distinct_paths(self.database_path, destination)
+        _assert_owner_only_sqlite_sidecars(self.database_path)
         with _database_operation_lock(self._operation_lock_path):
             return self._backup_locked(destination)
 
     def _backup_locked(self, destination: Path) -> Path:
         artifact: _DatabaseArtifact | None = None
+        published = False
+        keep_artifact = False
+        operation_error: BaseException | None = None
         try:
             with closing(self.connect()) as source:
                 source.execute("BEGIN")
@@ -637,41 +681,74 @@ class TaskDatabase:
                 busy_message="Task database backup destination requires offline access",
             ):
                 _publish_database_artifact(artifact, destination)
-            return destination
-        except TaskDatabaseError:
-            raise
-        except (OSError, sqlite3.Error) as error:
-            raise TaskDatabaseError("Task database backup failed") from error
-        finally:
-            if artifact is not None:
+            published = True
+        except BaseException as error:
+            operation_error = error
+            keep_artifact = isinstance(error, TaskDatabaseCommittedError)
+
+        if artifact is not None and not keep_artifact:
+            try:
                 _remove_database_artifact(artifact)
+            except BaseException as cleanup_error:
+                if published:
+                    raise TaskDatabaseCommittedError(
+                        operation="backup",
+                        retained_artifact=artifact.artifact,
+                        detail="artifact cleanup failed",
+                    ) from cleanup_error
+                if operation_error is not None:
+                    raise TaskDatabaseError(
+                        "Task database backup failed and its staging artifact "
+                        f"could not be removed: {artifact.artifact}"
+                    ) from operation_error
+                raise
+
+        if operation_error is not None:
+            if isinstance(operation_error, (KeyboardInterrupt, SystemExit)):
+                raise operation_error
+            if isinstance(operation_error, TaskDatabaseError):
+                raise operation_error
+            if isinstance(operation_error, (OSError, sqlite3.Error)):
+                raise TaskDatabaseError("Task database backup failed") from operation_error
+            raise operation_error
+        return destination
 
     def restore(self, backup_path: str | Path) -> None:
-        """Validate a staged backup before atomically replacing the live file."""
+        """Hold the live write gate while validating and restoring one backup."""
 
         backup = _prepare_existing_input_path(backup_path)
         _require_distinct_paths(self.database_path, backup)
+        _assert_owner_only_sqlite_sidecars(backup)
         with _database_operation_lock(
             self._operation_lock_path,
             exclusive=True,
             timeout_seconds=0.0,
             busy_message=_RESTORE_OFFLINE_MESSAGE,
         ):
-            self._restore_locked(backup)
+            with _offline_database_gate(self.database_path) as gate:
+                self._restore_locked(backup, gate)
 
-    def _restore_locked(self, backup: Path) -> None:
+    def _restore_locked(self, backup: Path, gate: _OfflineRestoreGate) -> None:
         temporary = _new_secure_temporary_file(self.database_path.parent, "restore")
         preimage: _DatabaseArtifact | None = None
         expected_content_hash: str | None = None
         committed = False
         keep_rollback_artifact = False
+        operation_error: BaseException | None = None
         try:
             with (
                 closing(_connect_database_file(backup, mode="ro")) as source,
                 closing(_connect_database_file(temporary, mode="rw")) as target,
             ):
-                source.backup(target)
-                target.commit()
+                prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
+                    target,
+                    temporary,
+                )
+                try:
+                    source.backup(target)
+                    target.commit()
+                finally:
+                    _remove_empty_precreated_sidecars(prepared_sidecars)
                 _validate_supported_schema(target)
                 _initialize_database_connection(target)
                 _require_standalone_journal(target, "restore staging database")
@@ -681,32 +758,38 @@ class TaskDatabase:
                 expected_content_hash=expected_content_hash,
                 description="restore staging database",
             )
-            with _offline_database_gate(self.database_path) as gate:
-                if gate.snapshot_connection is None:
-                    raise TaskDatabaseError("restore snapshot connection is missing")
-                preimage = _capture_restore_preimage(
-                    gate.snapshot_connection,
-                    self.database_path,
-                )
-                gate.close_snapshot()
-                _replace_database_content(
-                    gate.write_connection,
-                    temporary,
-                )
-                _validate_restore_candidate(
-                    gate.write_connection,
-                    expected_content_hash=expected_content_hash,
-                )
-                _apply_owner_only_permissions(self.database_path)
-                if not self.verify_owner_only_permissions():
-                    raise TaskDatabaseError(
-                        "restored Task database permissions are unsafe"
-                    )
-                gate.write_connection.commit()
-                committed = True
+            if gate.snapshot_connection is None:
+                raise TaskDatabaseError("restore snapshot connection is missing")
+            preimage = _capture_restore_preimage(
+                gate.snapshot_connection,
+                self.database_path,
+            )
+            gate.close_snapshot()
+            _replace_database_content(
+                gate.write_connection,
+                temporary,
+            )
+            _validate_restore_candidate(
+                gate.write_connection,
+                expected_content_hash=expected_content_hash,
+            )
+            _secure_existing_sqlite_sidecars(self.database_path)
+            _apply_owner_only_permissions(self.database_path)
+            if not self.verify_owner_only_permissions():
+                raise TaskDatabaseError("restored Task database permissions are unsafe")
+            _sync_file(self.database_path)
+            gate.write_connection.commit()
+            committed = True
+            _detach_database_if_attached(gate.write_connection, "restore_source")
+            _sync_directory(self.database_path.parent)
         except BaseException as error:
             if preimage is not None and not committed:
                 try:
+                    gate.write_connection.rollback()
+                    _detach_database_if_attached(
+                        gate.write_connection,
+                        "restore_source",
+                    )
                     _assert_database_matches_artifact(
                         self.database_path,
                         preimage,
@@ -717,31 +800,69 @@ class TaskDatabase:
                         "Task database restore failed and rollback failed; "
                         f"rollback artifact: {preimage.rollback_artifact}"
                     ) from rollback_error
+                operation_error = error
             elif preimage is not None and committed:
                 keep_rollback_artifact = True
+                committed_error = TaskDatabaseCommittedError(
+                    operation="restore",
+                    retained_artifact=preimage.rollback_artifact,
+                    detail="finalization failed",
+                )
+                committed_error.__cause__ = error
+                operation_error = committed_error
+            else:
+                operation_error = error
+
+        try:
+            _remove_restore_artifact(temporary)
+        except BaseException as cleanup_error:
+            if committed:
+                keep_rollback_artifact = True
+                retained = (
+                    preimage.rollback_artifact if preimage is not None else temporary
+                )
+                raise TaskDatabaseCommittedError(
+                    operation="restore",
+                    retained_artifact=retained,
+                    detail=f"staging cleanup failed; staging artifact: {temporary}",
+                ) from cleanup_error
+            if operation_error is not None:
                 raise TaskDatabaseError(
-                    "Task database restore committed but finalization failed; "
-                    f"preimage artifact: {preimage.rollback_artifact}"
-                ) from error
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    "Task database restore failed and its staging artifact "
+                    f"could not be removed: {temporary}"
+                ) from operation_error
+            raise
+
+        if preimage is not None and not keep_rollback_artifact:
+            try:
+                _remove_database_artifact(preimage)
+            except BaseException as cleanup_error:
+                if committed:
+                    raise TaskDatabaseCommittedError(
+                        operation="restore",
+                        retained_artifact=preimage.rollback_artifact,
+                        detail="preimage cleanup failed",
+                    ) from cleanup_error
                 raise
-            if (
-                not committed
-                and isinstance(error, TaskDatabaseError)
-                and str(error) == _RESTORE_OFFLINE_MESSAGE
-            ):
-                raise
+
+        if operation_error is not None:
+            if isinstance(operation_error, TaskDatabaseCommittedError):
+                raise operation_error
+            if isinstance(operation_error, (KeyboardInterrupt, SystemExit)):
+                raise operation_error
+            if _is_sqlite_busy_error(operation_error):
+                raise TaskDatabaseError(_RESTORE_OFFLINE_MESSAGE) from operation_error
             raise TaskDatabaseError(
                 "Task database backup could not be restored safely"
-            ) from error
-        finally:
-            _remove_restore_artifact(temporary)
-            if preimage is not None and not keep_rollback_artifact:
-                _remove_database_artifact(preimage)
+            ) from operation_error
 
     def _initialize(self, *, _operation_locked: bool = False) -> None:
         if not _operation_locked:
-            with _database_operation_lock(self._operation_lock_path):
+            with _database_operation_lock(
+                self._operation_lock_path,
+                exclusive=True,
+            ):
+                _assert_owner_only_sqlite_sidecars(self.database_path)
                 self._initialize(_operation_locked=True)
             return
         with closing(self.connect()) as connection:
@@ -749,8 +870,14 @@ class TaskDatabase:
 
 
 def _initialize_database_connection(connection: sqlite3.Connection) -> None:
+    database_path = _database_path_for_connection(connection)
+    prepared_sidecars: tuple[_PreparedSidecar, ...] = ()
     try:
         _begin_immediate(connection)
+        prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
+            connection,
+            database_path,
+        )
         version = _user_version(connection)
         objects = _load_schema_objects(connection)
         if not objects:
@@ -789,6 +916,7 @@ def _initialize_database_connection(connection: sqlite3.Connection) -> None:
         _quick_check(connection)
         if connection.execute("PRAGMA foreign_key_check").fetchall():
             raise TaskDatabaseError("Task database foreign key check failed")
+        _secure_existing_sqlite_sidecars(database_path)
         connection.commit()
     except BaseException as error:
         try:
@@ -802,11 +930,22 @@ def _initialize_database_connection(connection: sqlite3.Connection) -> None:
         if isinstance(error, sqlite3.Error):
             raise TaskDatabaseError("Task database operation failed") from error
         raise
+    finally:
+        _remove_empty_precreated_sidecars(prepared_sidecars)
 
 
 def _begin_immediate(connection: sqlite3.Connection) -> None:
     # RISK(race): every Task writer acquires the same lock before reading state.
     connection.execute("BEGIN IMMEDIATE")
+
+
+def _is_sqlite_busy_error(error: BaseException) -> bool:
+    if not isinstance(error, sqlite3.Error):
+        return False
+    error_code = getattr(error, "sqlite_errorcode", None)
+    if not isinstance(error_code, int):
+        return False
+    return error_code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
 
 
 def _user_version(connection: sqlite3.Connection) -> int:
@@ -1338,14 +1477,22 @@ def _connect_database_file(path: Path, *, mode: str) -> sqlite3.Connection:
 
 @contextmanager
 def _offline_database_gate(path: Path) -> Iterator[_OfflineRestoreGate]:
+    _assert_owner_only_sqlite_sidecars(path)
     write_gate = _connect_database_file(path, mode="rw")
     source: sqlite3.Connection | None = None
     gate: _OfflineRestoreGate | None = None
+    prepared_sidecars: tuple[_PreparedSidecar, ...] = ()
     try:
         write_gate.execute("PRAGMA busy_timeout = 0")
         try:
+            _require_standalone_journal(write_gate, "live Task database")
             write_gate.execute("BEGIN IMMEDIATE")
-        except sqlite3.Error as error:
+            prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
+                write_gate,
+                path,
+            )
+        except (sqlite3.Error, TaskDatabaseError) as error:
+            _remove_empty_precreated_sidecars(prepared_sidecars)
             raise TaskDatabaseError(_RESTORE_OFFLINE_MESSAGE) from error
         source = _connect_database_file(path, mode="rw")
         source.execute("PRAGMA busy_timeout = 0")
@@ -1365,6 +1512,7 @@ def _offline_database_gate(path: Path) -> Iterator[_OfflineRestoreGate]:
                 write_gate.rollback()
             finally:
                 write_gate.close()
+                _remove_empty_precreated_sidecars(prepared_sidecars)
 
 
 def _file_sha256(path: Path) -> str:
@@ -1450,10 +1598,27 @@ def _validate_exact_database(
             "Task database foreign key check failed: "
             f"{len(foreign_key_errors)} error(s)"
         )
+    _validate_sqlite_sequence(connection)
     content_hash = _database_content_hash(connection)
     if expected_content_hash is not None and content_hash != expected_content_hash:
         raise TaskDatabaseError("Task database content hash does not match")
     return content_hash
+
+
+def _validate_sqlite_sequence(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
+    for raw_name, raw_sequence in rows:
+        table_name = str(raw_name)
+        if table_name not in _AUTOINCREMENT_TABLES:
+            raise TaskDatabaseError("Task database has an unexpected sequence table")
+        if not isinstance(raw_sequence, int) or raw_sequence < 0:
+            raise TaskDatabaseError("Task database sequence value is invalid")
+        quoted_table = _quote_sqlite_identifier(table_name)
+        maximum = connection.execute(
+            f"SELECT COALESCE(MAX(rowid), 0) FROM {quoted_table}"
+        ).fetchone()
+        if maximum is None or raw_sequence < int(maximum[0]):
+            raise TaskDatabaseError("Task database sequence is below its row high-water")
 
 
 def _validate_restore_candidate(
@@ -1476,16 +1641,153 @@ def _require_standalone_journal(
         raise TaskDatabaseError(f"{description} is not a standalone SQLite database")
 
 
+def _database_path_for_connection(connection: sqlite3.Connection) -> Path:
+    for _, database_name, raw_path in connection.execute("PRAGMA database_list"):
+        if str(database_name) == "main" and raw_path:
+            return Path(str(raw_path)).resolve(strict=True)
+    raise TaskDatabaseError("Task database connection has no main file")
+
+
 def _assert_safe_sqlite_sidecars(database_path: Path) -> None:
     for suffix in _SQLITE_SIDECAR_SUFFIXES:
         sidecar = Path(f"{database_path}{suffix}")
-        if sidecar.exists():
+        if sidecar.exists() or sidecar.is_symlink():
             _assert_safe_file(sidecar, required=True)
 
 
-def _assert_no_sqlite_sidecars(database_path: Path) -> None:
+def _assert_owner_only_sqlite_sidecars(database_path: Path) -> None:
     _assert_safe_sqlite_sidecars(database_path)
-    if any(Path(f"{database_path}{suffix}").exists() for suffix in _SQLITE_SIDECAR_SUFFIXES):
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        sidecar = Path(f"{database_path}{suffix}")
+        if sidecar.exists() or sidecar.is_symlink():
+            _wait_for_owner_only_sidecar(sidecar)
+
+
+def _wait_for_owner_only_sidecar(sidecar: Path) -> None:
+    try:
+        initial = sidecar.stat()
+    except FileNotFoundError:
+        return
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            current = sidecar.stat()
+        except FileNotFoundError:
+            return
+        if (initial.st_dev, initial.st_ino) != (current.st_dev, current.st_ino):
+            raise TaskDatabaseError(
+                "SQLite sidecar path changed during permission check"
+            )
+        try:
+            _assert_safe_file(sidecar, required=True)
+        except TaskDatabaseError:
+            if not sidecar.exists():
+                return
+            raise
+        if _verify_owner_only_permissions(sidecar):
+            return
+        if time.monotonic() >= deadline:
+            raise TaskDatabaseError("SQLite sidecar permissions are unsafe")
+        time.sleep(_OPERATION_LOCK_RETRY_SECONDS)
+
+
+def _secure_existing_sqlite_sidecars(database_path: Path) -> None:
+    _assert_safe_sqlite_sidecars(database_path)
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        sidecar = Path(f"{database_path}{suffix}")
+        if not sidecar.exists() and not sidecar.is_symlink():
+            continue
+        _ensure_owner_only_permissions(sidecar)
+
+
+def _ensure_owner_only_permissions(path: Path) -> None:
+    _assert_safe_file(path, required=True)
+    try:
+        before = path.stat()
+        if not _verify_owner_only_permissions(path):
+            _apply_owner_only_permissions(path)
+        after = path.stat()
+    except OSError as error:
+        raise TaskDatabaseError("SQLite sidecar permissions are unsafe") from error
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise TaskDatabaseError("SQLite sidecar path changed during permission check")
+    if not _verify_owner_only_permissions(path):
+        raise TaskDatabaseError("SQLite sidecar permissions are unsafe")
+
+
+def _prepare_secure_sqlite_write_sidecars(
+    connection: sqlite3.Connection,
+    database_path: Path,
+) -> tuple[_PreparedSidecar, ...]:
+    journal_row = connection.execute("PRAGMA main.journal_mode").fetchone()
+    journal_mode = str(journal_row[0]).casefold() if journal_row else ""
+    suffixes = ("-wal", "-shm") if journal_mode == "wal" else ("-journal",)
+    created: list[_PreparedSidecar] = []
+    for suffix in suffixes:
+        sidecar = Path(f"{database_path}{suffix}")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOINHERIT", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(sidecar, flags, 0o600)
+        except FileExistsError:
+            _ensure_owner_only_permissions(sidecar)
+        except OSError as error:
+            raise TaskDatabaseError(
+                "SQLite sidecar could not be created securely"
+            ) from error
+        else:
+            try:
+                descriptor_stat = os.fstat(descriptor)
+                created.append(
+                    _PreparedSidecar(
+                        path=sidecar,
+                        device=descriptor_stat.st_dev,
+                        inode=descriptor_stat.st_ino,
+                    )
+                )
+            finally:
+                os.close(descriptor)
+            _ensure_owner_only_permissions(sidecar)
+        if not _verify_owner_only_permissions(sidecar):
+            raise TaskDatabaseError("SQLite sidecar permissions are unsafe")
+    return tuple(created)
+
+
+def _remove_empty_precreated_sidecars(
+    sidecars: tuple[_PreparedSidecar, ...],
+) -> None:
+    synced_directories: set[Path] = set()
+    for prepared in sidecars:
+        try:
+            if not prepared.path.exists():
+                continue
+            path_stat = prepared.path.stat()
+            if (
+                path_stat.st_dev,
+                path_stat.st_ino,
+                path_stat.st_size,
+            ) != (prepared.device, prepared.inode, 0):
+                continue
+            _assert_safe_file(prepared.path, required=True)
+            prepared.path.unlink()
+            synced_directories.add(prepared.path.parent)
+        except OSError as error:
+            raise TaskDatabaseError(
+                "empty SQLite sidecar could not be removed"
+            ) from error
+    for directory in synced_directories:
+        _sync_directory(directory)
+
+
+def _assert_no_sqlite_sidecars(database_path: Path) -> None:
+    _assert_owner_only_sqlite_sidecars(database_path)
+    if any(
+        Path(f"{database_path}{suffix}").exists()
+        or Path(f"{database_path}{suffix}").is_symlink()
+        for suffix in _SQLITE_SIDECAR_SUFFIXES
+    ):
         raise TaskDatabaseError("standalone Task database has SQLite sidecars")
 
 
@@ -1497,6 +1799,7 @@ def _finalize_database_file(
 ) -> str:
     _apply_owner_only_permissions(database_path)
     _sync_file(database_path)
+    _sync_directory(database_path.parent)
     if not _verify_owner_only_permissions(database_path):
         raise TaskDatabaseError(f"{description} permissions are unsafe")
     _assert_no_sqlite_sidecars(database_path)
@@ -1525,8 +1828,15 @@ def _capture_database_artifact(
     artifact = _new_secure_temporary_file(directory, purpose)
     try:
         with closing(_connect_database_file(artifact, mode="rw")) as target:
-            source.backup(target)
-            target.commit()
+            prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
+                target,
+                artifact,
+            )
+            try:
+                source.backup(target)
+                target.commit()
+            finally:
+                _remove_empty_precreated_sidecars(prepared_sidecars)
             _require_standalone_journal(target, f"{purpose} artifact")
             _validate_exact_database(
                 target,
@@ -1564,42 +1874,166 @@ def _publish_database_artifact(
 ) -> None:
     if _file_sha256(artifact.artifact) != artifact.file_hash:
         raise TaskDatabaseError("Task database artifact changed before publish")
-    _assert_safe_sqlite_sidecars(destination)
-    _ensure_secure_database_file(destination)
-    _apply_owner_only_permissions(destination)
-    with (
-        closing(_connect_database_file(artifact.artifact, mode="ro")) as source,
-        closing(_connect_database_file(destination, mode="rw")) as target,
-    ):
+    _assert_no_sqlite_sidecars(artifact.artifact)
+    if destination.exists():
+        _publish_existing_database_artifact(artifact, destination)
+        return
+    _publish_new_database_artifact(artifact, destination)
+
+
+def _publish_existing_database_artifact(
+    artifact: _DatabaseArtifact,
+    destination: Path,
+) -> None:
+    _assert_safe_file(destination, required=True)
+    _assert_owner_only_sqlite_sidecars(destination)
+    if not _verify_owner_only_permissions(destination):
+        raise TaskDatabaseError("Task database backup permissions are unsafe")
+    old_file_hash = _file_sha256(destination)
+    old_content_hash: str | None = None
+    target = _connect_database_file(destination, mode="rw")
+    prepared_sidecars: tuple[_PreparedSidecar, ...] = ()
+    committed = False
+    try:
         target.execute("PRAGMA busy_timeout = 0")
-        _require_standalone_journal(target, "backup destination")
-        source.backup(target, pages=-1, sleep=0)
-        target.commit()
-        _require_standalone_journal(target, "backup destination")
         try:
-            target.execute("BEGIN IMMEDIATE")
-        except sqlite3.Error as error:
+            _require_standalone_journal(target, "backup destination")
+            target.execute("BEGIN EXCLUSIVE")
+            prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
+                target,
+                destination,
+            )
+        except (sqlite3.Error, TaskDatabaseError) as error:
             raise TaskDatabaseError(
                 "Task database backup destination requires offline access"
             ) from error
-        _validate_exact_database(
+        old_content_hash = _validate_exact_database(target)
+        _replace_database_content(target, artifact.artifact)
+        _validate_existing_backup_candidate(
             target,
+            destination,
             expected_content_hash=artifact.content_hash,
         )
-        _apply_owner_only_permissions(destination)
+        target.commit()
+        committed = True
+    except BaseException as error:
+        try:
+            target.rollback()
+        finally:
+            target.close()
+            _remove_empty_precreated_sidecars(prepared_sidecars)
+        if old_content_hash is not None:
+            _assert_existing_backup_unchanged(
+                destination,
+                expected_file_hash=old_file_hash,
+                expected_content_hash=old_content_hash,
+            )
+        raise error
+    else:
+        try:
+            target.close()
+            _remove_empty_precreated_sidecars(prepared_sidecars)
+        except BaseException as error:
+            committed_error = TaskDatabaseCommittedError(
+                operation="backup",
+                retained_artifact=artifact.artifact,
+                detail="SQLite handle cleanup failed",
+            )
+            committed_error.__cause__ = error
+            raise committed_error
+
+    if committed:
+        try:
+            _assert_no_sqlite_sidecars(destination)
+            _sync_directory(destination.parent)
+        except BaseException as error:
+            committed_error = TaskDatabaseCommittedError(
+                operation="backup",
+                retained_artifact=artifact.artifact,
+                detail="destination finalization failed",
+            )
+            committed_error.__cause__ = error
+            raise committed_error
+
+
+def _validate_existing_backup_candidate(
+    target: sqlite3.Connection,
+    destination: Path,
+    *,
+    expected_content_hash: str,
+) -> None:
+    _validate_exact_database(
+        target,
+        expected_content_hash=expected_content_hash,
+    )
+    _secure_existing_sqlite_sidecars(destination)
+    if not _verify_owner_only_permissions(destination):
+        raise TaskDatabaseError("Task database backup permissions are unsafe")
+    _sync_file(destination)
+    _validate_exact_database(
+        target,
+        expected_content_hash=expected_content_hash,
+    )
+
+
+def _assert_existing_backup_unchanged(
+    destination: Path,
+    *,
+    expected_file_hash: str,
+    expected_content_hash: str,
+) -> None:
+    if _file_sha256(destination) != expected_file_hash:
+        raise TaskDatabaseError(
+            "Task database backup failed and destination rollback changed bytes"
+        )
+    with closing(_connect_database_file(destination, mode="ro")) as readback:
+        _validate_exact_database(
+            readback,
+            expected_content_hash=expected_content_hash,
+        )
+
+
+def _link_new_backup_artifact(artifact: Path, destination: Path) -> None:
+    try:
+        os.link(artifact, destination)
+    except FileExistsError as error:
+        raise TaskDatabaseError(
+            "Task database backup destination requires offline access"
+        ) from error
+    except OSError as error:
+        raise TaskDatabaseError("Task database backup could not be published") from error
+
+
+def _publish_new_database_artifact(
+    artifact: _DatabaseArtifact,
+    destination: Path,
+) -> None:
+    _assert_safe_sqlite_sidecars(destination)
+    try:
+        _link_new_backup_artifact(artifact.artifact, destination)
+        _assert_safe_file(destination, required=True)
+        if not os.path.samefile(artifact.artifact, destination):
+            raise TaskDatabaseError("Task database backup publication changed path")
         if not _verify_owner_only_permissions(destination):
             raise TaskDatabaseError("Task database backup permissions are unsafe")
+        if _file_sha256(destination) != artifact.file_hash:
+            raise TaskDatabaseError("Task database backup changed during publication")
         _assert_no_sqlite_sidecars(destination)
         _sync_file(destination)
-        file_hash = _file_sha256(destination)
-        with closing(_connect_database_file(destination, mode="ro")) as readback:
-            _validate_exact_database(
-                readback,
-                expected_content_hash=artifact.content_hash,
-            )
-        if _file_sha256(destination) != file_hash:
-            raise TaskDatabaseError("Task database backup changed during readback")
-        target.rollback()
+        _sync_directory(destination.parent)
+    except BaseException:
+        try:
+            if destination.exists() and os.path.samefile(
+                artifact.artifact,
+                destination,
+            ):
+                destination.unlink()
+                _sync_directory(destination.parent)
+        except OSError as cleanup_error:
+            raise TaskDatabaseError(
+                "partial Task database backup could not be removed"
+            ) from cleanup_error
+        raise
 
 
 def _replace_database_content(
@@ -1641,6 +2075,18 @@ def _replace_database_content(
         "INSERT INTO main.sqlite_sequence(name, seq) "
         "SELECT name, seq FROM restore_source.sqlite_sequence"
     )
+
+
+def _detach_database_if_attached(
+    connection: sqlite3.Connection,
+    database_name: str,
+) -> None:
+    attached_names = {
+        str(row[1]) for row in connection.execute("PRAGMA database_list").fetchall()
+    }
+    if database_name in attached_names:
+        quoted_name = _quote_sqlite_identifier(database_name)
+        connection.execute(f"DETACH DATABASE {quoted_name}")
 
 
 def _assert_database_matches_artifact(
@@ -1686,6 +2132,7 @@ def _remove_temporary_file(path: Path) -> None:
     try:
         if path.exists():
             path.unlink()
+            _sync_directory(path.parent)
     except OSError as error:
         raise TaskDatabaseError(
             "Task database staging file could not be removed"
@@ -1693,16 +2140,20 @@ def _remove_temporary_file(path: Path) -> None:
 
 
 def _remove_sqlite_sidecars(database_path: Path) -> None:
+    removed = False
     for suffix in _SQLITE_SIDECAR_SUFFIXES:
         sidecar = Path(f"{database_path}{suffix}")
         try:
             if sidecar.exists():
                 _assert_safe_file(sidecar, required=True)
                 sidecar.unlink()
+                removed = True
         except OSError as error:
             raise TaskDatabaseError(
                 "stale SQLite sidecar could not be removed"
             ) from error
+    if removed:
+        _sync_directory(database_path.parent)
 
 
 def _require_distinct_paths(first: Path, second: Path) -> None:
@@ -1728,6 +2179,22 @@ def _sync_file(path: Path) -> None:
     except OSError as error:
         raise TaskDatabaseError(
             "Task database staging file could not be synced"
+        ) from error
+
+
+def _sync_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise TaskDatabaseError(
+            "Task database directory could not be synced"
         ) from error
 
 
