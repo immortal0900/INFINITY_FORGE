@@ -217,13 +217,21 @@ class ProjectMergeStore(Protocol):
         occurred_at: datetime,
     ) -> None: ...
 
-    def guard_project(
+    def reserve_project(
         self,
         task: ProjectMergeTask,
         snapshot: ProjectMergeSnapshot,
         *,
         expected_head_commit: str,
         occurred_at: datetime,
+    ) -> bool: ...
+
+    def guard_project(
+        self,
+        task: ProjectMergeTask,
+        snapshot: ProjectMergeSnapshot,
+        *,
+        expected_head_commit: str,
     ) -> AbstractContextManager[ProjectMergeGuard]: ...
 
     def finish_merged(
@@ -246,8 +254,6 @@ class ProjectMergeStore(Protocol):
 
 
 class ProjectMergeGuard(Protocol):
-    merge_attempt_created: bool
-
     def mark_merged(
         self,
         snapshot: ProjectMergeSnapshot,
@@ -546,18 +552,19 @@ class TaskDatabaseProjectMergeStore:
                 if updated.rowcount != 1:
                     raise MergeRuntimeError("Project barrier proof update failed")
 
-    @contextmanager
-    def guard_project(
+    def reserve_project(
         self,
         task: ProjectMergeTask,
         snapshot: ProjectMergeSnapshot,
         *,
         expected_head_commit: str,
         occurred_at: datetime,
-    ) -> Iterator[ProjectMergeGuard]:
+    ) -> bool:
+        """Commit the one durable intent allowed to call GitHub."""
+
         state = snapshot.task_flow_state
         if state is None or expected_head_commit != state.current_commit:
-            raise MergeRuntimeError("Project guard head is not the replayed proof")
+            raise MergeRuntimeError("Project reservation head is not replayed proof")
         with self._database.transaction() as connection:
             self._require_exact_task(connection, task)
             row = connection.execute(
@@ -617,14 +624,46 @@ class TaskDatabaseProjectMergeStore:
                 raise MergeRuntimeError(
                     "Project state does not permit a merge reservation"
                 )
-        # The reservation transaction must commit before the remote call. A
-        # second worker can only observe this durable state and read back.
-        yield _TaskDatabaseProjectMergeGuard(
-            self._database,
-            task,
-            snapshot,
-            merge_attempt_created,
-        )
+        return merge_attempt_created
+
+    @contextmanager
+    def guard_project(
+        self,
+        task: ProjectMergeTask,
+        snapshot: ProjectMergeSnapshot,
+        *,
+        expected_head_commit: str,
+    ) -> Iterator[ProjectMergeGuard]:
+        """Hold the lifecycle write permit through the bounded GitHub call."""
+
+        state = snapshot.task_flow_state
+        if state is None or expected_head_commit != state.current_commit:
+            raise MergeRuntimeError("Project permit head is not the replayed proof")
+        with self._database.transaction() as connection:
+            # This check and stop/revision writes use the same database write
+            # lock. Whichever commits first defines the safe-point ordering.
+            self._require_exact_task(connection, task)
+            row = connection.execute(
+                """
+                SELECT state, pr_url, head_commit, merge_commit
+                FROM task_projects
+                WHERE request_id = ? AND project_id = ?
+                  AND task_settings_hash = ?
+                """,
+                (
+                    task.request.request_id,
+                    snapshot.project.project_id,
+                    task.settings.task_settings_hash,
+                ),
+            ).fetchone()
+            if row is None or tuple(row) != (
+                "waiting_for_help",
+                state.pr_url,
+                expected_head_commit,
+                None,
+            ):
+                raise MergeRuntimeError("Project external-write permit changed")
+            yield _TaskDatabaseProjectMergeGuard(connection, task, snapshot)
 
     def finish_merged(
         self,
@@ -886,10 +925,9 @@ class TaskDatabaseProjectMergeStore:
 
 @dataclass(slots=True)
 class _TaskDatabaseProjectMergeGuard:
-    database: TaskDatabase
+    connection: sqlite3.Connection
     task: ProjectMergeTask
     expected: ProjectMergeSnapshot
-    merge_attempt_created: bool
 
     def mark_merged(
         self,
@@ -904,59 +942,47 @@ class _TaskDatabaseProjectMergeGuard:
         if state is None:
             raise MergeRuntimeError("Project merge result has no replayed proof")
         timestamp = _v2_timestamp(occurred_at)
-        with self.database.transaction() as connection:
-            TaskDatabaseProjectMergeStore._require_exact_task(connection, self.task)
-            row = connection.execute(
-                """
-                SELECT state, pr_url, head_commit, merge_commit
-                FROM task_projects
-                WHERE request_id = ? AND project_id = ?
-                  AND task_settings_hash = ?
-                """,
-                (
-                    self.task.request.request_id,
-                    snapshot.project.project_id,
-                    self.task.settings.task_settings_hash,
-                ),
-            ).fetchone()
-            if row is None:
-                raise MergeRuntimeError("Project disappeared after merge readback")
-            if row[0] == "merged":
-                if tuple(row[1:]) != (
-                    state.pr_url,
-                    result.expected_commit,
-                    result.merged_commit,
-                ):
-                    raise MergeRuntimeError("stored Project merge commit changed")
-                return
-            if (
-                row[0] != "waiting_for_help"
-                or row[1] != state.pr_url
-                or row[2] != result.expected_commit
-                or row[3] is not None
-            ):
-                raise MergeRuntimeError("Project merge reservation changed")
-            updated = connection.execute(
-                """
-                UPDATE task_projects
-                SET state = 'merged', merge_commit = ?, updated_at = ?
-                WHERE request_id = ? AND project_id = ?
-                  AND task_settings_hash = ?
-                  AND state = 'waiting_for_help'
-                  AND pr_url = ? AND head_commit = ? AND merge_commit IS NULL
-                """,
-                (
-                    result.merged_commit,
-                    timestamp,
-                    self.task.request.request_id,
-                    snapshot.project.project_id,
-                    self.task.settings.task_settings_hash,
-                    state.pr_url,
-                    result.expected_commit,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise MergeRuntimeError("Project merge result could not be recorded")
+        row = self.connection.execute(
+            """
+            SELECT state, pr_url, head_commit, merge_commit
+            FROM task_projects
+            WHERE request_id = ? AND project_id = ?
+              AND task_settings_hash = ?
+            """,
+            (
+                self.task.request.request_id,
+                snapshot.project.project_id,
+                self.task.settings.task_settings_hash,
+            ),
+        ).fetchone()
+        if row is None or tuple(row) != (
+            "waiting_for_help",
+            state.pr_url,
+            result.expected_commit,
+            None,
+        ):
+            raise MergeRuntimeError("Project merge reservation changed")
+        updated = self.connection.execute(
+            """
+            UPDATE task_projects
+            SET state = 'merged', merge_commit = ?, updated_at = ?
+            WHERE request_id = ? AND project_id = ?
+              AND task_settings_hash = ?
+              AND state = 'waiting_for_help'
+              AND pr_url = ? AND head_commit = ? AND merge_commit IS NULL
+            """,
+            (
+                result.merged_commit,
+                timestamp,
+                self.task.request.request_id,
+                snapshot.project.project_id,
+                self.task.settings.task_settings_hash,
+                state.pr_url,
+                result.expected_commit,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise MergeRuntimeError("Project merge result could not be recorded")
 
 
 def _v2_timestamp(value: datetime) -> str:
@@ -1480,18 +1506,18 @@ def _run_project_task(
         write_started = False
         reservation_created: bool | None = None
         try:
-            # RISK(race): the exact settings/Project/PR/head reservation is
-            # committed before GitHub is called. Only its creator may write;
-            # every later worker is readback-only. Cross-repository merging
-            # remains non-atomic, so an exact later failure can be partial.
+            # RISK(race): one exact reservation is committed first. Its owner
+            # then holds the database external-write permit across the bounded
+            # evidence/write/result transaction. Stop or revision either wins
+            # before that permit (write=0) or waits for its safe point.
             reservation_time = _read_time(clock)
-            with merge_store.guard_project(
+            reservation_created = merge_store.reserve_project(
                 task,
                 snapshot,
                 expected_head_commit=proof.expected_head_commit,
                 occurred_at=reservation_time,
-            ) as guard:
-                reservation_created = guard.merge_attempt_created
+            )
+            if not reservation_created:
                 write_time = _read_time(clock)
                 fresh = evidence_reader.get_merge_evidence(
                     state.pr_url,
@@ -1513,7 +1539,18 @@ def _run_project_task(
                     )
                 if fresh_proof.already_merged:
                     result = _observed_project_merge_result(fresh)
-                elif not reservation_created:
+                    _validate_merge_result(
+                        result,
+                        expected_base_commit=state.current_base_commit,
+                        expected_commit=proof.expected_head_commit,
+                    )
+                    merge_store.converge_observed_merge(
+                        task,
+                        snapshot,
+                        result,
+                        occurred_at=write_time,
+                    )
+                else:
                     merge_store.mark_reconciliation_pending(
                         task,
                         snapshot,
@@ -1548,19 +1585,47 @@ def _run_project_task(
                         for remaining_id in remaining
                     )
                     return tuple(reports)
-                else:
-                    write_started = True
-                    result = merge_writer.merge_expected_commit(
+            else:
+                with merge_store.guard_project(
+                    task,
+                    snapshot,
+                    expected_head_commit=proof.expected_head_commit,
+                ) as guard:
+                    write_time = _read_time(clock)
+                    fresh = evidence_reader.get_merge_evidence(
                         state.pr_url,
-                        proof.expected_head_commit,
-                        expected_base_commit=state.current_base_commit,
+                        (required_check,),
+                        include_safe_files=include_safe_files,
                     )
-                _validate_merge_result(
-                    result,
-                    expected_base_commit=state.current_base_commit,
-                    expected_commit=proof.expected_head_commit,
-                )
-                guard.mark_merged(snapshot, result, occurred_at=write_time)
+                    fresh_proof = _project_merge_proof(
+                        snapshot,
+                        fresh,
+                        required_check=required_check,
+                        now=write_time,
+                    )
+                    if (
+                        fresh_proof.decision != AUTO_MERGE_ALLOWED
+                        or fresh_proof.expected_head_commit
+                        != proof.expected_head_commit
+                    ):
+                        raise MergeRuntimeError(
+                            "Project merge proof changed before its ordered write"
+                        )
+                    if fresh_proof.already_merged:
+                        result = _observed_project_merge_result(fresh)
+                    else:
+                        write_started = True
+                        result = merge_writer.merge_expected_commit(
+                            state.pr_url,
+                            proof.expected_head_commit,
+                            expected_base_commit=state.current_base_commit,
+                        )
+                    _validate_merge_result(
+                        result,
+                        expected_base_commit=state.current_base_commit,
+                        expected_commit=proof.expected_head_commit,
+                    )
+                    guard.mark_merged(snapshot, result, occurred_at=write_time)
             merged_ids.append(project_id)
             reports.append(
                 _project_report(
