@@ -11,6 +11,7 @@ from forge.ops.task_service import READY_TO_BUILD_LABEL
 
 
 REQUEST_ID = "9f7453ce-36ec-4e8e-9dfa-bb159b58c19b"
+V2_UUID7_REQUEST_ID = "01890f8e-7b2c-7abc-8def-0123456789ab"
 CONTENT_HASH = "a" * 64
 SETTINGS_HASH = "b" * 64
 BODY = (
@@ -209,6 +210,49 @@ def test_v1_and_v2_finders_ignore_the_other_marker_and_read_every_page() -> None
     assert "--paginate" in v2_runner.calls[0]
     assert "--slurp" in v2_runner.calls[0]
     assert "state=all" in v2_runner.calls[0][-1]
+
+
+def test_v2_finder_accepts_canonical_uuid7_without_changing_v1_contract() -> None:
+    v2_runner = Runner(
+        [[[_issue_v2(7, body=V2_BODY.replace(REQUEST_ID, V2_UUID7_REQUEST_ID))]]]
+    )
+    v1_runner = Runner([])
+
+    found = GitHubTaskIssueClientV2("gh", runner=v2_runner).find_issue(
+        "openai/infinity-forge",
+        V2_UUID7_REQUEST_ID,
+    )
+
+    assert found is not None and found.number == 7
+    with pytest.raises(GateError, match="request_id is invalid"):
+        GitHubTaskIssueClient("gh", runner=v1_runner).find_issue(
+            "openai/infinity-forge",
+            V2_UUID7_REQUEST_ID,
+        )
+    assert v1_runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    (
+        V2_UUID7_REQUEST_ID.upper(),
+        "{" + V2_UUID7_REQUEST_ID + "}",
+        "not-a-uuid",
+        7,
+    ),
+)
+def test_v2_finder_rejects_noncanonical_uuid_before_transport(
+    request_id: object,
+) -> None:
+    runner = Runner([])
+
+    with pytest.raises(GateError, match="request_id is invalid"):
+        GitHubTaskIssueClientV2("gh", runner=runner).find_issue(
+            "openai/infinity-forge",
+            request_id,  # type: ignore[arg-type]
+        )
+
+    assert runner.calls == []
 
 
 def test_v2_issue_client_does_not_expose_the_v1_ready_label_write() -> None:

@@ -11,6 +11,7 @@ from urllib.parse import quote
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from uuid import UUID
 
 from .contracts import CheckRun
 from .hermes import GateError
@@ -53,6 +54,18 @@ _REQUEST_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+
+
+def _is_canonical_v2_request_id(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        parsed = UUID(value)
+    except ValueError:
+        return False
+    return str(parsed) == value
+
+
 _FILE_STATUSES = frozenset(
     {"added", "modified", "removed", "renamed", "copied", "changed", "unchanged"}
 )
@@ -1151,7 +1164,7 @@ class GitHubTaskIssueClientV2:
         request_id: str,
     ) -> TaskParentIssue | None:
         repository = self._repository(repository)
-        if not isinstance(request_id, str) or _REQUEST_ID_RE.fullmatch(request_id) is None:
+        if not _is_canonical_v2_request_id(request_id):
             raise GateError("GitHub v2 Task request_id is invalid")
         # RISK(data-loss): every page and every state is required. Missing a
         # prior v2 parent after a lost create response would duplicate the Task.
