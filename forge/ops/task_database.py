@@ -471,7 +471,11 @@ _EXPECTED_SCHEMA = {**_V1_EXPECTED_SCHEMA, **_V2_EXPECTED_SCHEMA}
 TASK_DATABASE_TABLES = frozenset(
     name for (object_type, name) in _EXPECTED_SCHEMA if object_type == "table"
 )
-_AUTOINCREMENT_TABLES = frozenset({"task_events", "task_settings_events"})
+_AUTOINCREMENT_PRIMARY_KEYS = {
+    "task_events": "event_id",
+    "task_settings_events": "event_id",
+}
+_AUTOINCREMENT_TABLES = frozenset(_AUTOINCREMENT_PRIMARY_KEYS)
 
 
 class TaskDatabaseError(RuntimeError):
@@ -564,6 +568,7 @@ class TaskDatabase:
         self.database_path = _prepare_database_path(database_path)
         _ensure_secure_database_file(self.database_path)
         self._operation_lock_path = _prepare_operation_lock_path(self.database_path)
+        self._write_lock_path = _prepare_write_lock_path(self.database_path)
         self._initialize()
         _apply_owner_only_permissions(self.database_path)
         if not self.verify_owner_only_permissions():
@@ -604,20 +609,21 @@ class TaskDatabase:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Serialize a mutable operation with the shared BEGIN IMMEDIATE lock."""
+        """Serialize one mutable operation without excluding readers."""
 
         with (
             _database_operation_lock(self._operation_lock_path),
+            _database_operation_lock(self._write_lock_path, exclusive=True),
             closing(self.connect()) as connection,
         ):
             prepared_sidecars: tuple[_PreparedSidecar, ...] = ()
             try:
                 _assert_owner_only_sqlite_sidecars(self.database_path)
-                _begin_immediate(connection)
                 prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
                     connection,
                     self.database_path,
                 )
+                _begin_immediate(connection)
                 yield connection
                 _secure_existing_sqlite_sidecars(self.database_path)
                 connection.commit()
@@ -719,16 +725,41 @@ class TaskDatabase:
         backup = _prepare_existing_input_path(backup_path)
         _require_distinct_paths(self.database_path, backup)
         _assert_owner_only_sqlite_sidecars(backup)
-        with _database_operation_lock(
-            self._operation_lock_path,
-            exclusive=True,
-            timeout_seconds=0.0,
-            busy_message=_RESTORE_OFFLINE_MESSAGE,
-        ):
-            with _offline_database_gate(self.database_path) as gate:
-                self._restore_locked(backup, gate)
+        committed_preimage: _DatabaseArtifact | None = None
+        try:
+            with _database_operation_lock(
+                self._operation_lock_path,
+                exclusive=True,
+                timeout_seconds=0.0,
+                busy_message=_RESTORE_OFFLINE_MESSAGE,
+            ):
+                with _offline_database_gate(self.database_path) as gate:
+                    committed_preimage = self._restore_locked(backup, gate)
+        except BaseException as error:
+            if committed_preimage is not None:
+                raise TaskDatabaseCommittedError(
+                    operation="restore",
+                    retained_artifact=committed_preimage.rollback_artifact,
+                    detail="offline gate teardown failed",
+                ) from error
+            raise
 
-    def _restore_locked(self, backup: Path, gate: _OfflineRestoreGate) -> None:
+        if committed_preimage is None:
+            raise TaskDatabaseError("Task database restore completion is missing")
+        try:
+            _remove_database_artifact(committed_preimage)
+        except BaseException as cleanup_error:
+            raise TaskDatabaseCommittedError(
+                operation="restore",
+                retained_artifact=committed_preimage.rollback_artifact,
+                detail="preimage cleanup failed",
+            ) from cleanup_error
+
+    def _restore_locked(
+        self,
+        backup: Path,
+        gate: _OfflineRestoreGate,
+    ) -> _DatabaseArtifact:
         temporary = _new_secure_temporary_file(self.database_path.parent, "restore")
         preimage: _DatabaseArtifact | None = None
         expected_content_hash: str | None = None
@@ -833,7 +864,7 @@ class TaskDatabase:
                 ) from operation_error
             raise
 
-        if preimage is not None and not keep_rollback_artifact:
+        if preimage is not None and not keep_rollback_artifact and not committed:
             try:
                 _remove_database_artifact(preimage)
             except BaseException as cleanup_error:
@@ -855,6 +886,9 @@ class TaskDatabase:
             raise TaskDatabaseError(
                 "Task database backup could not be restored safely"
             ) from operation_error
+        if not committed or preimage is None:
+            raise TaskDatabaseError("Task database restore completion is missing")
+        return preimage
 
     def _initialize(self, *, _operation_locked: bool = False) -> None:
         if not _operation_locked:
@@ -873,11 +907,11 @@ def _initialize_database_connection(connection: sqlite3.Connection) -> None:
     database_path = _database_path_for_connection(connection)
     prepared_sidecars: tuple[_PreparedSidecar, ...] = ()
     try:
-        _begin_immediate(connection)
         prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
             connection,
             database_path,
         )
+        _begin_immediate(connection)
         version = _user_version(connection)
         objects = _load_schema_objects(connection)
         if not objects:
@@ -913,9 +947,11 @@ def _initialize_database_connection(connection: sqlite3.Connection) -> None:
             _EXPECTED_SCHEMA,
             TASK_DATABASE_SCHEMA_VERSION,
         )
+        _ensure_sqlite_sequence_rows(connection)
         _quick_check(connection)
         if connection.execute("PRAGMA foreign_key_check").fetchall():
             raise TaskDatabaseError("Task database foreign key check failed")
+        _validate_sqlite_sequence(connection)
         _secure_existing_sqlite_sidecars(database_path)
         connection.commit()
     except BaseException as error:
@@ -1099,7 +1135,15 @@ def _prepare_database_path(database_path: str | Path) -> Path:
 
 
 def _prepare_operation_lock_path(database_path: Path) -> Path:
-    lock_path = database_path.with_name(f"{database_path.name}.operation.lock")
+    return _prepare_database_lock_path(database_path, purpose="operation")
+
+
+def _prepare_write_lock_path(database_path: Path) -> Path:
+    return _prepare_database_lock_path(database_path, purpose="write")
+
+
+def _prepare_database_lock_path(database_path: Path, *, purpose: str) -> Path:
+    lock_path = database_path.with_name(f"{database_path.name}.{purpose}.lock")
     _assert_no_symlink_components(lock_path)
     _ensure_secure_database_file(lock_path)
     if os.name == "nt":
@@ -1215,18 +1259,22 @@ def _enter_exclusive_operation(
         if state.exclusive_owner == thread_id:
             state.exclusive_depth += 1
             return
-        if (
+        deadline = time.monotonic() + timeout_seconds
+        while (
             state.shared_count > 0
             or state.exclusive_owner is not None
             or state.exclusive_pending
         ):
-            raise TaskDatabaseError(busy_message)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TaskDatabaseError(busy_message)
+            state.condition.wait(min(remaining, _OPERATION_LOCK_RETRY_SECONDS))
         state.exclusive_pending = True
         try:
             held_lock = _acquire_operation_file_lock(
                 lock_path,
                 exclusive=True,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=max(0.0, deadline - time.monotonic()),
                 busy_message=busy_message,
             )
         except BaseException:
@@ -1430,16 +1478,101 @@ def _assert_safe_file(path: Path, *, required: bool) -> None:
         raise TaskDatabaseError("database path could not be checked safely") from error
 
 
-def _ensure_secure_database_file(path: Path) -> None:
+def _create_owner_only_file(path: Path) -> int:
+    if os.name == "nt":
+        return _windows_create_owner_only_file(path)
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    flags |= getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_NOINHERIT", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags, 0o600)
+
+
+def _windows_create_owner_only_file(path: Path) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _, sid = _windows_identity()
+    security_descriptor = wintypes.LPVOID()
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    local_free = kernel32.LocalFree
+    local_free.argtypes = (wintypes.LPVOID,)
+    local_free.restype = wintypes.LPVOID
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.ULONG),
+    )
+    convert.restype = wintypes.BOOL
+    sddl = f"O:{sid}D:P(A;;FA;;;{sid})"
+    if not convert(sddl, 1, ctypes.byref(security_descriptor), None):
+        error_code = ctypes.get_last_error()
+        raise OSError(error_code, "owner-only security descriptor could not be built")
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = (
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", wintypes.LPVOID),
+            ("bInheritHandle", wintypes.BOOL),
+        )
+
+    attributes = SecurityAttributes(
+        ctypes.sizeof(SecurityAttributes),
+        security_descriptor,
+        False,
+    )
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(SecurityAttributes),
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
     try:
-        descriptor = os.open(path, flags, 0o600)
+        handle = create_file(
+            str(path),
+            0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+            0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
+            ctypes.byref(attributes),
+            1,  # CREATE_NEW
+            0x00000080,  # FILE_ATTRIBUTE_NORMAL
+            None,
+        )
+        error_code = ctypes.get_last_error()
+    finally:
+        local_free(security_descriptor)
+
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        if error_code in {80, 183}:  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+            raise FileExistsError(error_code, "file already exists", str(path))
+        raise OSError(error_code, "owner-only file could not be created", str(path))
+    try:
+        return msvcrt.open_osfhandle(
+            int(handle),
+            os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
+        )
+    except OSError:
+        close_handle(handle)
+        raise
+
+
+def _ensure_secure_database_file(path: Path) -> None:
+    try:
+        descriptor = _create_owner_only_file(path)
     except FileExistsError:
         _assert_safe_file(path, required=True)
-        _apply_owner_only_permissions(path)
+        _ensure_owner_only_permissions(path)
         return
     except OSError as error:
         raise TaskDatabaseError(
@@ -1457,7 +1590,7 @@ def _ensure_secure_database_file(path: Path) -> None:
             raise TaskDatabaseError("Task database path changed during creation")
     finally:
         os.close(descriptor)
-    _apply_owner_only_permissions(path)
+    _ensure_owner_only_permissions(path)
 
 
 def _connect_database_file(path: Path, *, mode: str) -> sqlite3.Connection:
@@ -1486,11 +1619,11 @@ def _offline_database_gate(path: Path) -> Iterator[_OfflineRestoreGate]:
         write_gate.execute("PRAGMA busy_timeout = 0")
         try:
             _require_standalone_journal(write_gate, "live Task database")
-            write_gate.execute("BEGIN IMMEDIATE")
             prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
                 write_gate,
                 path,
             )
+            write_gate.execute("BEGIN IMMEDIATE")
         except (sqlite3.Error, TaskDatabaseError) as error:
             _remove_empty_precreated_sidecars(prepared_sidecars)
             raise TaskDatabaseError(_RESTORE_OFFLINE_MESSAGE) from error
@@ -1607,18 +1740,42 @@ def _validate_exact_database(
 
 def _validate_sqlite_sequence(connection: sqlite3.Connection) -> None:
     rows = connection.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
+    names = [str(row[0]) for row in rows]
+    unexpected = set(names) - _AUTOINCREMENT_TABLES
+    if unexpected:
+        raise TaskDatabaseError("Task database has an unexpected sequence table")
+    if len(rows) != len(_AUTOINCREMENT_TABLES) or set(names) != _AUTOINCREMENT_TABLES:
+        raise TaskDatabaseError(
+            "Task database sequence rows must contain each AUTOINCREMENT table once"
+        )
     for raw_name, raw_sequence in rows:
         table_name = str(raw_name)
-        if table_name not in _AUTOINCREMENT_TABLES:
-            raise TaskDatabaseError("Task database has an unexpected sequence table")
         if not isinstance(raw_sequence, int) or raw_sequence < 0:
             raise TaskDatabaseError("Task database sequence value is invalid")
         quoted_table = _quote_sqlite_identifier(table_name)
+        quoted_primary_key = _quote_sqlite_identifier(
+            _AUTOINCREMENT_PRIMARY_KEYS[table_name]
+        )
         maximum = connection.execute(
-            f"SELECT COALESCE(MAX(rowid), 0) FROM {quoted_table}"
+            f"SELECT COALESCE(MAX({quoted_primary_key}), 0) FROM {quoted_table}"
         ).fetchone()
         if maximum is None or raw_sequence < int(maximum[0]):
             raise TaskDatabaseError("Task database sequence is below its row high-water")
+
+
+def _ensure_sqlite_sequence_rows(connection: sqlite3.Connection) -> None:
+    for table_name, primary_key in sorted(_AUTOINCREMENT_PRIMARY_KEYS.items()):
+        quoted_table = _quote_sqlite_identifier(table_name)
+        quoted_primary_key = _quote_sqlite_identifier(primary_key)
+        connection.execute(
+            "INSERT INTO sqlite_sequence(name, seq) "
+            f"SELECT ?, COALESCE((SELECT MAX({quoted_primary_key}) "
+            f"FROM {quoted_table}), 0) "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM sqlite_sequence WHERE name = ?"
+            ")",
+            (table_name, table_name),
+        )
 
 
 def _validate_restore_candidate(
@@ -1660,35 +1817,21 @@ def _assert_owner_only_sqlite_sidecars(database_path: Path) -> None:
     for suffix in _SQLITE_SIDECAR_SUFFIXES:
         sidecar = Path(f"{database_path}{suffix}")
         if sidecar.exists() or sidecar.is_symlink():
-            _wait_for_owner_only_sidecar(sidecar)
+            _assert_owner_only_sidecar(sidecar)
 
 
-def _wait_for_owner_only_sidecar(sidecar: Path) -> None:
+def _assert_owner_only_sidecar(sidecar: Path) -> None:
+    _assert_safe_file(sidecar, required=True)
     try:
-        initial = sidecar.stat()
-    except FileNotFoundError:
-        return
-    deadline = time.monotonic() + 1.0
-    while True:
-        try:
-            current = sidecar.stat()
-        except FileNotFoundError:
-            return
-        if (initial.st_dev, initial.st_ino) != (current.st_dev, current.st_ino):
-            raise TaskDatabaseError(
-                "SQLite sidecar path changed during permission check"
-            )
-        try:
-            _assert_safe_file(sidecar, required=True)
-        except TaskDatabaseError:
-            if not sidecar.exists():
-                return
-            raise
-        if _verify_owner_only_permissions(sidecar):
-            return
-        if time.monotonic() >= deadline:
-            raise TaskDatabaseError("SQLite sidecar permissions are unsafe")
-        time.sleep(_OPERATION_LOCK_RETRY_SECONDS)
+        before = sidecar.stat()
+        owner_only = _verify_owner_only_permissions(sidecar)
+        after = sidecar.stat()
+    except OSError as error:
+        raise TaskDatabaseError("SQLite sidecar permissions are unsafe") from error
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise TaskDatabaseError("SQLite sidecar path changed during permission check")
+    if not owner_only:
+        raise TaskDatabaseError("SQLite sidecar permissions are unsafe")
 
 
 def _secure_existing_sqlite_sidecars(database_path: Path) -> None:
@@ -1697,7 +1840,7 @@ def _secure_existing_sqlite_sidecars(database_path: Path) -> None:
         sidecar = Path(f"{database_path}{suffix}")
         if not sidecar.exists() and not sidecar.is_symlink():
             continue
-        _ensure_owner_only_permissions(sidecar)
+        _assert_owner_only_sidecar(sidecar)
 
 
 def _ensure_owner_only_permissions(path: Path) -> None:
@@ -1723,35 +1866,44 @@ def _prepare_secure_sqlite_write_sidecars(
     journal_mode = str(journal_row[0]).casefold() if journal_row else ""
     suffixes = ("-wal", "-shm") if journal_mode == "wal" else ("-journal",)
     created: list[_PreparedSidecar] = []
-    for suffix in suffixes:
-        sidecar = Path(f"{database_path}{suffix}")
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        flags |= getattr(os, "O_BINARY", 0)
-        flags |= getattr(os, "O_NOINHERIT", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(sidecar, flags, 0o600)
-        except FileExistsError:
-            _ensure_owner_only_permissions(sidecar)
-        except OSError as error:
-            raise TaskDatabaseError(
-                "SQLite sidecar could not be created securely"
-            ) from error
-        else:
+    try:
+        for suffix in suffixes:
+            sidecar = Path(f"{database_path}{suffix}")
             try:
-                descriptor_stat = os.fstat(descriptor)
-                created.append(
-                    _PreparedSidecar(
-                        path=sidecar,
-                        device=descriptor_stat.st_dev,
-                        inode=descriptor_stat.st_ino,
+                descriptor = _create_owner_only_file(sidecar)
+            except FileExistsError:
+                _assert_owner_only_sidecar(sidecar)
+            except OSError as error:
+                raise TaskDatabaseError(
+                    "SQLite sidecar could not be created securely"
+                ) from error
+            else:
+                try:
+                    descriptor_stat = os.fstat(descriptor)
+                    created.append(
+                        _PreparedSidecar(
+                            path=sidecar,
+                            device=descriptor_stat.st_dev,
+                            inode=descriptor_stat.st_ino,
+                        )
                     )
-                )
-            finally:
-                os.close(descriptor)
-            _ensure_owner_only_permissions(sidecar)
-        if not _verify_owner_only_permissions(sidecar):
-            raise TaskDatabaseError("SQLite sidecar permissions are unsafe")
+                finally:
+                    os.close(descriptor)
+                _assert_owner_only_sidecar(sidecar)
+    except BaseException as preparation_error:
+        try:
+            _remove_empty_precreated_sidecars(tuple(created))
+        except BaseException as cleanup_error:
+            combined_error = TaskDatabaseError(
+                "SQLite sidecar preparation failed and cleanup also failed; "
+                f"preparation error: {preparation_error}; "
+                f"cleanup error: {cleanup_error}"
+            )
+            combined_error.add_note(
+                f"Original sidecar preparation failure: {preparation_error!r}"
+            )
+            raise combined_error from cleanup_error
+        raise
     return tuple(created)
 
 
@@ -1902,11 +2054,11 @@ def _publish_existing_database_artifact(
                 raise TaskDatabaseError(
                     "Task database backup destination must be standalone"
                 )
-            target.execute("BEGIN EXCLUSIVE")
             prepared_sidecars = _prepare_secure_sqlite_write_sidecars(
                 target,
                 destination,
             )
+            target.execute("BEGIN EXCLUSIVE")
         except (sqlite3.Error, TaskDatabaseError) as error:
             raise TaskDatabaseError(
                 "Task database backup destination requires offline access"

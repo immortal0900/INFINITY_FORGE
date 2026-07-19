@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -565,6 +565,263 @@ with database.transaction() as connection:
     assert result_path.read_text(encoding="utf-8") == "owner-only"
 
 
+def test_sidecar_prepare_cleans_created_file_when_permission_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    journal = Path(f"{database.database_path}-journal")
+    synced: list[Path] = []
+    real_sync_directory = task_database_module._sync_directory
+    real_assert_sidecar = task_database_module._assert_owner_only_sidecar
+
+    def fail_permission_setup(path: Path) -> None:
+        if path == journal:
+            raise TaskDatabaseError("forced sidecar permission failure")
+        real_assert_sidecar(path)
+
+    def record_sync(directory: Path) -> None:
+        synced.append(directory)
+        real_sync_directory(directory)
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_assert_owner_only_sidecar",
+        fail_permission_setup,
+    )
+    monkeypatch.setattr(task_database_module, "_sync_directory", record_sync)
+
+    with closing(database.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(TaskDatabaseError, match="permission failure"):
+            task_database_module._prepare_secure_sqlite_write_sidecars(
+                connection,
+                database.database_path,
+            )
+        connection.rollback()
+
+    assert not journal.exists()
+    assert database.database_path.parent in synced
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL creation contract")
+def test_windows_sidecar_is_never_observable_with_inherited_acl(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "task-settings.db"
+    ready_path = tmp_path / "creator-ready"
+    done_path = tmp_path / "creator-done"
+    release_path = tmp_path / "creator-release"
+    TaskDatabase(database_path)
+    script = '''
+import time
+import sys
+from pathlib import Path
+
+import forge.ops.task_database as module
+from forge.ops.task_database import TaskDatabase
+
+database_path, ready_path, done_path, release_path = map(Path, sys.argv[1:])
+database = TaskDatabase(database_path)
+connection = database.connect()
+connection.execute("BEGIN IMMEDIATE")
+real_assert = module._assert_owner_only_sidecar
+
+def delayed_assert(path):
+    if str(path).endswith("-journal"):
+        time.sleep(0.5)
+    real_assert(path)
+
+module._assert_owner_only_sidecar = delayed_assert
+ready_path.write_text("ready", encoding="utf-8")
+prepared = module._prepare_secure_sqlite_write_sidecars(connection, database_path)
+done_path.write_text("done", encoding="utf-8")
+deadline = time.monotonic() + 10
+while not release_path.exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("observer release timed out")
+    time.sleep(0.01)
+connection.rollback()
+connection.close()
+module._remove_empty_precreated_sidecars(prepared)
+'''
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(database_path),
+            str(ready_path),
+            str(done_path),
+            str(release_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_subprocess_environment(),
+    )
+    journal = Path(f"{database_path}-journal")
+    unsafe_observed = False
+    try:
+        deadline = time.monotonic() + 10
+        while not ready_path.exists() and process.poll() is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert ready_path.exists()
+        while not done_path.exists() and process.poll() is None:
+            assert time.monotonic() < deadline
+            if journal.exists() and not task_database_module._verify_owner_only_permissions(
+                journal
+            ):
+                unsafe_observed = True
+                break
+            time.sleep(0.002)
+        assert done_path.exists() or unsafe_observed
+        if journal.exists() and not task_database_module._verify_owner_only_permissions(
+            journal
+        ):
+            unsafe_observed = True
+    finally:
+        release_path.touch()
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, f"{stdout}\n{stderr}"
+    assert not unsafe_observed
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle ownership contract")
+def test_windows_owner_only_file_descriptor_owns_native_handle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "owner-only.db"
+
+    descriptor = task_database_module._create_owner_only_file(path)
+    try:
+        assert os.fstat(descriptor).st_size == 0
+        assert task_database_module._verify_owner_only_permissions(path)
+    finally:
+        os.close(descriptor)
+
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_writers_are_serialized_across_processes_without_an_acl_gap(
+    tmp_path: Path,
+) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    script = '''
+import sys
+import time
+from pathlib import Path
+
+from forge.ops.task_database import TaskDatabase
+
+(
+    database_path,
+    constructed_path,
+    begin_path,
+    attempted_path,
+    entered_path,
+    release_path,
+    done_path,
+) = map(Path, sys.argv[1:8])
+event_id = sys.argv[8]
+database = TaskDatabase(database_path)
+constructed_path.touch()
+deadline = time.monotonic() + 10
+while not begin_path.exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("writer start timed out")
+    time.sleep(0.01)
+attempted_path.touch()
+with database.transaction() as connection:
+    connection.execute(
+        """
+        INSERT INTO surface_events (
+            source_event_id, subject_id, session_id, surface, payload_hash,
+            state, received_at, retention_until
+        ) VALUES (?, 'user-1', 'session-1', 'cli', ?, 'received', 'now', 'later')
+        """,
+        (event_id, ("a" if event_id.startswith("holder") else "b") * 64),
+    )
+    entered_path.touch()
+    while not release_path.exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("writer release timed out")
+        time.sleep(0.01)
+done_path.touch()
+'''
+
+    def start_writer(name: str, event_id: str) -> tuple[subprocess.Popen[str], dict[str, Path]]:
+        markers = {
+            marker: tmp_path / f"{name}-{marker}"
+            for marker in (
+                "constructed",
+                "begin",
+                "attempted",
+                "entered",
+                "release",
+                "done",
+            )
+        }
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(database.database_path),
+                *(str(markers[marker]) for marker in markers),
+                event_id,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_subprocess_environment(),
+        )
+        return process, markers
+
+    holder, holder_markers = start_writer("holder", "holder-event")
+    waiter, waiter_markers = start_writer("waiter", "waiter-event")
+    processes = ((holder, holder_markers), (waiter, waiter_markers))
+    try:
+        deadline = time.monotonic() + 10
+        for process, markers in processes:
+            while not markers["constructed"].exists() and process.poll() is None:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            assert markers["constructed"].exists()
+
+        holder_markers["begin"].touch()
+        while not holder_markers["entered"].exists() and holder.poll() is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        if not holder_markers["entered"].exists():
+            stdout, stderr = holder.communicate(timeout=1)
+            pytest.fail(f"holder exited before entering transaction:\n{stdout}\n{stderr}")
+
+        waiter_markers["release"].touch()
+        waiter_markers["begin"].touch()
+        while not waiter_markers["attempted"].exists() and waiter.poll() is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert waiter_markers["attempted"].exists()
+        time.sleep(0.2)
+        assert waiter.poll() is None
+        assert not waiter_markers["entered"].exists()
+        journal = Path(f"{database.database_path}-journal")
+        assert journal.is_file()
+        assert task_database_module._verify_owner_only_permissions(journal)
+    finally:
+        holder_markers["release"].touch()
+        waiter_markers["release"].touch()
+
+    for process, markers in processes:
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, f"{stdout}\n{stderr}"
+        assert markers["done"].exists()
+    assert _surface_event_ids(database) == ["holder-event", "waiter-event"]
+
+
 def test_backup_restore_is_checked_and_does_not_replace_live_db_on_failure(
     tmp_path: Path,
 ) -> None:
@@ -1054,6 +1311,18 @@ def test_backup_rejects_unexpected_sqlite_sequence_entry(tmp_path: Path) -> None
         database.backup(tmp_path / "backup.db")
 
 
+def test_backup_rejects_duplicate_sqlite_sequence_entries(tmp_path: Path) -> None:
+    database = TaskDatabase(tmp_path / "task-settings.db")
+    with database.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('task_events', ?)",
+            ((1000,), (2000,)),
+        )
+
+    with pytest.raises(TaskDatabaseError, match="sequence rows"):
+        database.backup(tmp_path / "backup.db")
+
+
 def test_backup_and_restore_sync_parent_directory_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1281,6 +1550,36 @@ def test_restore_reports_committed_cleanup_failure_with_retained_preimage(
     assert _surface_event_ids(database) == ["archived-event"]
     assert retained
     real_remove(retained[0])
+
+
+def test_restore_reports_committed_gate_teardown_failure_with_preimage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, backup_path = _database_with_different_live_and_backup(tmp_path)
+    real_gate = task_database_module._offline_database_gate
+
+    @contextmanager
+    def fail_after_gate_teardown(path: Path) -> object:
+        with real_gate(path) as gate:
+            yield gate
+        raise TaskDatabaseError("forced restore gate teardown failure")
+
+    monkeypatch.setattr(
+        task_database_module,
+        "_offline_database_gate",
+        fail_after_gate_teardown,
+    )
+
+    with pytest.raises(task_database_module.TaskDatabaseCommittedError) as captured:
+        database.restore(backup_path)
+
+    error = captured.value
+    assert error.committed is True
+    assert error.operation == "restore"
+    assert error.retained_artifact.is_file()
+    assert _surface_event_ids(database) == ["archived-event"]
+    task_database_module._remove_restore_artifact(error.retained_artifact)
 
 
 def test_restore_rejects_a_concurrent_write_before_publish(tmp_path: Path) -> None:
