@@ -92,7 +92,15 @@ GH_BIN="${INFINITY_FORGE_GH_PATH:-/usr/bin/gh}"
 [ -x "$GH_BIN" ] || { echo "[deploy] GitHub command is missing" >&2; exit 1; }
 
 CLAUDE_VERSION="2.1.215"
-CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+CLAUDE_NATIVE_BIN="$HOME/.local/bin/claude"
+resolve_claude_bin() {
+  if [ -x "$CLAUDE_NATIVE_BIN" ]; then
+    printf '%s\n' "$CLAUDE_NATIVE_BIN"
+    return 0
+  fi
+  command -v claude 2>/dev/null || true
+}
+CLAUDE_BIN="$(resolve_claude_bin)"
 CLAUDE_ACTUAL_VERSION=""
 if [ -n "$CLAUDE_BIN" ]; then
   CLAUDE_ACTUAL_VERSION="$("$CLAUDE_BIN" --version 2>/dev/null | awk 'NR == 1 { print $1 }')"
@@ -101,7 +109,7 @@ if [ "$CLAUDE_ACTUAL_VERSION" != "$CLAUDE_VERSION" ]; then
   # RISK(security): execute only the pinned official native installer before any service/config mutation.
   curl -fsSL https://claude.ai/install.sh | bash -s 2.1.215
   hash -r
-  CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+  CLAUDE_BIN="$(resolve_claude_bin)"
   [ -n "$CLAUDE_BIN" ] || { echo "[deploy] Claude Code installation failed" >&2; exit 78; }
   CLAUDE_ACTUAL_VERSION="$("$CLAUDE_BIN" --version 2>/dev/null | awk 'NR == 1 { print $1 }')"
   [ "$CLAUDE_ACTUAL_VERSION" = "$CLAUDE_VERSION" ] || {
