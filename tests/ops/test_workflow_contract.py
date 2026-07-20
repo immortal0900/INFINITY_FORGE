@@ -371,6 +371,38 @@ def test_hermes_change_package_is_version_bound_and_committed_atomically() -> No
     )
 
 
+def test_server_deploy_upgrades_an_installed_hermes_change_transactionally() -> None:
+    deploy = DEPLOY.read_text(encoding="utf-8")
+
+    assert 'PREVIOUS_CHANGE_PACKAGE=""' in deploy
+    assert 'PREVIOUS_PACKAGE_RESTORED=false' in deploy
+    assert 'find_previous_change_package()' in deploy
+    assert 'common_paths = candidate_before.keys() & requested_before.keys()' in deploy
+    assert 'candidate_before[path] != requested_before[path]' in deploy
+    assert 'requested_before.keys() - candidate_before.keys()' in deploy
+    assert 'current_hash != expected_hash' in deploy
+    assert '--package "$CANDIDATE" >/dev/null 2>&1' in deploy
+    previous_restore = deploy.index(
+        '--hermes-root "$HERMES_ROOT" --package "$PREVIOUS_CHANGE_PACKAGE"'
+    )
+    requested_install = deploy.index(
+        '--hermes-root "$HERMES_ROOT" --package "$CHANGE_PACKAGE"',
+        previous_restore,
+    )
+    assert previous_restore < requested_install
+
+    rollback_start = deploy.index("restore_runtime_after_error()")
+    rollback_end = deploy.index("trap restore_runtime_after_error EXIT")
+    rollback = deploy[rollback_start:rollback_end]
+    requested_restore = rollback.index(
+        '--hermes-root "$HERMES_ROOT" --package "$CHANGE_PACKAGE"'
+    )
+    previous_reinstall = rollback.index(
+        '--hermes-root "$HERMES_ROOT" --package "$PREVIOUS_CHANGE_PACKAGE"'
+    )
+    assert requested_restore < previous_reinstall
+
+
 def test_local_deploy_pushes_without_staging_and_checks_both_servers() -> None:
     deploy = LOCAL_DEPLOY.read_text(encoding="utf-8")
 
