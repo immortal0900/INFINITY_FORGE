@@ -439,6 +439,48 @@ def test_runtime_switch_capture_observes_one_migration_and_restores_adapter():
     assert migration_module.migrate is migration
 
 
+def test_runtime_switch_capture_excludes_existing_codex_mcp_collisions_only_from_migration():
+    migrated_configs: list[dict] = []
+    persisted_configs: list[dict] = []
+    report = SimpleNamespace(written=True, migrated=["new-server", "hermes-tools"])
+
+    def migration(config):
+        migrated_configs.append(config)
+        return report
+
+    migration_module = SimpleNamespace(migrate=migration)
+
+    def helper(config, value, *, persist_callback):
+        config.setdefault("model", {})["openai_runtime"] = value
+        persist_callback(config)
+        migration_module.migrate(config)
+        return SimpleNamespace(success=True)
+
+    config = {
+        "mcp_servers": {
+            "existing-server": {"command": "windows-only"},
+            "new-server": {"url": "https://mcp.invalid"},
+        }
+    }
+    outcome = subscription_setup._apply_runtime_switch_with_captured_migration(
+        config,
+        "codex_app_server",
+        persist_callback=lambda updated: persisted_configs.append(updated.copy()),
+        runtime_switch_apply=helper,
+        migration_module=migration_module,
+        migration_excluded_mcp_names=frozenset({"existing-server"}),
+    )
+
+    assert outcome.migration_report is report
+    assert set(persisted_configs[0]["mcp_servers"]) == {
+        "existing-server",
+        "new-server",
+    }
+    assert set(migrated_configs[0]["mcp_servers"]) == {"new-server"}
+    assert set(config["mcp_servers"]) == {"existing-server", "new-server"}
+    assert migration_module.migrate is migration
+
+
 def test_runtime_switch_capture_restores_adapter_on_system_exit():
     def migration(config):
         return SimpleNamespace(written=True)

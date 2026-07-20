@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -70,6 +71,7 @@ def _apply_runtime_switch_with_captured_migration(
     persist_callback: Callable[[dict[str, Any]], None],
     runtime_switch_apply: Callable[..., object],
     migration_module: object,
+    migration_excluded_mcp_names: frozenset[str] = frozenset(),
 ) -> _RuntimeSwitchOutcome:
     # The Hermes helper imports migrate inside apply(). Serialize and always restore
     # the temporary observer so one helper-owned plugin discovery is authoritative.
@@ -79,7 +81,22 @@ def _apply_runtime_switch_with_captured_migration(
         owner_thread = threading.get_ident()
 
         def observe_migration(*args: object, **kwargs: object) -> object:
-            report = original_migrate(*args, **kwargs)
+            migration_args = args
+            if (
+                migration_excluded_mcp_names
+                and args
+                and isinstance(args[0], dict)
+            ):
+                migration_config = copy.deepcopy(args[0])
+                servers = migration_config.get("mcp_servers")
+                if isinstance(servers, dict):
+                    migration_config["mcp_servers"] = {
+                        name: server
+                        for name, server in servers.items()
+                        if name not in migration_excluded_mcp_names
+                    }
+                migration_args = (migration_config, *args[1:])
+            report = original_migrate(*migration_args, **kwargs)
             if threading.get_ident() == owner_thread:
                 reports.append(report)
             return report
@@ -104,6 +121,7 @@ def _default_runtime_switch_apply(
     value: str,
     *,
     persist_callback: Callable[[dict[str, Any]], None],
+    migration_excluded_mcp_names: frozenset[str] = frozenset(),
 ) -> object:
     from hermes_cli import codex_runtime_plugin_migration
     from hermes_cli.codex_runtime_switch import apply
@@ -114,6 +132,7 @@ def _default_runtime_switch_apply(
         persist_callback=persist_callback,
         runtime_switch_apply=apply,
         migration_module=codex_runtime_plugin_migration,
+        migration_excluded_mcp_names=migration_excluded_mcp_names,
     )
 
 
@@ -222,6 +241,11 @@ class SubscriptionRuntimeSetup:
             transaction = self._capture_snapshots(paths)
             self._ensure_baseline(transaction)
             config = self._load_hermes_config()
+            migration_excluded_mcp_names = frozenset()
+            if self._uses_default_switch:
+                migration_excluded_mcp_names = frozenset(
+                    self._codex_mcp_names() & _expected_mcp_names(config)
+                )
             persist_failed = False
 
             def persist_safely(updated: dict[str, Any]) -> None:
@@ -233,11 +257,19 @@ class SubscriptionRuntimeSetup:
                     # The installed helper logs callback exceptions with details.
                     persist_failed = True
 
-            switch_outcome = self._runtime_switch_apply(
-                config,
-                _RUNTIME,
-                persist_callback=persist_safely,
-            )
+            if self._uses_default_switch:
+                switch_outcome = self._runtime_switch_apply(
+                    config,
+                    _RUNTIME,
+                    persist_callback=persist_safely,
+                    migration_excluded_mcp_names=migration_excluded_mcp_names,
+                )
+            else:
+                switch_outcome = self._runtime_switch_apply(
+                    config,
+                    _RUNTIME,
+                    persist_callback=persist_safely,
+                )
             if self._uses_default_switch:
                 if not isinstance(switch_outcome, _RuntimeSwitchOutcome):
                     raise RuntimeError("runtime switch adapter rejected")
@@ -260,12 +292,15 @@ class SubscriptionRuntimeSetup:
                 )
             self._assert_managed_paths_safe()
             migrated = getattr(migration, "migrated", None)
+            required_migrated = (
+                expected_mcp - migration_excluded_mcp_names
+            ) | {_CLAUDE_SERVER}
             if (
                 getattr(migration, "written", False) is not True
                 or getattr(migration, "plugin_query_error", None) is not None
                 or not isinstance(migrated, (list, tuple, set))
                 or not all(isinstance(name, str) for name in migrated)
-                or not expected_mcp | {_CLAUDE_SERVER} <= set(migrated)
+                or not required_migrated <= set(migrated)
             ):
                 raise RuntimeError("MCP migration rejected")
             if not expected_mcp | {_CLAUDE_SERVER} <= self._codex_mcp_names():
