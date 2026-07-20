@@ -375,13 +375,23 @@ def test_server_deploy_upgrades_an_installed_hermes_change_transactionally() -> 
     deploy = DEPLOY.read_text(encoding="utf-8")
 
     assert 'PREVIOUS_CHANGE_PACKAGE=""' in deploy
+    assert 'PREVIOUS_CHANGE_INSTALLER=""' in deploy
     assert 'PREVIOUS_PACKAGE_RESTORED=false' in deploy
     assert 'find_previous_change_package()' in deploy
+    assert 'CANDIDATE_COMMIT="${CANDIDATE_NAME%%-*}"' in deploy
+    assert 'CANDIDATE_INSTALLER="$FORGE_RELEASE_ROOT/$CANDIDATE_COMMIT/forge/scripts/install-hermes-change.py"' in deploy
+    assert 'verify_candidate_change_package()' in deploy
+    assert 'from forge.hermes_change.installer import _read_manifest' in deploy
+    assert '_validate_all_package_files(package, manifest)' in deploy
+    assert '_verify_target_hashes(hermes_root, manifest, "after_file_hash")' in deploy
     assert 'common_paths = candidate_before.keys() & requested_before.keys()' in deploy
     assert 'candidate_before[path] != requested_before[path]' in deploy
     assert 'requested_before.keys() - candidate_before.keys()' in deploy
     assert 'current_hash != expected_hash' in deploy
-    assert '--package "$CANDIDATE" >/dev/null 2>&1' in deploy
+    assert (
+        'verify_candidate_change_package "$CANDIDATE_RELEASE" "$CANDIDATE" '
+        '>/dev/null 2>&1'
+    ) in deploy
     previous_restore = deploy.index(
         '--hermes-root "$HERMES_ROOT" --package "$PREVIOUS_CHANGE_PACKAGE"'
     )
@@ -398,7 +408,7 @@ def test_server_deploy_upgrades_an_installed_hermes_change_transactionally() -> 
         '--hermes-root "$HERMES_ROOT" --package "$CHANGE_PACKAGE"'
     )
     previous_reinstall = rollback.index(
-        '--hermes-root "$HERMES_ROOT" --package "$PREVIOUS_CHANGE_PACKAGE"'
+        '"$HERMES_PY" "$PREVIOUS_CHANGE_INSTALLER" install'
     )
     assert requested_restore < previous_reinstall
 
