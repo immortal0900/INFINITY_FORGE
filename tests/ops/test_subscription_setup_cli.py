@@ -94,6 +94,36 @@ def test_cli_readiness_failure_returns_78(monkeypatch, tmp_path: Path, capsys):
     assert json.loads(capsys.readouterr().out)["error"] == "preflight failed"
 
 
+def test_cli_passes_explicit_claude_binary_to_subscription_setup(
+    monkeypatch, tmp_path: Path, capsys
+):
+    captured: dict[str, object] = {}
+
+    class CapturingSetup(FakeSetup):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(subscription_setup, "SubscriptionRuntimeSetup", CapturingSetup)
+    claude_bin = tmp_path / "bin" / "claude"
+
+    assert (
+        subscription_setup.main(
+            [
+                "verify",
+                "--forge-root",
+                str(tmp_path),
+                "--hermes-root",
+                str(tmp_path / "hermes"),
+                "--claude-bin",
+                str(claude_bin),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert captured["claude_bin"] == str(claude_bin)
+
+
 def test_cli_unexpected_adapter_error_is_generic_and_has_no_traceback(
     monkeypatch, tmp_path: Path, capsys
 ):

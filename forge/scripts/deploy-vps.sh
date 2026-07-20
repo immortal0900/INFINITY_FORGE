@@ -997,8 +997,10 @@ UNIT
 backup_managed_path "$HOME/.hermes/config.yaml"
 backup_managed_path "$HOME/.codex/config.toml"
 backup_managed_path "$TASK_DATA_DIR/subscription-runtime"
-"$HERMES_PY" "$CONFIGURE_SCRIPT" apply --forge-root "$REPO_DIR" --hermes-root "$HOME/.hermes"
-"$HERMES_PY" "$CONFIGURE_SCRIPT" verify --forge-root "$REPO_DIR" --hermes-root "$HOME/.hermes"
+"$HERMES_PY" "$CONFIGURE_SCRIPT" apply --forge-root "$REPO_DIR" \
+  --hermes-root "$HOME/.hermes" --claude-bin "$CLAUDE_BIN"
+"$HERMES_PY" "$CONFIGURE_SCRIPT" verify --forge-root "$REPO_DIR" \
+  --hermes-root "$HOME/.hermes" --claude-bin "$CLAUDE_BIN"
 systemctl --user daemon-reload
 cleanup_deploy_temporaries
 systemctl --user restart hermes-gateway

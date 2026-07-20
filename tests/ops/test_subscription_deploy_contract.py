@@ -99,6 +99,7 @@ def test_linux_applies_and_verifies_before_restart_and_rolls_back_on_failure() -
     restart = deploy.index("systemctl --user restart hermes-gateway")
 
     assert apply < verify < restart
+    assert deploy.count('--claude-bin "$CLAUDE_BIN"') == 2
     for path in (
         '"$HOME/.hermes/config.yaml"',
         '"$HOME/.codex/config.toml"',

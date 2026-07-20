@@ -843,6 +843,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("apply", "verify", "rollback"))
     parser.add_argument("--forge-root", type=Path)
     parser.add_argument("--hermes-root", type=Path, required=True)
+    parser.add_argument("--claude-bin", default="claude")
     try:
         args = parser.parse_args(argv)
         if args.command != "rollback" and args.forge_root is None:
@@ -854,6 +855,7 @@ def main(argv: list[str] | None = None) -> int:
         setup = SubscriptionRuntimeSetup(
             forge_root=args.forge_root or Path.cwd(),
             hermes_root=args.hermes_root,
+            claude_bin=args.claude_bin,
         )
         result = getattr(setup, args.command)()
         print(json.dumps(_result_payload(result), sort_keys=True))
