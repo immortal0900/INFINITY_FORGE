@@ -269,6 +269,7 @@ restore_plugin_state() {
 
 PACKAGE_CHANGED=false
 PREVIOUS_CHANGE_PACKAGE=""
+PREVIOUS_CHANGE_INSTALLER=""
 PREVIOUS_PACKAGE_RESTORED=false
 CONFIGURE_APPLIED=false
 DEPLOY_BACKUP="$(mktemp -d "$TASK_DATA_DIR/.subscription-deploy-backup.XXXXXX")"
@@ -289,14 +290,44 @@ backup_managed_path() {
   fi
 }
 
+verify_candidate_change_package() {
+  CANDIDATE_RELEASE="$1"
+  CANDIDATE_PACKAGE="$2"
+  (
+    cd "$CANDIDATE_RELEASE"
+    CANDIDATE_PACKAGE="$CANDIDATE_PACKAGE" HERMES_CHECKOUT="$HERMES_ROOT" \
+      "$HERMES_PY" - <<'PY'
+import os
+from pathlib import Path
+
+from forge.hermes_change.installer import _read_change_state
+from forge.hermes_change.installer import _read_manifest
+from forge.hermes_change.installer import _validate_all_package_files
+from forge.hermes_change.installer import _verify_target_hashes
+
+hermes_root = Path(os.environ["HERMES_CHECKOUT"]).resolve()
+package = Path(os.environ["CANDIDATE_PACKAGE"]).resolve()
+manifest = _read_manifest(package)
+if _read_change_state(hermes_root, manifest) is not None:
+    raise RuntimeError("installed Hermes package has an unfinished operation")
+_validate_all_package_files(package, manifest)
+_verify_target_hashes(hermes_root, manifest, "after_file_hash")
+PY
+  )
+}
+
 find_previous_change_package() {
   PREVIOUS_CHANGE_PACKAGE=""
+  PREVIOUS_CHANGE_INSTALLER=""
   while IFS= read -r -d '' CANDIDATE; do
     [ "$CANDIDATE" != "$CHANGE_PACKAGE" ] || continue
     CANDIDATE_NAME="$(basename -- "$CANDIDATE")"
     [[ "$CANDIDATE_NAME" =~ ^[0-9a-f]{40}-${HERMES_SOURCE_VERSION}$ ]] || continue
-    "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" verify \
-      --hermes-root "$HERMES_ROOT" --package "$CANDIDATE" >/dev/null 2>&1 || continue
+    CANDIDATE_COMMIT="${CANDIDATE_NAME%%-*}"
+    CANDIDATE_RELEASE="$FORGE_RELEASE_ROOT/$CANDIDATE_COMMIT"
+    CANDIDATE_INSTALLER="$FORGE_RELEASE_ROOT/$CANDIDATE_COMMIT/forge/scripts/install-hermes-change.py"
+    [ -f "$CANDIDATE_INSTALLER" ] && [ ! -L "$CANDIDATE_INSTALLER" ] || continue
+    verify_candidate_change_package "$CANDIDATE_RELEASE" "$CANDIDATE" >/dev/null 2>&1 || continue
     if ! CANDIDATE_PACKAGE="$CANDIDATE" REQUESTED_PACKAGE="$CHANGE_PACKAGE" \
       HERMES_CHECKOUT="$HERMES_ROOT" \
       "$HERMES_PY" - <<'PY'
@@ -335,6 +366,7 @@ PY
       continue
     fi
     PREVIOUS_CHANGE_PACKAGE="$CANDIDATE"
+    PREVIOUS_CHANGE_INSTALLER="$CANDIDATE_INSTALLER"
     return 0
   done < <(find "$CHANGE_PACKAGE_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
   return 1
@@ -415,7 +447,7 @@ restore_runtime_after_error() {
         --hermes-root "$HERMES_ROOT" --package "$CHANGE_PACKAGE" >/dev/null 2>&1 || PACKAGE_ROLLBACK_FAILED=true
     fi
     if [ "$PREVIOUS_PACKAGE_RESTORED" = true ] && [ -n "$PREVIOUS_CHANGE_PACKAGE" ]; then
-      "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" install \
+      "$HERMES_PY" "$PREVIOUS_CHANGE_INSTALLER" install \
         --hermes-root "$HERMES_ROOT" --package "$PREVIOUS_CHANGE_PACKAGE" >/dev/null 2>&1 || PACKAGE_ROLLBACK_FAILED=true
     fi
     if [ "$PACKAGE_ROLLBACK_FAILED" = true ]; then
@@ -549,7 +581,7 @@ if ! "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" verify \
   --hermes-root "$HERMES_ROOT" --package "$CHANGE_PACKAGE" >/dev/null 2>&1; then
   if find_previous_change_package; then
     echo "[deploy] restoring the installed Hermes change before upgrade"
-    "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" restore \
+    "$HERMES_PY" "$PREVIOUS_CHANGE_INSTALLER" restore \
       --hermes-root "$HERMES_ROOT" --package "$PREVIOUS_CHANGE_PACKAGE"
     PREVIOUS_PACKAGE_RESTORED=true
   fi
