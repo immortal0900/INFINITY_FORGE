@@ -279,7 +279,6 @@ PACKAGE_CHANGED=false
 PREVIOUS_CHANGE_PACKAGE=""
 PREVIOUS_CHANGE_INSTALLER=""
 PREVIOUS_PACKAGE_RESTORED=false
-CONFIGURE_APPLIED=false
 DEPLOY_BACKUP="$(mktemp -d "$TASK_DATA_DIR/.subscription-deploy-backup.XXXXXX")"
 BACKUP_DESTINATIONS=()
 BACKUP_PATHS=()
@@ -429,9 +428,6 @@ restore_runtime_after_error() {
       systemctl --user stop "forge-$T.timer" >/dev/null 2>&1 || true
       systemctl --user stop "forge-$T.service" >/dev/null 2>&1 || true
     done
-    if [ "$CONFIGURE_APPLIED" = true ]; then
-      "$HERMES_PY" "$CONFIGURE_SCRIPT" rollback --hermes-root "$HOME/.hermes" >/dev/null 2>&1 || true
-    fi
     for ((I=${#PROFILE_LINK_DESTINATIONS[@]}-1; I>=0; I--)); do
       DST="${PROFILE_LINK_DESTINATIONS[$I]}"
       BACKUP="${PROFILE_LINK_BACKUPS[$I]}"
@@ -998,7 +994,9 @@ Environment="INFINITY_FORGE_CLAUDE_MCP_CONFIG=$CLAUDE_MCP_CONFIG"
 Environment="INFINITY_FORGE_REPO=$REPO_DIR"
 UNIT
 
-CONFIGURE_APPLIED=true
+backup_managed_path "$HOME/.hermes/config.yaml"
+backup_managed_path "$HOME/.codex/config.toml"
+backup_managed_path "$TASK_DATA_DIR/subscription-runtime"
 "$HERMES_PY" "$CONFIGURE_SCRIPT" apply --forge-root "$REPO_DIR" --hermes-root "$HOME/.hermes"
 "$HERMES_PY" "$CONFIGURE_SCRIPT" verify --forge-root "$REPO_DIR" --hermes-root "$HOME/.hermes"
 systemctl --user daemon-reload

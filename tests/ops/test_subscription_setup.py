@@ -481,6 +481,31 @@ def test_runtime_switch_capture_excludes_existing_codex_mcp_collisions_only_from
     assert migration_module.migrate is migration
 
 
+def test_unmanaged_codex_mcp_names_excludes_the_hermes_managed_block(
+    tmp_path: Path,
+):
+    setup, _, codex_config = make_setup(tmp_path)
+    codex_config.write_text(
+        """[mcp_servers.serena]
+command = "serena"
+[mcp_servers.playwright]
+command = "playwright"
+[mcp_servers.playwright.env]
+MODE = "safe"
+
+# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section
+[mcp_servers.memex]
+url = "https://memex.invalid"
+[mcp_servers.hermes-tools]
+command = "python"
+# end hermes-agent managed section
+""",
+        encoding="utf-8",
+    )
+
+    assert setup._unmanaged_codex_mcp_names() == {"playwright", "serena"}
+
+
 def test_runtime_switch_capture_restores_adapter_on_system_exit():
     def migration(config):
         return SimpleNamespace(written=True)
