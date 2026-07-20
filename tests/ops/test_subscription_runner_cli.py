@@ -167,6 +167,8 @@ def test_default_kanban_uses_exact_show_and_block_argv(
 ) -> None:
     executable = tmp_path / "hermes.exe"
     executable.touch()
+    if os.name != "nt":
+        executable.chmod(0o755)
     calls: list[tuple[list[str], dict[str, object]]] = []
     parent_env = {"INFINITY_FORGE_HERMES_BIN": str(executable), "PYTHONUTF8": "0"}
 
@@ -568,6 +570,8 @@ def test_default_kanban_rejects_malformed_unicode_json(
 ) -> None:
     executable = tmp_path / "hermes.exe"
     executable.touch()
+    if os.name != "nt":
+        executable.chmod(0o755)
     monkeypatch.setattr(
         subscription_runner.subprocess,
         "run",

@@ -166,7 +166,7 @@ def test_worker_falls_back_once_only_after_confirmed_quota() -> None:
     outcome = make_runner(process, probe).run_worker(worker_request())
 
     assert [Path(call["argv"][0]).name for call in process.calls] == [
-        Path(sys.executable).name,
+        Path(sys.executable).resolve().name,
         "claude",
     ]
     assert outcome.returncode == 0

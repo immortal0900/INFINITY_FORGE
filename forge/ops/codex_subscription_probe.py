@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import platform
 import shutil
@@ -138,7 +139,7 @@ def _resolve_codex_bin(codex_bin: str) -> str:
     suffix = codex_bin.lower()
     if suffix.endswith((".cmd", ".bat", ".ps1")):
         raise ProbeError("Codex App Server requires a native .exe executable on Windows")
-    if os.path.isabs(codex_bin):
+    if ntpath.isabs(codex_bin):
         if suffix.endswith(".exe"):
             return codex_bin
         raise ProbeError("Codex App Server requires a native .exe executable on Windows")
@@ -148,7 +149,7 @@ def _resolve_codex_bin(codex_bin: str) -> str:
     if (
         native_executable is None
         or not native_executable.lower().endswith(".exe")
-        or not os.path.isabs(native_executable)
+        or not ntpath.isabs(native_executable)
     ):
         raise ProbeError("Codex App Server requires a native .exe executable on Windows")
     if "\\windowsapps\\" in native_executable.replace("/", "\\").lower():

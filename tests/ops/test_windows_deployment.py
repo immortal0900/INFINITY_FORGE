@@ -184,7 +184,7 @@ def test_windows_hermes_package_uses_live_runtime_snapshot() -> None:
     )
     targets = json.loads(target_manifest.read_text(encoding="utf-8"))
 
-    assert len(targets) == 19
+    assert len(targets) == 24
     assert len(targets) == len(set(targets))
     assert "$HermesChangeTargets = @(" not in script
     assert '"$Commit`:forge/hermes_change/targets.json"' in script

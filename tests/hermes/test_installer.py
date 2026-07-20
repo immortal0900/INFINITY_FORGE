@@ -1811,7 +1811,8 @@ def test_kanban_transform_rejects_invalid_original_hermes_before_spawn(
         )
     else:
         non_native = (
-            tmp_path / ("hermes.ps1" if os.name == "nt" else "hermes")
+            tmp_path
+            / ("original-hermes.ps1" if os.name == "nt" else "original-hermes")
         ).resolve()
         non_native.write_bytes(b"not native")
         if os.name != "nt":
@@ -2466,6 +2467,14 @@ def test_desktop_outbox_serializes_renderer_read_modify_write(
                 "    renameSync(temporary, workerData.storage)",
                 "  }",
                 "}",
+                "const lockGate = new Int32Array(workerData.lockGate)",
+                "Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { locks: {",
+                "  async request(name, _options, action) {",
+                "    while (Atomics.compareExchange(lockGate, 0, 0, 1) !== 0) Atomics.wait(lockGate, 0, 1)",
+                "    try { return await action({ name }) }",
+                "    finally { Atomics.store(lockGate, 0, 0); Atomics.notify(lockGate, 0, 1) }",
+                "  }",
+                "} } })",
                 "globalThis.withSessionBusyRetry = async action => action()",
                 "globalThis.PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1000",
                 "globalThis.selectedStoredSessionIdRef = { current: null }",
@@ -2486,8 +2495,9 @@ def test_desktop_outbox_serializes_renderer_read_modify_write(
             (
                 "import { Worker } from 'node:worker_threads'",
                 "const gate = new SharedArrayBuffer(4)",
+                "const lockGate = new SharedArrayBuffer(4)",
                 "const run = (payload, index) => new Promise((resolve, reject) => {",
-                f"  const worker = new Worker(new URL({json.dumps(worker_path.as_uri())}), {{ workerData: {{ gate, index, payload, storage: {json.dumps(str(storage_path))} }} }})",
+                f"  const worker = new Worker(new URL({json.dumps(worker_path.as_uri())}), {{ workerData: {{ gate, lockGate, index, payload, storage: {json.dumps(str(storage_path))} }} }})",
                 "  let id = ''",
                 "  worker.on('message', value => { id = value })",
                 "  worker.on('error', reject)",

@@ -1118,7 +1118,6 @@ class _FailingJobQueryKernel(_FakeJobQueryKernel):
             buffer_length,
             return_length,
         )
-        ctypes.set_last_error(5)
         return False
 
 
@@ -1144,7 +1143,10 @@ def test_windows_job_query_retries_when_listed_is_less_than_assigned() -> None:
     assert kernel.query_count >= 3
 
 
-def test_windows_job_query_does_not_mask_non_buffer_api_failure() -> None:
+def test_windows_job_query_does_not_mask_non_buffer_api_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
     kernel = _FailingJobQueryKernel([(3, (101, 102))])
 
     with pytest.raises(OSError, match="QueryInformationJobObject"):
