@@ -32,6 +32,10 @@ def test_linux_installs_exact_claude_and_authenticates_before_runtime_mutation()
     first_stop = deploy.index('systemctl --user stop "forge-$T.timer"')
 
     assert 'CLAUDE_VERSION="2.1.215"' in deploy
+    assert 'CLAUDE_NATIVE_BIN="$HOME/.local/bin/claude"' in deploy
+    assert 'if [ -x "$CLAUDE_NATIVE_BIN" ]; then' in deploy
+    assert 'printf \'%s\\n\' "$CLAUDE_NATIVE_BIN"' in deploy
+    assert deploy.count('CLAUDE_BIN="$(resolve_claude_bin)"') == 2
     assert installer in deploy
     assert auth_probe in deploy
     assert deploy.index(installer) < first_stop
