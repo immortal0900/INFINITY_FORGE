@@ -2900,19 +2900,47 @@ def change_tui_submission_source(source: str) -> str:
         "deps.gw.request<PromptSubmitResponse>('prompt.submit', "
         "{ session_id: liveSid, text: submitText }).catch((e: Error) => {"
     )
-    source = _insert_before_unique_line(
-        source,
-        request_line,
-        (
-            "const sourceEventSessionId = readSourceEventSessionId()",
-            "const sourceEvent = sourceEventSessionId ? prepareSourceEvent(sourceEventSessionId, submitText) : null",
-        ),
-        label="TUI durable source event preparation",
+    chained_request_line = (
+        ".request<PromptSubmitResponse>('prompt.submit', "
+        "{ session_id: liveSid, text: submitText })"
     )
-    return _replace_unique_line(
+    chained_catch_line = ".catch((e: Error) => {"
+    chained_sequence = ("deps.gw", chained_request_line, chained_catch_line)
+    stripped = [line.strip() for line in source.splitlines()]
+    single_matches = stripped.count(request_line)
+    chained_matches = sum(
+        tuple(stripped[index : index + len(chained_sequence)]) == chained_sequence
+        for index in range(len(stripped) - len(chained_sequence) + 1)
+    )
+    if single_matches + chained_matches != 1:
+        raise InstallError("TUI durable source event preparation anchor is not unique")
+
+    additions = (
+        "const sourceEventSessionId = readSourceEventSessionId()",
+        "const sourceEvent = sourceEventSessionId ? prepareSourceEvent(sourceEventSessionId, submitText) : null",
+    )
+    submitted_request = (
+        ".request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, "
+        "text: submitText, ...(sourceEvent ? { source_event_id: sourceEvent.id } : {}) })"
+    )
+    if single_matches == 1:
+        source = _insert_before_unique_line(
+            source,
+            request_line,
+            additions,
+            label="TUI durable source event preparation",
+        )
+        return _replace_unique_line(
+            source,
+            request_line,
+            f"deps.gw{submitted_request}.catch((e: Error) => {{",
+            label="TUI source event submission",
+        )
+
+    return _replace_unique_sequence(
         source,
-        request_line,
-        "deps.gw.request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText, ...(sourceEvent ? { source_event_id: sourceEvent.id } : {}) }).catch((e: Error) => {",
+        chained_sequence,
+        (*additions, "deps.gw", f"  {submitted_request}", f"  {chained_catch_line}"),
         label="TUI source event submission",
     )
 

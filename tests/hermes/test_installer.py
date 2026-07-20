@@ -2565,6 +2565,23 @@ def test_client_source_transforms_preserve_crlf_files() -> None:
     assert "\n" not in changed_desktop.replace("\r\n", "")
 
 
+def test_tui_submission_transform_supports_chained_gateway_request() -> None:
+    chained_source = TUI_SUBMISSION_SOURCE.replace(
+        "    deps.gw.request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText }).catch((e: Error) => {",
+        "    deps.gw\n"
+        "      .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })\n"
+        "      .catch((e: Error) => {",
+    )
+
+    changed = installer.change_tui_submission_source(chained_source)
+
+    assert changed.index("const sourceEventSessionId") < changed.index("    deps.gw\n")
+    assert (
+        ".request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, "
+        "text: submitText, ...(sourceEvent ? { source_event_id: sourceEvent.id } : {}) })"
+    ) in changed
+
+
 def test_tui_persists_server_durable_session_key_for_outbox_lookup() -> None:
     changed_types = installer.change_tui_gateway_types_source(
         TUI_GATEWAY_TYPES_SOURCE
