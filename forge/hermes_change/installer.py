@@ -3212,6 +3212,8 @@ export function choiceRequestFromPayload(payload: GatewayEventPayload | undefine
             "export const setChoiceRequest = choice.set",
             "export const clearChoiceRequest = choice.clear",
             "export const resetChoiceRequests = choice.reset",
+            "export const sessionChoiceRequest = (sessionId: string | null) =>",
+            "  computed(choice.$all, all => all[keyFor(sessionId)] ?? null)",
             "",
         ),
         label="Desktop chooser store exports",
@@ -3244,8 +3246,26 @@ export function choiceRequestFromPayload(payload: GatewayEventPayload | undefine
         ),
         label="Desktop chooser awaiting input",
     )
+    if "export function sessionAwaitingInput(sessionId: string | null)" in source:
+        source = _replace_unique_sequence(
+            source,
+            (
+                "return computed([$clarifyRequests, approval.$all, sudo.$all, secret.$all], (clarify, approvals, sudos, secrets) => {",
+                "const key = keyFor(sessionId)",
+                "",
+                "return Boolean(clarify[key] || approvals[key] || sudos[key] || secrets[key])",
+            ),
+            (
+                "return computed([$clarifyRequests, approval.$all, sudo.$all, secret.$all, choice.$all], (clarify, approvals, sudos, secrets, choices) => {",
+                "const key = keyFor(sessionId)",
+                "",
+                "return Boolean(clarify[key] || approvals[key] || sudos[key] || secrets[key] || choices[key])",
+            ),
+            label="Desktop chooser session awaiting input",
+        )
     for expected, label in (
         (identity_postcondition, "Desktop chooser stale clear identity"),
+        ("export const sessionChoiceRequest", "Desktop chooser session store export"),
         ("choice.reset()", "Desktop chooser global clear"),
         ("choice.clear(sessionId)", "Desktop chooser session clear"),
     ):
@@ -3291,18 +3311,33 @@ def change_desktop_gateway_event_source(source: str) -> str:
 
 
 def change_desktop_prompt_overlays_source(source: str) -> str:
-    import_line = "import { type FormEvent, useCallback, useEffect, useState } from 'react'"
-    if source.count(import_line) != 1:
-        raise InstallError("Desktop chooser React import anchor is not unique")
-    source = source.replace(
-        import_line,
-        "import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react'",
+    react_imports = (
+        (
+            "import { type FormEvent, useCallback, useEffect, useState } from 'react'",
+            "import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react'",
+        ),
+        (
+            "import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react'",
+            "import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'",
+        ),
     )
-    old = "import { $secretRequest, $sudoRequest, clearSecretRequest, clearSudoRequest } from '@/store/prompts'"
-    new = "import { $choiceRequest, $secretRequest, $sudoRequest, clearChoiceRequest, clearSecretRequest, clearSudoRequest, type ChoiceRequest } from '@/store/prompts'"
-    if source.count(old) != 1:
+    matching_react_imports = [(old, new) for old, new in react_imports if source.count(old) == 1]
+    if len(matching_react_imports) != 1 or sum(source.count(old) for old, _ in react_imports) != 1:
+        raise InstallError("Desktop chooser React import anchor is not unique")
+    source = source.replace(*matching_react_imports[0])
+
+    legacy_store_import = "import { $secretRequest, $sudoRequest, clearSecretRequest, clearSudoRequest } from '@/store/prompts'"
+    session_store_import = "import { clearSecretRequest, clearSudoRequest, sessionSecretRequest, sessionSudoRequest } from '@/store/prompts'"
+    session_scoped = source.count(session_store_import) == 1
+    if sum(source.count(value) for value in (legacy_store_import, session_store_import)) != 1:
         raise InstallError("Desktop chooser prompt store import anchor is not unique")
-    source = source.replace(old, new)
+    store_import = session_store_import if session_scoped else legacy_store_import
+    new_store_import = (
+        "import { clearChoiceRequest, clearSecretRequest, clearSudoRequest, sessionChoiceRequest, sessionSecretRequest, sessionSudoRequest, type ChoiceRequest } from '@/store/prompts'"
+        if session_scoped
+        else "import { $choiceRequest, $secretRequest, $sudoRequest, clearChoiceRequest, clearSecretRequest, clearSudoRequest, type ChoiceRequest } from '@/store/prompts'"
+    )
+    source = source.replace(store_import, new_store_import)
 
     component = '''export function choiceSubmitErrorDisposition(reason: unknown): { clearPrompt: boolean; message: string } {
   const error = reason as { code?: unknown; message?: unknown } | null
@@ -3436,16 +3471,27 @@ export function ChoiceDialog() {
 }
 
 '''
+    prompt_overlays_anchor = "export function PromptOverlays() {"
+    mount_anchor = "<SecretDialog />"
+    mount = "<ChoiceDialog />"
+    if session_scoped:
+        component = component.replace(
+            "export function ChoiceDialog() {\n  const request = useStore($choiceRequest)",
+            "export function ChoiceDialog({ sessionId }: { sessionId: string | null }) {\n  const $request = useMemo(() => sessionChoiceRequest(sessionId), [sessionId])\n  const request = useStore($request)",
+        )
+        prompt_overlays_anchor = "export function PromptOverlays({ sessionId }: { sessionId: string | null }) {"
+        mount_anchor = "<SecretDialog sessionId={sessionId} />"
+        mount = "<ChoiceDialog sessionId={sessionId} />"
     source = _insert_before_unique_line(
         source,
-        "export function PromptOverlays() {",
+        prompt_overlays_anchor,
         tuple(component.splitlines()),
         label="Desktop chooser dialog",
     )
     return _insert_after_unique_line(
         source,
-        "<SecretDialog />",
-        ("<ChoiceDialog />",),
+        mount_anchor,
+        (mount,),
         label="Desktop chooser dialog mount",
     )
 

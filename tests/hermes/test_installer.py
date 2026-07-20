@@ -634,6 +634,23 @@ export function PromptOverlays() {
 }
 """
 
+DESKTOP_SESSION_PROMPT_OVERLAYS_SOURCE = """'use client'
+import { useStore } from '@nanostores/react'
+import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { Button } from '@/components/ui/button'
+import { $gateway } from '@/store/gateway'
+import { clearSecretRequest, clearSudoRequest, sessionSecretRequest, sessionSudoRequest } from '@/store/prompts'
+
+export function PromptOverlays({ sessionId }: { sessionId: string | null }) {
+  return (
+    <>
+      <SudoDialog sessionId={sessionId} />
+      <SecretDialog sessionId={sessionId} />
+    </>
+  )
+}
+"""
+
 DESKTOP_SUBMIT_SOURCE = """export async function submitPrompt(
   requestGateway: any,
   sessionId: string,
@@ -1085,6 +1102,40 @@ def test_desktop_chooser_has_separate_keyed_store_and_accessible_controls() -> N
     assert "aria-live" in changed_overlays
     assert "choice.submit" in changed_overlays
     assert "prompt.submit" not in changed_overlays
+
+
+def test_desktop_chooser_supports_session_scoped_prompt_overlays() -> None:
+    changed = installer.change_desktop_prompt_overlays_source(
+        DESKTOP_SESSION_PROMPT_OVERLAYS_SOURCE
+    )
+
+    assert "sessionChoiceRequest" in changed
+    assert "export function ChoiceDialog({ sessionId }" in changed
+    assert "useMemo(() => sessionChoiceRequest(sessionId), [sessionId])" in changed
+    assert "<ChoiceDialog sessionId={sessionId} />" in changed
+
+
+def test_desktop_chooser_marks_session_scoped_choice_as_awaiting_input() -> None:
+    source = DESKTOP_PROMPTS_STORE_SOURCE.replace(
+        "import { $clarifyRequest } from './clarify'",
+        "import { $clarifyRequest, $clarifyRequests } from './clarify'",
+    ).replace(
+        "export function clearAllPrompts(sessionId?: string | null): void {",
+        """export function sessionAwaitingInput(sessionId: string | null) {
+  return computed([$clarifyRequests, approval.$all, sudo.$all, secret.$all], (clarify, approvals, sudos, secrets) => {
+    const key = keyFor(sessionId)
+
+    return Boolean(clarify[key] || approvals[key] || sudos[key] || secrets[key])
+  })
+}
+export function clearAllPrompts(sessionId?: string | null): void {""",
+    )
+
+    changed = installer.change_desktop_prompts_store_source(source)
+
+    assert "export const sessionChoiceRequest" in changed
+    assert "choice.$all" in changed
+    assert "choices[key]" in changed
 
 
 def test_chooser_submit_errors_preserve_retryable_prompts() -> None:
