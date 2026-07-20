@@ -268,6 +268,8 @@ restore_plugin_state() {
 }
 
 PACKAGE_CHANGED=false
+PREVIOUS_CHANGE_PACKAGE=""
+PREVIOUS_PACKAGE_RESTORED=false
 CONFIGURE_APPLIED=false
 DEPLOY_BACKUP="$(mktemp -d "$TASK_DATA_DIR/.subscription-deploy-backup.XXXXXX")"
 BACKUP_DESTINATIONS=()
@@ -285,6 +287,57 @@ backup_managed_path() {
   else
     BACKUP_PATHS+=("")
   fi
+}
+
+find_previous_change_package() {
+  PREVIOUS_CHANGE_PACKAGE=""
+  while IFS= read -r -d '' CANDIDATE; do
+    [ "$CANDIDATE" != "$CHANGE_PACKAGE" ] || continue
+    CANDIDATE_NAME="$(basename -- "$CANDIDATE")"
+    [[ "$CANDIDATE_NAME" =~ ^[0-9a-f]{40}-${HERMES_SOURCE_VERSION}$ ]] || continue
+    "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" verify \
+      --hermes-root "$HERMES_ROOT" --package "$CANDIDATE" >/dev/null 2>&1 || continue
+    if ! CANDIDATE_PACKAGE="$CANDIDATE" REQUESTED_PACKAGE="$CHANGE_PACKAGE" \
+      HERMES_CHECKOUT="$HERMES_ROOT" \
+      "$HERMES_PY" - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+candidate = json.loads(
+    (Path(os.environ["CANDIDATE_PACKAGE"]) / "installed-files-list.json").read_text(
+        encoding="utf-8"
+    )
+)
+requested = json.loads(
+    (Path(os.environ["REQUESTED_PACKAGE"]) / "installed-files-list.json").read_text(
+        encoding="utf-8"
+    )
+)
+candidate_before = {
+    item["path"]: item["before_file_hash"] for item in candidate["files"]
+}
+requested_before = {
+    item["path"]: item["before_file_hash"] for item in requested["files"]
+}
+common_paths = candidate_before.keys() & requested_before.keys()
+if any(candidate_before[path] != requested_before[path] for path in common_paths):
+    raise RuntimeError("installed Hermes package has a different source preimage")
+hermes_checkout = Path(os.environ["HERMES_CHECKOUT"])
+for path in requested_before.keys() - candidate_before.keys():
+    expected_hash = requested_before[path]
+    current_hash = hashlib.sha256((hermes_checkout / path).read_bytes()).hexdigest()
+    if current_hash != expected_hash:
+        raise RuntimeError("new Hermes package target is not at its source preimage")
+PY
+    then
+      continue
+    fi
+    PREVIOUS_CHANGE_PACKAGE="$CANDIDATE"
+    return 0
+  done < <(find "$CHANGE_PACKAGE_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+  return 1
 }
 
 cleanup_deploy_temporaries() {
@@ -356,9 +409,17 @@ restore_runtime_after_error() {
         cp -a -- "$BACKUP" "$DST" || true
       fi
     done
+    PACKAGE_ROLLBACK_FAILED=false
     if [ "$PACKAGE_CHANGED" = true ] && [ -n "${CHANGE_PACKAGE:-}" ]; then
       "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" restore \
-        --hermes-root "$HERMES_ROOT" --package "$CHANGE_PACKAGE" >/dev/null 2>&1 || true
+        --hermes-root "$HERMES_ROOT" --package "$CHANGE_PACKAGE" >/dev/null 2>&1 || PACKAGE_ROLLBACK_FAILED=true
+    fi
+    if [ "$PREVIOUS_PACKAGE_RESTORED" = true ] && [ -n "$PREVIOUS_CHANGE_PACKAGE" ]; then
+      "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" install \
+        --hermes-root "$HERMES_ROOT" --package "$PREVIOUS_CHANGE_PACKAGE" >/dev/null 2>&1 || PACKAGE_ROLLBACK_FAILED=true
+    fi
+    if [ "$PACKAGE_ROLLBACK_FAILED" = true ]; then
+      echo "[deploy] WARNING: Hermes change package rollback needs manual review" >&2
     fi
     if ! restore_forge_environment; then
       echo "[deploy] WARNING: runtime settings rollback needs manual review: $ENV_BACKUP" >&2
@@ -484,6 +545,15 @@ if [ ! -f "$CHANGE_PACKAGE/installed-files-list.json" ]; then
 fi
 EXPECTED_PACKAGE_VERSION="$CHANGE_PACKAGE_VERSION" CHANGE_PACKAGE="$CHANGE_PACKAGE" "$HERMES_PY" -c \
   'import json, os, pathlib; payload=json.loads((pathlib.Path(os.environ["CHANGE_PACKAGE"]) / "installed-files-list.json").read_text(encoding="utf-8")); assert payload["source_version"] == os.environ["EXPECTED_PACKAGE_VERSION"]'
+if ! "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" verify \
+  --hermes-root "$HERMES_ROOT" --package "$CHANGE_PACKAGE" >/dev/null 2>&1; then
+  if find_previous_change_package; then
+    echo "[deploy] restoring the installed Hermes change before upgrade"
+    "$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" restore \
+      --hermes-root "$HERMES_ROOT" --package "$PREVIOUS_CHANGE_PACKAGE"
+    PREVIOUS_PACKAGE_RESTORED=true
+  fi
+fi
 if ! grep -Fq "INFINITY_FORGE_SUBSCRIPTION_WORKER_V1" "$HERMES_ROOT/hermes_cli/kanban_db.py"; then
   PACKAGE_CHANGED=true
 fi
