@@ -99,8 +99,15 @@ def test_linux_applies_and_verifies_before_restart_and_rolls_back_on_failure() -
     restart = deploy.index("systemctl --user restart hermes-gateway")
 
     assert apply < verify < restart
-    assert 'CONFIGURE_APPLIED=true' in deploy
-    assert '"$HERMES_PY" "$CONFIGURE_SCRIPT" rollback' in deploy
+    for path in (
+        '"$HOME/.hermes/config.yaml"',
+        '"$HOME/.codex/config.toml"',
+        '"$TASK_DATA_DIR/subscription-runtime"',
+    ):
+        backup = deploy.index(f"backup_managed_path {path}")
+        assert backup < apply
+    assert 'CONFIGURE_APPLIED=true' not in deploy
+    assert '"$HERMES_PY" "$CONFIGURE_SCRIPT" rollback' not in deploy
     assert 'systemctl --user is-active --quiet hermes-gateway' in deploy[restart:]
     assert 'trap restore_runtime_after_error EXIT' in deploy
 

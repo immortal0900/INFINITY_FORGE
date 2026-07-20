@@ -31,6 +31,10 @@ from .subscription_runtime import (
 _RUNTIME = "codex_app_server"
 _CLAUDE_SERVER = "hermes-tools"
 _CLAUDE_MODULE = "agent.transports.hermes_tools_mcp_server"
+_CODEX_MANAGED_MARKER = (
+    "# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section"
+)
+_CODEX_MANAGED_END_MARKER = "# end hermes-agent managed section"
 _PREFLIGHT_TIMEOUT_SECONDS = 10.0
 _BACKUP_NAMES = {
     "hermes": "hermes-config.bin",
@@ -244,7 +248,8 @@ class SubscriptionRuntimeSetup:
             migration_excluded_mcp_names = frozenset()
             if self._uses_default_switch:
                 migration_excluded_mcp_names = frozenset(
-                    self._codex_mcp_names() & _expected_mcp_names(config)
+                    self._unmanaged_codex_mcp_names()
+                    & _expected_mcp_names(config)
                 )
             persist_failed = False
 
@@ -684,6 +689,41 @@ class SubscriptionRuntimeSetup:
         if not isinstance(servers, dict):
             raise ValueError("Codex MCP config is invalid")
         return set(servers)
+
+    def _unmanaged_codex_mcp_names(self) -> set[str]:
+        self._assert_managed_paths_safe()
+        text = self.codex_config_path.read_text(encoding="utf-8")
+        # Validate the complete document before interpreting source-level sections.
+        tomllib.loads(text)
+        names: set[str] = set()
+        in_managed_block = False
+        managed_blocks = 0
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped == _CODEX_MANAGED_MARKER:
+                if in_managed_block or managed_blocks:
+                    raise ValueError("Codex MCP managed block is ambiguous")
+                in_managed_block = True
+                managed_blocks += 1
+                continue
+            if stripped == _CODEX_MANAGED_END_MARKER:
+                if not in_managed_block:
+                    raise ValueError("Codex MCP managed block is incomplete")
+                in_managed_block = False
+                continue
+            if in_managed_block or not stripped.startswith("[mcp_servers."):
+                continue
+            try:
+                fragment = tomllib.loads(f"{stripped}\n__forge_probe__ = true\n")
+            except tomllib.TOMLDecodeError as error:
+                raise ValueError("Codex MCP table header is invalid") from error
+            servers = fragment.get("mcp_servers")
+            if not isinstance(servers, dict) or not servers:
+                raise ValueError("Codex MCP table header is invalid")
+            names.update(str(name) for name in servers)
+        if in_managed_block:
+            raise ValueError("Codex MCP managed block is incomplete")
+        return names
 
     def _write_claude_mcp(self) -> None:
         self._assert_managed_paths_safe()
