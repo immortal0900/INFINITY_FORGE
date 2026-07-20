@@ -5,16 +5,18 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from threading import RLock
 from typing import Protocol
 from uuid import UUID
 
+from .task_database import TaskDatabase, TaskDatabaseError
 from .task_outbox import TaskOutbox
 from .task_options import MergeMode, TaskFlow
+from .task_projects import TaskProject
 from .task_settings import (
     TaskContent,
     TaskSettings,
@@ -22,6 +24,13 @@ from .task_settings import (
     TaskSettingsStore,
     task_content_hash,
 )
+from .task_settings_v2 import (
+    TASK_REQUEST_V2_FORMAT,
+    TaskRequestV2,
+    TaskSettingsV2,
+    TaskSettingsV2Error,
+)
+from .surface_events import TrustedTurnContext
 
 
 TASK_REQUEST_FORMAT = "forge-task-request/v1"
@@ -33,6 +42,35 @@ _MARKER_PATTERN = re.compile(
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PROCESS_LOCKS_GUARD = RLock()
 _PROCESS_LOCKS: dict[str, RLock] = {}
+
+V2_PROGRESS_START = "<!-- forge-v2-progress:start -->"
+V2_PROGRESS_END = "<!-- forge-v2-progress:end -->"
+_V2_MARKER_START = "<!-- forge-v2-task-request"
+_V2_MARKER_PATTERN = re.compile(
+    r"<!-- forge-v2-task-request\n(?P<json>\{[^\n]+\})\n-->",
+)
+_V2_BODY_LIMIT_BYTES = 65_536
+_V2_PROGRESS_LABELS = {
+    "blocked": "Blocked",
+    "ready": "Ready",
+}
+_V2_ROOT_KEY_PATTERN = re.compile(
+    r"^forge-task-v2:"
+    r"(?P<request_id>[0-9a-f-]{36}):"
+    r"(?P<project_id>[0-9a-f]{64}):build$"
+)
+_V2_REPOSITORY_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
+_V2_LIFECYCLE_BARRIER_EVENTS = (
+    "revision_requested",
+    "stop_requested",
+    "changing",
+    "stopping",
+    "cancelled",
+    "expired",
+    "merged",
+    "replaced",
+    "partially_merged",
+)
 
 
 class TaskServiceError(RuntimeError):
@@ -78,9 +116,116 @@ class TaskIssue:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskParentIssue:
+    """Strict v2 snapshot of the central Management issue."""
+
+    number: int
+    title: str
+    body: str
+    state: str
+
+    def __post_init__(self) -> None:
+        if type(self.number) is not int or self.number <= 0:
+            raise TaskServiceError("GitHub parent issue number must be positive")
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise TaskServiceError("GitHub parent issue title must be non-empty text")
+        if not isinstance(self.body, str):
+            raise TaskServiceError("GitHub parent issue body must be text")
+        if type(self.state) is not str or self.state not in {"open", "closed"}:
+            raise TaskServiceError("GitHub parent issue state is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class CreatedTask:
     settings: TaskSettings
     issue: TaskIssue
+
+
+def root_project_item_key(request_id: str, project_id: str) -> str:
+    """Return the exact request + Project + build idempotency key."""
+
+    if not isinstance(request_id, str):
+        raise TaskServiceError("Project item request_id is invalid")
+    try:
+        parsed_request_id = UUID(request_id)
+    except ValueError as error:
+        raise TaskServiceError("Project item request_id is invalid") from error
+    if str(parsed_request_id) != request_id:
+        raise TaskServiceError("Project item request_id is invalid")
+    if not isinstance(project_id, str) or _SHA256_PATTERN.fullmatch(project_id) is None:
+        raise TaskServiceError("Project item project_id is invalid")
+    return f"forge-task-v2:{request_id}:{project_id}:build"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectExecutionItem:
+    """Strict external snapshot for one blocked or released Build root."""
+
+    item_id: str
+    idempotency_key: str
+    parent_issue_number: int
+    project_repository: str
+    state: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.item_id, str)
+            or not self.item_id.strip()
+            or self.item_id != self.item_id.strip()
+            or len(self.item_id) > 512
+        ):
+            raise TaskServiceError("Project item ID is invalid")
+        key_match = (
+            None
+            if not isinstance(self.idempotency_key, str)
+            else _V2_ROOT_KEY_PATTERN.fullmatch(self.idempotency_key)
+        )
+        if key_match is None:
+            raise TaskServiceError("Project item idempotency key is invalid")
+        try:
+            key_request_id = str(UUID(key_match.group("request_id")))
+        except ValueError as error:
+            raise TaskServiceError("Project item idempotency key is invalid") from error
+        if key_request_id != key_match.group("request_id"):
+            raise TaskServiceError("Project item idempotency key is invalid")
+        if type(self.parent_issue_number) is not int or self.parent_issue_number <= 0:
+            raise TaskServiceError("Project item parent issue number is invalid")
+        if (
+            not isinstance(self.project_repository, str)
+            or _V2_REPOSITORY_PATTERN.fullmatch(self.project_repository) is None
+        ):
+            raise TaskServiceError("Project item repository is invalid")
+        if type(self.state) is not str or self.state not in {"blocked", "ready"}:
+            raise TaskServiceError("Project item state is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedTaskV2:
+    request: TaskRequestV2
+    settings: TaskSettingsV2
+    parent_issue: TaskParentIssue
+    project_items: tuple[ProjectExecutionItem, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, TaskRequestV2):
+            raise TaskServiceError("created v2 request is invalid")
+        if not isinstance(self.settings, TaskSettingsV2):
+            raise TaskServiceError("created v2 settings are invalid")
+        if not isinstance(self.parent_issue, TaskParentIssue):
+            raise TaskServiceError("created v2 parent issue is invalid")
+        if not isinstance(self.project_items, tuple):
+            raise TaskServiceError("created v2 Project items are invalid")
+        if len(self.project_items) != len(self.request.projects):
+            raise TaskServiceError("created v2 Project item count does not match")
+        for project, item in zip(self.request.projects, self.project_items, strict=True):
+            if (
+                item.idempotency_key
+                != root_project_item_key(self.request.request_id, project.project_id)
+                or item.parent_issue_number != self.parent_issue.number
+                or item.project_repository != project.repository
+                or item.state != "ready"
+            ):
+                raise TaskServiceError("created v2 Project item does not match")
 
 
 class TaskIssueClient(Protocol):
@@ -105,6 +250,66 @@ class TaskIssueClient(Protocol):
         issue_number: int,
         label: str,
     ) -> TaskIssue: ...
+
+
+class TaskIssueClientV2(Protocol):
+    def find_issue(
+        self,
+        repository: str,
+        request_id: str,
+    ) -> TaskParentIssue | None: ...
+
+    def create_issue(
+        self,
+        repository: str,
+        title: str,
+        body: str,
+    ) -> TaskParentIssue: ...
+
+    def get_issue(
+        self,
+        repository: str,
+        issue_number: int,
+    ) -> TaskParentIssue: ...
+
+    def update_issue(
+        self,
+        repository: str,
+        issue_number: int,
+        *,
+        title: str,
+        body: str,
+    ) -> TaskParentIssue: ...
+
+
+class ProjectItemClient(Protocol):
+    def find_items(
+        self,
+        management_repository: str,
+        idempotency_key: str,
+    ) -> tuple[ProjectExecutionItem, ...]: ...
+
+    def create_item(
+        self,
+        management_repository: str,
+        parent_issue_number: int,
+        project_repository: str,
+        idempotency_key: str,
+        *,
+        state: str,
+    ) -> ProjectExecutionItem: ...
+
+    def get_item(
+        self,
+        management_repository: str,
+        item_id: str,
+    ) -> ProjectExecutionItem: ...
+
+    def release_item(
+        self,
+        management_repository: str,
+        item_id: str,
+    ) -> ProjectExecutionItem: ...
 
 
 def _task_marker_object(
@@ -176,6 +381,240 @@ def _marker(settings: TaskSettings) -> str:
         separators=(",", ":"),
     )
     return f"{_MARKER_START}\n{encoded}\n-->"
+
+
+def _v2_marker(request: TaskRequestV2) -> str:
+    payload = {
+        "format_version": TASK_REQUEST_V2_FORMAT,
+        "request_hash": request.request_hash,
+        "request_id": request.request_id,
+        "task_content_hash": request.task_content_hash,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"{_V2_MARKER_START}\n{encoded}\n-->"
+
+
+def read_task_marker_v2(body: str) -> dict[str, str]:
+    """Read one v2 marker without accepting the v1 marker namespace."""
+
+    if not isinstance(body, str):
+        raise TaskServiceError("GitHub parent issue body must be text")
+    matches = tuple(_V2_MARKER_PATTERN.finditer(body))
+    if len(matches) != 1 or body.count(_V2_MARKER_START) != 1:
+        raise TaskServiceError("GitHub parent issue must contain exactly one Task marker")
+    try:
+        value = json.loads(
+            matches[0].group("json"),
+            object_pairs_hook=_task_marker_object,
+        )
+    except json.JSONDecodeError as error:
+        raise TaskServiceError("GitHub parent issue Task marker is invalid JSON") from error
+    required = {
+        "format_version",
+        "request_id",
+        "request_hash",
+        "task_content_hash",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise TaskServiceError("GitHub parent issue Task marker has invalid fields")
+    if value.get("format_version") != TASK_REQUEST_V2_FORMAT:
+        raise TaskServiceError("GitHub parent issue Task marker has an unknown format")
+    request_id = value.get("request_id")
+    if not isinstance(request_id, str):
+        raise TaskServiceError("GitHub parent issue Task marker request_id is invalid")
+    try:
+        parsed_request_id = UUID(request_id)
+    except ValueError as error:
+        raise TaskServiceError(
+            "GitHub parent issue Task marker request_id is invalid"
+        ) from error
+    if str(parsed_request_id) != request_id:
+        raise TaskServiceError("GitHub parent issue Task marker request_id is invalid")
+    for field in ("request_hash", "task_content_hash"):
+        if (
+            not isinstance(value.get(field), str)
+            or _SHA256_PATTERN.fullmatch(value[field]) is None
+        ):
+            raise TaskServiceError(
+                f"GitHub parent issue Task marker {field} is invalid"
+            )
+    return {str(key): str(item) for key, item in value.items()}
+
+
+def _render_v2_progress(
+    request: TaskRequestV2,
+    project_states: Mapping[str, str],
+) -> str:
+    if not isinstance(project_states, Mapping):
+        raise TaskServiceError("Project progress must be a mapping")
+    expected_ids = {project.project_id for project in request.projects}
+    if set(project_states) != expected_ids:
+        raise TaskServiceError("Project progress must cover every exact Project")
+    lines = ("| Project | Build |", "| --- | --- |")
+    rows: list[str] = []
+    for project in request.projects:
+        state = project_states[project.project_id]
+        if type(state) is not str or state not in _V2_PROGRESS_LABELS:
+            raise TaskServiceError("Project progress state is invalid")
+        rows.append(f"| `{project.repository}` | {_V2_PROGRESS_LABELS[state]} |")
+    return "\n".join((*lines, *rows))
+
+
+def _require_v2_body_size(body: str) -> None:
+    try:
+        size = len(body.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise TaskServiceError("GitHub parent issue body is not valid UTF-8") from error
+    if size > _V2_BODY_LIMIT_BYTES:
+        raise TaskServiceError("GitHub parent issue body is too large")
+
+
+def _split_v2_progress(body: str) -> tuple[str, str, str]:
+    if body.count(V2_PROGRESS_START) != 1 or body.count(V2_PROGRESS_END) != 1:
+        raise TaskServiceError(
+            "GitHub parent issue progress delimiters must appear exactly once"
+        )
+    start = body.index(V2_PROGRESS_START) + len(V2_PROGRESS_START)
+    end = body.index(V2_PROGRESS_END)
+    if end <= start or body[start : start + 1] != "\n" or body[end - 1 : end] != "\n":
+        raise TaskServiceError("GitHub parent issue progress delimiters are malformed")
+    return body[:start], body[start:end], body[end:]
+
+
+def build_task_issue_body_v2(
+    request: TaskRequestV2,
+    project_states: Mapping[str, str],
+) -> str:
+    """Build immutable v2 content around one Forge-owned progress section."""
+
+    if not isinstance(request, TaskRequestV2):
+        raise TaskServiceError("request must be TaskRequestV2")
+    reserved = (
+        _MARKER_START,
+        _V2_MARKER_START,
+        V2_PROGRESS_START,
+        V2_PROGRESS_END,
+    )
+    content_values = (
+        request.task_content.description,
+        *request.task_content.acceptance_criteria,
+    )
+    if any(token in value for token in reserved for value in content_values):
+        raise TaskServiceError("Task content contains a reserved v2 marker")
+    criteria = "\n".join(
+        f"{number}. {criterion}"
+        for number, criterion in enumerate(
+            request.task_content.acceptance_criteria,
+            start=1,
+        )
+    )
+    expiry = (
+        "manual"
+        if request.auto_merge_expires_at is None
+        else request.auto_merge_expires_at.isoformat().replace("+00:00", "Z")
+    )
+    settings_lines = [
+        f"- Task flow: `{request.task_flow.value}`",
+        f"- Merge mode: `{request.merge_mode.value}`",
+        f"- Auto-merge permission until: `{expiry}`",
+        "- Projects:",
+        *(f"  - `{project.repository}`" for project in request.projects),
+    ]
+    if request.merge_order is not None:
+        repositories = {
+            project.project_id: project.repository for project in request.projects
+        }
+        settings_lines.extend(
+            (
+                "- Merge order:",
+                *(
+                    f"  {number}. `{repositories[project_id]}`"
+                    for number, project_id in enumerate(
+                        request.merge_order,
+                        start=1,
+                    )
+                ),
+            )
+        )
+    progress = _render_v2_progress(request, project_states)
+    body = "\n\n".join(
+        (
+            request.task_content.description,
+            "## Acceptance Criteria\n\n" + criteria,
+            "## Task Settings\n\n" + "\n".join(settings_lines),
+            (
+                "## Project Progress\n\n"
+                f"{V2_PROGRESS_START}\n{progress}\n{V2_PROGRESS_END}"
+            ),
+            _v2_marker(request),
+        )
+    )
+    _require_v2_body_size(body)
+    return body
+
+
+def _verify_v2_body(body: str, request: TaskRequestV2) -> None:
+    _require_v2_body_size(body)
+    marker = read_task_marker_v2(body)
+    expected_marker = {
+        "format_version": TASK_REQUEST_V2_FORMAT,
+        "request_id": request.request_id,
+        "request_hash": request.request_hash,
+        "task_content_hash": request.task_content_hash,
+    }
+    for field, expected in expected_marker.items():
+        if marker.get(field) != expected:
+            raise TaskServiceError(
+                f"GitHub parent issue Task marker {field} does not match"
+            )
+    expected_body = build_task_issue_body_v2(
+        request,
+        {project.project_id: "blocked" for project in request.projects},
+    )
+    prefix, _progress, suffix = _split_v2_progress(body)
+    expected_prefix, _expected_progress, expected_suffix = _split_v2_progress(
+        expected_body
+    )
+    if prefix != expected_prefix or suffix != expected_suffix:
+        raise TaskServiceError("GitHub parent issue immutable content changed")
+
+
+def verify_task_issue_v2_content(
+    issue: TaskParentIssue,
+    request: TaskRequestV2,
+) -> None:
+    """Verify the parent title, immutable body, marker, and open state."""
+
+    if not isinstance(issue, TaskParentIssue):
+        raise TaskServiceError("issue must be TaskParentIssue")
+    if not isinstance(request, TaskRequestV2):
+        raise TaskServiceError("request must be TaskRequestV2")
+    if issue.state != "open":
+        raise TaskServiceError("GitHub parent issue is closed")
+    if issue.title != request.task_content.title:
+        raise TaskServiceError("GitHub parent issue title does not match")
+    _verify_v2_body(issue.body, request)
+
+
+def replace_task_progress_v2(
+    body: str,
+    request: TaskRequestV2,
+    project_states: Mapping[str, str],
+) -> str:
+    """Replace only the exact Forge-owned v2 progress interior."""
+
+    if not isinstance(request, TaskRequestV2):
+        raise TaskServiceError("request must be TaskRequestV2")
+    _verify_v2_body(body, request)
+    prefix, _progress, suffix = _split_v2_progress(body)
+    updated = prefix + "\n" + _render_v2_progress(request, project_states) + "\n" + suffix
+    _require_v2_body_size(updated)
+    return updated
 
 
 def build_task_issue_body(content: TaskContent, settings: TaskSettings) -> str:
@@ -541,3 +980,1549 @@ class TaskService:
             verify_task_issue_content(issue, request, settings)
         except TaskServiceError as error:
             raise TaskServiceError(message) from error
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _v2_timestamp(value: datetime) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise TaskServiceError("v2 event time must include a timezone")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _require_v2_event_time(value: object) -> str:
+    if type(value) is not str or not value.endswith("Z"):
+        raise TaskServiceError("Task event time is not canonical UTC")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise TaskServiceError("Task event time is not canonical UTC") from error
+    if _v2_timestamp(parsed) != value:
+        raise TaskServiceError("Task event time is not canonical UTC")
+    return value
+
+
+def _require_surface_event_time(value: object) -> str:
+    if type(value) is not str or not value.endswith("Z"):
+        raise TaskServiceError("Task creation source time is not canonical UTC")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise TaskServiceError(
+            "Task creation source time is not canonical UTC"
+        ) from error
+    canonical = parsed.astimezone(UTC).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+    if canonical != value:
+        raise TaskServiceError("Task creation source time is not canonical UTC")
+    return value
+
+
+def _is_v2_item_id(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= 512
+    )
+
+
+def _v2_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _request_project_json(request: TaskRequestV2) -> dict[str, str]:
+    payload = json.loads(request.to_json())
+    raw_projects = payload.get("projects")
+    if not isinstance(raw_projects, list) or len(raw_projects) != len(request.projects):
+        raise TaskServiceError("Task request Project payload is invalid")
+    result: dict[str, str] = {}
+    for project, raw_project in zip(request.projects, raw_projects, strict=True):
+        if not isinstance(raw_project, dict) or raw_project.get("project_id") != project.project_id:
+            raise TaskServiceError("Task request Project order is invalid")
+        result[project.project_id] = _v2_json(raw_project)
+    return result
+
+
+class _TaskRegistryV2:
+    """Keep all v2 SQLite comparisons exact and transaction-scoped."""
+
+    def __init__(self, database: TaskDatabase) -> None:
+        self._database = database
+
+    @contextmanager
+    def guard(self, request: TaskRequestV2) -> Iterator[sqlite3.Connection]:
+        with self._database.transaction() as connection:
+            self._require_request(connection, request)
+            self._require_projects(connection, request)
+            yield connection
+
+    @staticmethod
+    def require_no_lifecycle_barrier(
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+    ) -> None:
+        placeholders = ",".join("?" for _ in _V2_LIFECYCLE_BARRIER_EVENTS)
+        barrier = connection.execute(
+            f"""
+            SELECT event_type
+            FROM task_events
+            WHERE request_id = ? AND event_type IN ({placeholders})
+            ORDER BY event_id
+            LIMIT 1
+            """,
+            (request.request_id, *_V2_LIFECYCLE_BARRIER_EVENTS),
+        ).fetchone()
+        if barrier is not None:
+            raise TaskServiceError(
+                f"Task external write is blocked by lifecycle barrier {barrier[0]}"
+            )
+
+    def prepare(
+        self,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> None:
+        request_payload = json.loads(request.to_json())
+        project_json = _request_project_json(request)
+        confirmed_at = str(request_payload["confirmed_at"])
+        expected_request = (
+            request.request_id,
+            TASK_REQUEST_V2_FORMAT,
+            request.to_json(),
+            request.request_hash,
+            request.management_repository,
+            request.task_owner_host,
+            request.confirmed_by,
+            confirmed_at,
+            request.replaces_request_id,
+        )
+        with self._database.transaction() as connection:
+            self._require_creation_source(
+                connection,
+                request,
+                context,
+                source_payload_hash,
+            )
+            existing = connection.execute(
+                """
+                SELECT request_id, format_version, request_json, request_hash,
+                       management_repository, task_owner_host, confirmed_by,
+                       confirmed_at, replaces_request_id
+                FROM task_requests
+                WHERE request_id = ?
+                """,
+                (request.request_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO task_requests (
+                        request_id, format_version, request_json, request_hash,
+                        management_repository, task_owner_host, confirmed_by,
+                        confirmed_at, replaces_request_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    expected_request,
+                )
+                for project in request.projects:
+                    connection.execute(
+                        """
+                        INSERT INTO task_projects (
+                            request_id, project_id, task_settings_hash,
+                            project_json, state, root_card_id, branch_name,
+                            worktree_path, pr_url, head_commit, merge_commit,
+                            updated_at
+                        ) VALUES (?, ?, NULL, ?, 'prepared', NULL, NULL, NULL,
+                                  NULL, NULL, NULL, ?)
+                        """,
+                        (
+                            request.request_id,
+                            project.project_id,
+                            project_json[project.project_id],
+                            confirmed_at,
+                        ),
+                    )
+            elif tuple(existing) != expected_request:
+                raise TaskServiceError(
+                    "request_id is already bound to a different confirmed request"
+                )
+            self._require_request(connection, request)
+            self._require_projects(connection, request)
+            self._ensure_event(
+                connection,
+                request=request,
+                event_key="request_prepared",
+                event_type="request_prepared",
+                event_json=self._creation_event_json(
+                    request,
+                    context,
+                    source_payload_hash,
+                ),
+                occurred_at=confirmed_at,
+            )
+            self._require_request_prepared_event(
+                connection,
+                request,
+                context,
+                source_payload_hash,
+            )
+            self._ensure_owner_access(
+                connection,
+                request,
+                context,
+                granted_at=confirmed_at,
+            )
+
+    @staticmethod
+    def _creation_event_json(
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> str:
+        return _v2_json(
+            {
+                "request_hash": request.request_hash,
+                "source_event_id": context.source_event_id,
+                "source_payload_hash": source_payload_hash,
+            }
+        )
+
+    @staticmethod
+    def _require_creation_source(
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> None:
+        if not isinstance(context, TrustedTurnContext):
+            raise TaskServiceError(
+                "v2 Task creation requires a trusted turn context"
+            )
+        if context.owner_host != request.task_owner_host:
+            raise TaskServiceError("Task creation owner host changed")
+        if context.subject_id != request.confirmed_by:
+            raise TaskServiceError("Task confirmer does not match trusted subject")
+        if (
+            not isinstance(source_payload_hash, str)
+            or _SHA256_PATTERN.fullmatch(source_payload_hash) is None
+        ):
+            raise TaskServiceError(
+                "Task creation source payload hash must be a lowercase SHA-256"
+            )
+        source = connection.execute(
+            """
+            SELECT subject_id, session_id, surface, payload_hash, state,
+                   received_at
+            FROM surface_events
+            WHERE source_event_id = ?
+            """,
+            (context.source_event_id,),
+        ).fetchone()
+        expected_identity = (
+            context.subject_id,
+            context.session_id,
+            context.surface,
+            source_payload_hash,
+        )
+        if (
+            source is None
+            or tuple(source[:4]) != expected_identity
+            or source[4] not in {"received", "handled", "responded"}
+        ):
+            raise TaskServiceError(
+                "Task creation source receipt does not match trusted context"
+            )
+        _require_surface_event_time(source[5])
+
+        for row in connection.execute(
+            """
+            SELECT request_id, event_json
+            FROM task_events
+            WHERE event_type = 'request_prepared'
+            """
+        ):
+            raw_payload = str(row[1])
+            try:
+                payload = json.loads(raw_payload)
+            except (json.JSONDecodeError, RecursionError):
+                raise TaskServiceError(
+                    "stored Task creation event is invalid"
+                ) from None
+            if not isinstance(payload, dict) or _v2_json(payload) != raw_payload:
+                raise TaskServiceError("stored Task creation event is invalid")
+            fields = set(payload)
+            if fields == {"request_hash"}:
+                continue
+            if fields != {
+                "request_hash",
+                "source_event_id",
+                "source_payload_hash",
+            }:
+                raise TaskServiceError("stored Task creation event is invalid")
+            if (
+                payload.get("source_event_id") == context.source_event_id
+                and str(row[0]) != request.request_id
+            ):
+                raise TaskServiceError(
+                    "Task creation source receipt is already bound to another request"
+                )
+
+    @staticmethod
+    def _ensure_owner_access(
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        *,
+        granted_at: str,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT role, granted_by, granted_at, revoked_at
+            FROM task_access
+            WHERE request_id = ? AND surface = ? AND subject_id = ?
+            """,
+            (request.request_id, context.surface, context.subject_id),
+        ).fetchone()
+        expected = ("owner", context.subject_id, granted_at, None)
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO task_access (
+                    request_id, surface, subject_id, role, granted_by,
+                    granted_at, revoked_at
+                ) VALUES (?, ?, ?, 'owner', ?, ?, NULL)
+                """,
+                (
+                    request.request_id,
+                    context.surface,
+                    context.subject_id,
+                    context.subject_id,
+                    granted_at,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT role, granted_by, granted_at, revoked_at
+                FROM task_access
+                WHERE request_id = ? AND surface = ? AND subject_id = ?
+                """,
+                (request.request_id, context.surface, context.subject_id),
+            ).fetchone()
+        if row is None or tuple(row) != expected:
+            raise TaskServiceError("Task owner access does not match confirmation")
+
+    @staticmethod
+    def _require_owner_access(
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+    ) -> None:
+        granted_at = json.loads(request.to_json())["confirmed_at"]
+        row = connection.execute(
+            """
+            SELECT role, granted_by, granted_at, revoked_at
+            FROM task_access
+            WHERE request_id = ? AND surface = ? AND subject_id = ?
+            """,
+            (request.request_id, context.surface, context.subject_id),
+        ).fetchone()
+        if row is None or tuple(row) != (
+            "owner",
+            context.subject_id,
+            granted_at,
+            None,
+        ):
+            raise TaskServiceError("Task owner access does not match confirmation")
+
+    @staticmethod
+    def _ensure_session_binding(
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        *,
+        issue_number: int,
+        bound_at: str,
+    ) -> None:
+        key = (
+            context.surface,
+            context.subject_id,
+            context.session_id,
+            request.request_id,
+        )
+        row = connection.execute(
+            """
+            SELECT parent_issue_number, bound_at
+            FROM task_session_bindings
+            WHERE surface = ? AND subject_id = ? AND session_id = ?
+              AND request_id = ?
+            """,
+            key,
+        ).fetchone()
+        expected = (issue_number, bound_at)
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO task_session_bindings (
+                    surface, subject_id, session_id, request_id,
+                    parent_issue_number, bound_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (*key, issue_number, bound_at),
+            )
+            row = connection.execute(
+                """
+                SELECT parent_issue_number, bound_at
+                FROM task_session_bindings
+                WHERE surface = ? AND subject_id = ? AND session_id = ?
+                  AND request_id = ?
+                """,
+                key,
+            ).fetchone()
+        if row is None or tuple(row) != expected:
+            raise TaskServiceError("Task session binding does not match parent")
+
+    def parent_issue_number(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+    ) -> int | None:
+        rows = connection.execute(
+            """
+            SELECT event_key, task_settings_hash, project_id, event_json
+            FROM task_events
+            WHERE request_id = ? AND event_type = 'parent_issue_bound'
+            """,
+            (request.request_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise TaskServiceError("Task has duplicate parent issue bindings")
+        row = rows[0]
+        try:
+            payload = json.loads(row[3])
+        except json.JSONDecodeError as error:
+            raise TaskServiceError("parent issue binding is invalid") from error
+        if (
+            row[0] != "parent_issue_bound"
+            or row[1] is not None
+            or row[2] is not None
+            or not isinstance(payload, dict)
+            or set(payload) != {"parent_issue_number", "request_hash"}
+            or payload.get("request_hash") != request.request_hash
+            or type(payload.get("parent_issue_number")) is not int
+            or payload["parent_issue_number"] <= 0
+        ):
+            raise TaskServiceError("parent issue binding does not match request")
+        if row[3] != _v2_json(
+            {
+                "parent_issue_number": payload["parent_issue_number"],
+                "request_hash": request.request_hash,
+            }
+        ):
+            raise TaskServiceError("parent issue binding is not canonical")
+        return payload["parent_issue_number"]
+
+    def bind_parent(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        issue_number: int,
+        occurred_at: str,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> None:
+        if type(issue_number) is not int or issue_number <= 0:
+            raise TaskServiceError("parent issue number is invalid")
+        self._require_creation_source(
+            connection,
+            request,
+            context,
+            source_payload_hash,
+        )
+        self._require_request_prepared_event(
+            connection,
+            request,
+            context,
+            source_payload_hash,
+        )
+        self._require_owner_access(connection, request, context)
+        self._ensure_event(
+            connection,
+            request=request,
+            event_key="parent_issue_bound",
+            event_type="parent_issue_bound",
+            event_json=_v2_json(
+                {
+                    "parent_issue_number": issue_number,
+                    "request_hash": request.request_hash,
+                }
+            ),
+            occurred_at=occurred_at,
+        )
+        if self.parent_issue_number(connection, request) != issue_number:
+            raise TaskServiceError("parent issue binding readback failed")
+        self._ensure_session_binding(
+            connection,
+            request,
+            context,
+            issue_number=issue_number,
+            bound_at=occurred_at,
+        )
+
+    def require_creation_binding(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+        issue_number: int,
+    ) -> None:
+        """Recheck the exact creation receipt and its durable owner binding."""
+
+        self._require_creation_source(
+            connection,
+            request,
+            context,
+            source_payload_hash,
+        )
+        self._require_request_prepared_event(
+            connection,
+            request,
+            context,
+            source_payload_hash,
+        )
+        self._require_owner_access(connection, request, context)
+        parent = connection.execute(
+            """
+            SELECT occurred_at
+            FROM task_events
+            WHERE request_id = ? AND event_type = 'parent_issue_bound'
+              AND event_key = 'parent_issue_bound'
+            """,
+            (request.request_id,),
+        ).fetchone()
+        if parent is None:
+            raise TaskServiceError("parent issue binding is missing")
+        bound_at = _require_v2_event_time(parent[0])
+        row = connection.execute(
+            """
+            SELECT parent_issue_number, bound_at
+            FROM task_session_bindings
+            WHERE surface = ? AND subject_id = ? AND session_id = ?
+              AND request_id = ?
+            """,
+            (
+                context.surface,
+                context.subject_id,
+                context.session_id,
+                request.request_id,
+            ),
+        ).fetchone()
+        if row is None or tuple(row) != (issue_number, bound_at):
+            raise TaskServiceError("Task session binding does not match parent")
+
+    def project_binding(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        project_id: str,
+    ) -> tuple[str, str | None, str | None]:
+        row = connection.execute(
+            """
+            SELECT state, root_card_id, task_settings_hash
+            FROM task_projects
+            WHERE request_id = ? AND project_id = ?
+            """,
+            (request.request_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise TaskServiceError("Task Project registry row is missing")
+        state, root_card_id, settings_hash = tuple(row)
+        if state == "prepared":
+            if root_card_id is not None or settings_hash is not None:
+                raise TaskServiceError("prepared Project registry row is inconsistent")
+        elif state == "bound":
+            if not _is_v2_item_id(root_card_id):
+                raise TaskServiceError("stored Project root card ID is invalid")
+            if settings_hash is not None:
+                raise TaskServiceError("bound Project registry row is inconsistent")
+        else:
+            if not _is_v2_item_id(root_card_id):
+                raise TaskServiceError("stored Project root card ID is invalid")
+            if not isinstance(settings_hash, str):
+                raise TaskServiceError("active Project registry row is inconsistent")
+        return state, root_card_id, settings_hash
+
+    def bind_project_item(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        project_id: str,
+        item: ProjectExecutionItem,
+        occurred_at: str,
+    ) -> None:
+        state, root_card_id, settings_hash = self.project_binding(
+            connection,
+            request,
+            project_id,
+        )
+        if state == "prepared":
+            updated = connection.execute(
+                """
+                UPDATE task_projects
+                SET state = 'bound', root_card_id = ?, updated_at = ?
+                WHERE request_id = ? AND project_id = ?
+                  AND state = 'prepared' AND root_card_id IS NULL
+                  AND task_settings_hash IS NULL
+                """,
+                (
+                    item.item_id,
+                    occurred_at,
+                    request.request_id,
+                    project_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise TaskServiceError("Project item binding update failed")
+        elif root_card_id != item.item_id:
+            raise TaskServiceError("Project item does not match bound root card")
+        if settings_hash is not None and state == "bound":
+            raise TaskServiceError("bound Project unexpectedly has active settings")
+        key = root_project_item_key(request.request_id, project_id)
+        self._ensure_event(
+            connection,
+            request=request,
+            event_key=f"project_item_bound:{project_id}",
+            event_type="project_item_bound",
+            event_json=_v2_json(
+                {"idempotency_key": key, "root_card_id": item.item_id}
+            ),
+            occurred_at=occurred_at,
+            project_id=project_id,
+        )
+        self._require_project_binding_event(
+            connection,
+            request,
+            project_id,
+            item.item_id,
+        )
+
+    def activate(
+        self,
+        request: TaskRequestV2,
+        occurred_at: str,
+    ) -> TaskSettingsV2:
+        with self._database.transaction() as connection:
+            self._require_request(connection, request)
+            self._require_projects(connection, request)
+            parent_issue_number = self.parent_issue_number(connection, request)
+            if parent_issue_number is None:
+                raise TaskServiceError("parent issue is not bound")
+            root_ids: list[str] = []
+            for project in request.projects:
+                state, root_card_id, settings_hash = self.project_binding(
+                    connection,
+                    request,
+                    project.project_id,
+                )
+                if state not in {"bound", "ready"} or root_card_id is None:
+                    raise TaskServiceError("not every Project root is bound")
+                if state == "bound" and settings_hash is not None:
+                    raise TaskServiceError("bound Project has unexpected settings")
+                root_ids.append(root_card_id)
+                self._require_project_binding_event(
+                    connection,
+                    request,
+                    project.project_id,
+                    root_card_id,
+                )
+            if len(root_ids) != len(set(root_ids)):
+                raise TaskServiceError("Project roots contain duplicate card IDs")
+            self.require_no_lifecycle_barrier(connection, request)
+            expected = TaskSettingsV2.create(
+                request=request,
+                parent_issue_number=parent_issue_number,
+            )
+            existing = connection.execute(
+                """
+                SELECT task_settings_hash, request_id, request_hash,
+                       format_version, settings_json, management_repository,
+                       parent_issue_number, task_owner_host, confirmed_at
+                FROM task_settings_v2
+                WHERE request_id = ?
+                """,
+                (request.request_id,),
+            ).fetchone()
+            if existing is None:
+                payload = json.loads(expected.to_json())
+                connection.execute(
+                    """
+                    INSERT INTO task_settings_v2 (
+                        task_settings_hash, request_id, request_hash,
+                        format_version, settings_json, management_repository,
+                        parent_issue_number, task_owner_host, confirmed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        expected.task_settings_hash,
+                        expected.request_id,
+                        expected.request_hash,
+                        expected.format_version,
+                        expected.to_json(),
+                        expected.management_repository,
+                        expected.parent_issue_number,
+                        expected.task_owner_host,
+                        payload["confirmed_at"],
+                    ),
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE task_projects
+                    SET task_settings_hash = ?, state = 'ready', updated_at = ?
+                    WHERE request_id = ? AND state = 'bound'
+                      AND task_settings_hash IS NULL
+                    """,
+                    (
+                        expected.task_settings_hash,
+                        occurred_at,
+                        request.request_id,
+                    ),
+                )
+                if updated.rowcount != len(request.projects):
+                    raise TaskServiceError("not every Project became ready atomically")
+                event_payload = _v2_json(
+                    {"task_settings_hash": expected.task_settings_hash}
+                )
+                for event_type in ("settings_activated", "active"):
+                    self._ensure_event(
+                        connection,
+                        request=request,
+                        event_key=event_type,
+                        event_type=event_type,
+                        event_json=event_payload,
+                        occurred_at=occurred_at,
+                        task_settings_hash=expected.task_settings_hash,
+                    )
+                self._ensure_event(
+                    connection,
+                    request=request,
+                    event_key="dispatch_ready",
+                    event_type="dispatch_ready",
+                    event_json=_v2_json(
+                        {
+                            "project_ids": [
+                                project.project_id for project in request.projects
+                            ],
+                            "task_settings_hash": expected.task_settings_hash,
+                        }
+                    ),
+                    occurred_at=occurred_at,
+                    task_settings_hash=expected.task_settings_hash,
+                )
+            else:
+                self._require_settings_row(existing, expected, request)
+                for project in request.projects:
+                    state, _root_id, settings_hash = self.project_binding(
+                        connection,
+                        request,
+                        project.project_id,
+                    )
+                    if state == "bound" or settings_hash != expected.task_settings_hash:
+                        raise TaskServiceError("active Project registry does not match settings")
+                self._require_activation_events(connection, request, expected)
+            self._require_settings_readback(connection, request, expected)
+            self._require_activation_events(connection, request, expected)
+            return expected
+
+    def require_active_external_write(self, request: TaskRequestV2) -> None:
+        """Fail closed unless the exact active registry still permits writes."""
+
+        with self.guard(request) as connection:
+            self._require_active_external_write_on_connection(connection, request)
+
+    @contextmanager
+    def active_external_write(
+        self,
+        request: TaskRequestV2,
+    ) -> Iterator[None]:
+        """Hold the shared write permit across one exact external mutation."""
+
+        with self.guard(request) as connection:
+            self._require_active_external_write_on_connection(connection, request)
+            # RISK(race): Stop and revision writers use this same database write
+            # permit. Keep it until the external mutation and readback finish.
+            yield
+
+    def _require_active_external_write_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+    ) -> None:
+        self.require_no_lifecycle_barrier(connection, request)
+        parent_issue_number = self.parent_issue_number(connection, request)
+        if parent_issue_number is None:
+            raise TaskServiceError("parent issue is not bound")
+        expected = TaskSettingsV2.create(
+            request=request,
+            parent_issue_number=parent_issue_number,
+        )
+        self._require_settings_readback(connection, request, expected)
+        root_ids: list[str] = []
+        for project in request.projects:
+            state, root_card_id, settings_hash = self.project_binding(
+                connection,
+                request,
+                project.project_id,
+            )
+            if (
+                state != "ready"
+                or root_card_id is None
+                or settings_hash != expected.task_settings_hash
+            ):
+                raise TaskServiceError(
+                    "Project registry is not active for external write"
+                )
+            self._require_project_binding_event(
+                connection,
+                request,
+                project.project_id,
+                root_card_id,
+            )
+            root_ids.append(root_card_id)
+        if len(root_ids) != len(set(root_ids)):
+            raise TaskServiceError("Project roots contain duplicate card IDs")
+        self._require_activation_events(connection, request, expected)
+
+    def root_card_ids(self, request: TaskRequestV2) -> tuple[str, ...]:
+        with self._database.read() as connection:
+            self._require_request(connection, request)
+            self._require_projects(connection, request)
+            root_ids: list[str] = []
+            for project in request.projects:
+                _state, root_card_id, _settings_hash = self.project_binding(
+                    connection,
+                    request,
+                    project.project_id,
+                )
+                if root_card_id is None:
+                    raise TaskServiceError("Project root card is not bound")
+                root_ids.append(root_card_id)
+            if len(root_ids) != len(set(root_ids)):
+                raise TaskServiceError("Project roots contain duplicate card IDs")
+            return tuple(root_ids)
+
+    def _require_request(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+    ) -> None:
+        payload = json.loads(request.to_json())
+        expected = (
+            request.request_id,
+            TASK_REQUEST_V2_FORMAT,
+            request.to_json(),
+            request.request_hash,
+            request.management_repository,
+            request.task_owner_host,
+            request.confirmed_by,
+            payload["confirmed_at"],
+            request.replaces_request_id,
+        )
+        row = connection.execute(
+            """
+            SELECT request_id, format_version, request_json, request_hash,
+                   management_repository, task_owner_host, confirmed_by,
+                   confirmed_at, replaces_request_id
+            FROM task_requests
+            WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+        if row is None or tuple(row) != expected:
+            raise TaskServiceError(
+                "request_id is already bound to a different confirmed request"
+            )
+        for event_row in connection.execute(
+            "SELECT occurred_at FROM task_events WHERE request_id = ?",
+            (request.request_id,),
+        ):
+            _require_v2_event_time(event_row[0])
+
+    def _require_projects(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+    ) -> None:
+        expected = _request_project_json(request)
+        rows = connection.execute(
+            """
+            SELECT project_id, project_json
+            FROM task_projects
+            WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchall()
+        actual = {str(row[0]): str(row[1]) for row in rows}
+        if len(actual) != len(rows) or actual != expected:
+            raise TaskServiceError("Task Project registry does not match request")
+
+    @staticmethod
+    def _ensure_event(
+        connection: sqlite3.Connection,
+        *,
+        request: TaskRequestV2,
+        event_key: str,
+        event_type: str,
+        event_json: str,
+        occurred_at: str,
+        task_settings_hash: str | None = None,
+        project_id: str | None = None,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT task_settings_hash, project_id, event_type, event_json,
+                   occurred_at
+            FROM task_events
+            WHERE request_id = ? AND event_key = ?
+            """,
+            (request.request_id, event_key),
+        ).fetchone()
+        expected = (task_settings_hash, project_id, event_type, event_json)
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO task_events (
+                    request_id, task_settings_hash, project_id, event_type,
+                    event_key, event_json, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.request_id,
+                    task_settings_hash,
+                    project_id,
+                    event_type,
+                    event_key,
+                    event_json,
+                    occurred_at,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT task_settings_hash, project_id, event_type, event_json,
+                       occurred_at
+                FROM task_events
+                WHERE request_id = ? AND event_key = ?
+                """,
+                (request.request_id, event_key),
+            ).fetchone()
+        if (
+            row is None
+            or tuple(row[:4]) != expected
+        ):
+            raise TaskServiceError(f"Task event {event_key} does not match")
+        _require_v2_event_time(row[4])
+
+    def _require_project_binding_event(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        project_id: str,
+        root_card_id: str,
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT event_key, task_settings_hash, project_id, event_json
+            FROM task_events
+            WHERE request_id = ? AND event_type = 'project_item_bound'
+              AND project_id = ?
+            """,
+            (request.request_id, project_id),
+        ).fetchall()
+        expected_json = _v2_json(
+            {
+                "idempotency_key": root_project_item_key(
+                    request.request_id,
+                    project_id,
+                ),
+                "root_card_id": root_card_id,
+            }
+        )
+        if (
+            len(rows) != 1
+            or tuple(rows[0])
+            != (
+                f"project_item_bound:{project_id}",
+                None,
+                project_id,
+                expected_json,
+            )
+        ):
+            raise TaskServiceError("Project item binding event does not match")
+
+    @classmethod
+    def _require_request_prepared_event(
+        cls,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT event_key, task_settings_hash, project_id, event_json
+            FROM task_events
+            WHERE request_id = ? AND event_type = 'request_prepared'
+            """,
+            (request.request_id,),
+        ).fetchall()
+        if (
+            len(rows) != 1
+            or tuple(rows[0])
+            != (
+                "request_prepared",
+                None,
+                None,
+                cls._creation_event_json(
+                    request,
+                    context,
+                    source_payload_hash,
+                ),
+            )
+        ):
+            raise TaskServiceError("request_prepared event does not match")
+
+    @staticmethod
+    def _require_settings_row(
+        row: sqlite3.Row,
+        expected: TaskSettingsV2,
+        request: TaskRequestV2,
+    ) -> None:
+        try:
+            parsed = TaskSettingsV2.from_json(row[4], request=request)
+        except TaskSettingsV2Error as error:
+            raise TaskServiceError("stored v2 Task settings are invalid") from error
+        payload = json.loads(expected.to_json())
+        expected_row = (
+            expected.task_settings_hash,
+            expected.request_id,
+            expected.request_hash,
+            expected.format_version,
+            expected.to_json(),
+            expected.management_repository,
+            expected.parent_issue_number,
+            expected.task_owner_host,
+            payload["confirmed_at"],
+        )
+        if parsed != expected or tuple(row) != expected_row:
+            raise TaskServiceError("stored v2 Task settings do not match request")
+
+    def _require_settings_readback(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        expected: TaskSettingsV2,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT task_settings_hash, request_id, request_hash,
+                   format_version, settings_json, management_repository,
+                   parent_issue_number, task_owner_host, confirmed_at
+            FROM task_settings_v2
+            WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+        if row is None:
+            raise TaskServiceError("v2 Task settings readback is missing")
+        self._require_settings_row(row, expected, request)
+
+    def _require_activation_events(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        settings: TaskSettingsV2,
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT event_type, event_key, task_settings_hash, project_id,
+                   event_json
+            FROM task_events
+            WHERE request_id = ?
+              AND event_type IN ('settings_activated', 'active', 'dispatch_ready')
+            ORDER BY event_id
+            """,
+            (request.request_id,),
+        ).fetchall()
+        common_json = _v2_json(
+            {"task_settings_hash": settings.task_settings_hash}
+        )
+        expected = (
+            (
+                "settings_activated",
+                "settings_activated",
+                settings.task_settings_hash,
+                None,
+                common_json,
+            ),
+            (
+                "active",
+                "active",
+                settings.task_settings_hash,
+                None,
+                common_json,
+            ),
+            (
+                "dispatch_ready",
+                "dispatch_ready",
+                settings.task_settings_hash,
+                None,
+                _v2_json(
+                    {
+                        "project_ids": [
+                            project.project_id for project in request.projects
+                        ],
+                        "task_settings_hash": settings.task_settings_hash,
+                    }
+                ),
+            ),
+        )
+        if tuple(tuple(row) for row in rows) != expected:
+            raise TaskServiceError("v2 Task activation events do not match")
+
+
+class TaskServiceV2:
+    """Create one central parent and blocked Build root per selected Project."""
+
+    def __init__(
+        self,
+        database: TaskDatabase,
+        issues: TaskIssueClientV2,
+        project_items: ProjectItemClient,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not isinstance(database, TaskDatabase):
+            raise TaskServiceError("database must be TaskDatabase")
+        self._registry = _TaskRegistryV2(database)
+        self._issues = issues
+        self._project_items = project_items
+        self._clock = clock or _utc_now
+
+    def create_task(
+        self,
+        request: TaskRequestV2,
+        *,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> CreatedTaskV2:
+        if not isinstance(request, TaskRequestV2):
+            raise TaskServiceError("request must be TaskRequestV2")
+        if request.replaces_request_id is not None:
+            raise TaskServiceError(
+                "replacement requests are unavailable until Task 12"
+            )
+        if len(request.task_content.title) > 256:
+            raise TaskServiceError("Task title is longer than GitHub allows")
+        blocked_states = {
+            project.project_id: "blocked" for project in request.projects
+        }
+        initial_body = build_task_issue_body_v2(request, blocked_states)
+        try:
+            self._registry.prepare(request, context, source_payload_hash)
+        except TaskDatabaseError as error:
+            raise TaskServiceError("Task request preparation failed") from error
+        parent = self._ensure_parent(
+            request,
+            initial_body,
+            context,
+            source_payload_hash,
+        )
+        for project in request.projects:
+            self._ensure_project_item(request, parent, project)
+        try:
+            settings = self._registry.activate(request, self._now())
+        except TaskDatabaseError as error:
+            raise TaskServiceError("Task activation failed") from error
+        root_ids = self._registry.root_card_ids(request)
+        released = tuple(
+            self._release_project_item(request, parent, project, root_card_id)
+            for project, root_card_id in zip(
+                request.projects,
+                root_ids,
+                strict=True,
+            )
+        )
+        projected_parent = self._project_parent_progress(request, parent)
+        return CreatedTaskV2(
+            request=request,
+            settings=settings,
+            parent_issue=projected_parent,
+            project_items=released,
+        )
+
+    def _ensure_parent(
+        self,
+        request: TaskRequestV2,
+        initial_body: str,
+        context: TrustedTurnContext,
+        source_payload_hash: str,
+    ) -> TaskParentIssue:
+        try:
+            with self._registry.guard(request) as connection:
+                issue_number = self._registry.parent_issue_number(
+                    connection,
+                    request,
+                )
+                if issue_number is None:
+                    issue = self._find_parent(request)
+                    if issue is None:
+                        self._registry.require_no_lifecycle_barrier(
+                            connection,
+                            request,
+                        )
+                        issue = self._create_parent(request, initial_body)
+                    self._require_parent(issue, request)
+                    if issue.body != initial_body:
+                        raise TaskServiceError(
+                            "unbound parent issue progress does not match"
+                        )
+                    readback = self._get_parent(request, issue.number)
+                    self._require_parent(readback, request)
+                    if readback != issue or readback.body != initial_body:
+                        raise TaskServiceError("parent issue readback does not match")
+                    self._registry.bind_parent(
+                        connection,
+                        request,
+                        readback.number,
+                        self._now(),
+                        context,
+                        source_payload_hash,
+                    )
+                    return readback
+                self._registry.require_creation_binding(
+                    connection,
+                    request,
+                    context,
+                    source_payload_hash,
+                    issue_number,
+                )
+                issue = self._get_parent(request, issue_number)
+                self._require_parent(issue, request)
+                return issue
+        except TaskDatabaseError as error:
+            raise TaskServiceError("parent issue binding failed") from error
+
+    def _ensure_project_item(
+        self,
+        request: TaskRequestV2,
+        parent: TaskParentIssue,
+        project: TaskProject,
+    ) -> ProjectExecutionItem:
+        key = root_project_item_key(request.request_id, project.project_id)
+        try:
+            with self._registry.guard(request) as connection:
+                bound_parent = self._registry.parent_issue_number(connection, request)
+                if bound_parent != parent.number:
+                    raise TaskServiceError("Project item parent binding changed")
+                state, root_card_id, _settings_hash = self._registry.project_binding(
+                    connection,
+                    request,
+                    project.project_id,
+                )
+                if root_card_id is None:
+                    matches = self._find_project_items(request, key)
+                    if len(matches) > 1:
+                        raise TaskServiceError(
+                            "Project item key matched more than one root"
+                        )
+                    item = (
+                        matches[0]
+                        if matches
+                        else self._create_project_item_after_guard(
+                            connection,
+                            request,
+                            parent,
+                            project.repository,
+                            key,
+                        )
+                    )
+                    self._require_project_item(
+                        item,
+                        parent,
+                        project.repository,
+                        key,
+                        allowed_states={"blocked"},
+                    )
+                    readback = self._get_project_item(request, item.item_id)
+                    self._require_project_item(
+                        readback,
+                        parent,
+                        project.repository,
+                        key,
+                        allowed_states={"blocked"},
+                    )
+                    if readback != item:
+                        raise TaskServiceError("Project item readback does not match")
+                    self._registry.bind_project_item(
+                        connection,
+                        request,
+                        project.project_id,
+                        readback,
+                        self._now(),
+                    )
+                    return readback
+                item = self._get_project_item(request, root_card_id)
+                if state == "bound" and item.state != "blocked":
+                    raise TaskServiceError(
+                        "Project item was released before activation"
+                    )
+                self._require_project_item(
+                    item,
+                    parent,
+                    project.repository,
+                    key,
+                    allowed_states=(
+                        {"blocked"}
+                        if state == "bound"
+                        else {"blocked", "ready"}
+                    ),
+                )
+                if state == "prepared":
+                    raise TaskServiceError("prepared Project unexpectedly has a root")
+                self._registry.bind_project_item(
+                    connection,
+                    request,
+                    project.project_id,
+                    item,
+                    self._now(),
+                )
+                return item
+        except TaskDatabaseError as error:
+            raise TaskServiceError("Project item binding failed") from error
+
+    def _release_project_item(
+        self,
+        request: TaskRequestV2,
+        parent: TaskParentIssue,
+        project: TaskProject,
+        root_card_id: str,
+    ) -> ProjectExecutionItem:
+        key = root_project_item_key(request.request_id, project.project_id)
+        with self._registry.active_external_write(request):
+            item = self._get_project_item(request, root_card_id)
+            self._require_project_item(
+                item,
+                parent,
+                project.repository,
+                key,
+                allowed_states={"blocked", "ready"},
+            )
+            if item.state == "blocked":
+                try:
+                    item = self._project_items.release_item(
+                        request.management_repository,
+                        item.item_id,
+                    )
+                except Exception as error:
+                    raise TaskServiceError("Project item release failed") from error
+                self._require_project_item(
+                    item,
+                    parent,
+                    project.repository,
+                    key,
+                    allowed_states={"ready"},
+                )
+                item = self._get_project_item(request, item.item_id)
+            self._require_project_item(
+                item,
+                parent,
+                project.repository,
+                key,
+                allowed_states={"ready"},
+            )
+            return item
+
+    def _project_parent_progress(
+        self,
+        request: TaskRequestV2,
+        parent: TaskParentIssue,
+    ) -> TaskParentIssue:
+        with self._registry.active_external_write(request):
+            issue = self._get_parent(request, parent.number)
+            self._require_parent(issue, request)
+            expected_body = replace_task_progress_v2(
+                issue.body,
+                request,
+                {project.project_id: "ready" for project in request.projects},
+            )
+            if issue.body != expected_body:
+                try:
+                    updated = self._issues.update_issue(
+                        request.management_repository,
+                        issue.number,
+                        title=request.task_content.title,
+                        body=expected_body,
+                    )
+                except Exception as error:
+                    raise TaskServiceError("parent progress update failed") from error
+                self._require_parent(updated, request)
+                issue = self._get_parent(request, issue.number)
+            self._require_parent(issue, request)
+            if issue.body != expected_body:
+                raise TaskServiceError("parent progress readback does not match")
+            return issue
+
+    def _find_parent(self, request: TaskRequestV2) -> TaskParentIssue | None:
+        try:
+            issue = self._issues.find_issue(
+                request.management_repository,
+                request.request_id,
+            )
+        except Exception as error:
+            raise TaskServiceError("parent issue lookup failed") from error
+        if issue is not None and not isinstance(issue, TaskParentIssue):
+            raise TaskServiceError("parent issue lookup returned an invalid value")
+        return issue
+
+    def _create_parent(
+        self,
+        request: TaskRequestV2,
+        body: str,
+    ) -> TaskParentIssue:
+        try:
+            issue = self._issues.create_issue(
+                request.management_repository,
+                request.task_content.title,
+                body,
+            )
+        except Exception as error:
+            raise TaskServiceError("parent issue creation failed") from error
+        if not isinstance(issue, TaskParentIssue):
+            raise TaskServiceError("parent issue creation returned an invalid value")
+        return issue
+
+    def _get_parent(
+        self,
+        request: TaskRequestV2,
+        issue_number: int,
+    ) -> TaskParentIssue:
+        try:
+            issue = self._issues.get_issue(
+                request.management_repository,
+                issue_number,
+            )
+        except Exception as error:
+            raise TaskServiceError("parent issue readback failed") from error
+        if not isinstance(issue, TaskParentIssue):
+            raise TaskServiceError("parent issue readback returned an invalid value")
+        return issue
+
+    def _find_project_items(
+        self,
+        request: TaskRequestV2,
+        key: str,
+    ) -> tuple[ProjectExecutionItem, ...]:
+        try:
+            items = self._project_items.find_items(
+                request.management_repository,
+                key,
+            )
+        except Exception as error:
+            raise TaskServiceError("Project item lookup failed") from error
+        if not isinstance(items, tuple) or any(
+            not isinstance(item, ProjectExecutionItem) for item in items
+        ):
+            raise TaskServiceError("Project item lookup returned an invalid value")
+        return items
+
+    def _create_project_item(
+        self,
+        request: TaskRequestV2,
+        parent: TaskParentIssue,
+        project_repository: str,
+        key: str,
+    ) -> ProjectExecutionItem:
+        try:
+            item = self._project_items.create_item(
+                request.management_repository,
+                parent.number,
+                project_repository,
+                key,
+                state="blocked",
+            )
+        except Exception as error:
+            raise TaskServiceError("Project item creation failed") from error
+        if not isinstance(item, ProjectExecutionItem):
+            raise TaskServiceError("Project item creation returned an invalid value")
+        return item
+
+    def _create_project_item_after_guard(
+        self,
+        connection: sqlite3.Connection,
+        request: TaskRequestV2,
+        parent: TaskParentIssue,
+        project_repository: str,
+        key: str,
+    ) -> ProjectExecutionItem:
+        self._registry.require_no_lifecycle_barrier(connection, request)
+        return self._create_project_item(
+            request,
+            parent,
+            project_repository,
+            key,
+        )
+
+    def _get_project_item(
+        self,
+        request: TaskRequestV2,
+        item_id: str,
+    ) -> ProjectExecutionItem:
+        try:
+            item = self._project_items.get_item(
+                request.management_repository,
+                item_id,
+            )
+        except Exception as error:
+            raise TaskServiceError("Project item readback failed") from error
+        if not isinstance(item, ProjectExecutionItem):
+            raise TaskServiceError("Project item readback returned an invalid value")
+        return item
+
+    @staticmethod
+    def _require_parent(
+        issue: TaskParentIssue,
+        request: TaskRequestV2,
+    ) -> None:
+        verify_task_issue_v2_content(issue, request)
+
+    @staticmethod
+    def _require_project_item(
+        item: ProjectExecutionItem,
+        parent: TaskParentIssue,
+        project_repository: str,
+        key: str,
+        *,
+        allowed_states: set[str],
+    ) -> None:
+        if (
+            not isinstance(item, ProjectExecutionItem)
+            or item.idempotency_key != key
+            or item.parent_issue_number != parent.number
+            or item.project_repository != project_repository
+            or item.state not in allowed_states
+        ):
+            raise TaskServiceError("Project item does not match exact root binding")
+
+    def _now(self) -> str:
+        return _v2_timestamp(self._clock())

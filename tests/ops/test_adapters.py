@@ -9,10 +9,15 @@ import pytest
 from forge.ops.hermes import (
     GateError,
     HermesStore,
+    ProjectTaskCardSpec,
     RootTaskCardSpec,
     build_create_argv,
+    build_project_create_argv,
     build_root_create_argv,
+    parse_project_task_card_key,
     parse_task_card_key,
+    project_step_card_key,
+    project_task_card_key,
     step_card_key,
     task_card_key,
 )
@@ -374,4 +379,65 @@ def test_root_task_create_argv_is_builder_without_parent() -> None:
     assert argv[argv.index("--assignee") + 1] == "builder"
     assert argv[argv.index("--skill") + 1] == "build-task"
     assert argv[argv.index("--idempotency-key") + 1] == ROOT_KEY
+    assert "--parent" not in argv
+
+
+def test_v2_card_keys_bind_request_project_and_step_without_v1_aliasing() -> None:
+    request_id = "4485be21-2a8f-41b8-a2a2-e25722df284e"
+    project_id = "c" * 64
+
+    root = project_task_card_key(request_id, project_id)
+    review = project_step_card_key(
+        request_id,
+        project_id,
+        TaskStep.REVIEW,
+        SOURCE_RESULT_HASH,
+    )
+
+    assert root == f"forge-task-v2:{request_id}:{project_id}:build"
+    assert review == (
+        f"forge-step-v2:{request_id}:{project_id}:review:"
+        f"{SOURCE_RESULT_HASH[:16]}"
+    )
+    assert parse_project_task_card_key(root).step is TaskStep.BUILD
+    assert parse_project_task_card_key(review).project_id == project_id
+    with pytest.raises(GateError, match="new forge-task or forge-step"):
+        parse_task_card_key(root)
+
+
+def test_v2_card_argv_uses_project_worktree_and_keeps_exact_snapshot_body() -> None:
+    request_id = "4485be21-2a8f-41b8-a2a2-e25722df284e"
+    project_id = "c" * 64
+    body = json.dumps(
+        {
+            "format_version": "forge-project-card/v2",
+            "project": {
+                "project_id": project_id,
+                "repository": "owner/actual-project",
+                "workspace": "/source/actual-project",
+                "remote_name": "origin",
+                "base_branch": "main",
+                "base_commit": "d" * 40,
+                "host_id": "d6f70d5d-6482-45f5-80d2-219ec2ad4d19",
+            },
+            "request_id": request_id,
+            "step": "build",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    spec = ProjectTaskCardSpec(
+        step=TaskStep.BUILD,
+        title="Build Project: owner/actual-project",
+        body=body,
+        idempotency_key=project_task_card_key(request_id, project_id),
+        parent_id=None,
+        skill="build-task",
+    )
+
+    argv = build_project_create_argv(spec, Path("C:/tasks/project-worktree"))
+
+    assert argv[argv.index("--workspace") + 1] == "dir:C:/tasks/project-worktree"
+    assert argv[argv.index("--body") + 1] == body
+    assert argv[argv.index("--idempotency-key") + 1] == spec.idempotency_key
     assert "--parent" not in argv

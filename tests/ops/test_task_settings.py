@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import pytest
 
-import forge.ops.task_settings as task_settings_module
+import forge.ops.task_database as task_database_module
 from forge.ops.task_options import MergeMode, TaskFlow
 from forge.ops.task_settings import (
     TASK_SETTINGS_FORMAT,
@@ -108,6 +108,10 @@ def test_task_content_hash_uses_canonical_utf8_json() -> None:
     ).encode("utf-8")
 
     assert task_content_hash(content) == hashlib.sha256(canonical).hexdigest()
+    assert (
+        task_content_hash(content)
+        == "5d5bd28e8ff50a52de088e27c00e1a6f96e3b77b5c9b0d1211e92946cebc034b"
+    )
 
 
 def test_task_settings_hash_is_canonical_and_excludes_status() -> None:
@@ -135,6 +139,9 @@ def test_task_settings_hash_is_canonical_and_excludes_status() -> None:
     ).hexdigest()
 
     assert task_settings_hash(bound) == expected
+    assert expected == (
+        "ce04fe1beb53b5b1e7c1a6ed5321a4bb025aa93cd3b1ce3f18ef8c2a90f0c2f1"
+    )
     assert (
         task_settings_hash(replace(bound, status=TaskSettingsStatus.ACTIVE)) == expected
     )
@@ -411,6 +418,26 @@ def test_active_guard_serializes_external_write_with_lifecycle_end(
     assert isinstance(cancel_result, TaskSettingsError)
     assert "lifecycle status is immutable" in str(cancel_result)
     assert store.get_active(active.request_id) is None
+
+
+def test_active_guard_allows_same_store_status_read(tmp_path: Path) -> None:
+    store = TaskSettingsStore(tmp_path / "task-settings.db")
+    active = _activate_one(store)
+
+    with store.guard_active(active):
+        assert store.get_active(active.request_id) == active
+
+
+def test_active_guard_allows_other_store_status_read(tmp_path: Path) -> None:
+    database_path = tmp_path / "task-settings.db"
+    store = TaskSettingsStore(database_path)
+    other_store = TaskSettingsStore(database_path)
+    active = _activate_one(store)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with store.guard_active(active):
+            status_read = pool.submit(other_store.get_active, active.request_id)
+            assert status_read.result(timeout=1) == active
 
 
 def test_active_guard_rejects_a_task_that_already_ended(tmp_path: Path) -> None:
@@ -736,7 +763,7 @@ def test_new_database_has_exact_schema_version_and_terminal_index(
             ("task_settings_one_terminal_event",),
         ).fetchone()
 
-    assert version == 1
+    assert version == 2
     assert index_sql is not None
     normalized_index_sql = " ".join(index_sql[0].split()).lower()
     assert "unique index" in normalized_index_sql
@@ -829,13 +856,7 @@ def test_store_normalizes_commit_error(
     real_connect = sqlite3.connect
 
     class CommitFailingConnection(sqlite3.Connection):
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            traceback: object,
-        ) -> bool:
-            del exc_type, exc_value, traceback
+        def commit(self) -> None:
             raise sqlite3.OperationalError("forced commit failure")
 
     def connect_with_commit_failure(
@@ -845,7 +866,7 @@ def test_store_normalizes_commit_error(
         return real_connect(*args, **kwargs)
 
     monkeypatch.setattr(
-        task_settings_module.sqlite3,
+        task_database_module.sqlite3,
         "connect",
         connect_with_commit_failure,
     )
@@ -865,15 +886,8 @@ def test_store_normalizes_rollback_error(
     real_connect = sqlite3.connect
 
     class RollbackFailingConnection(sqlite3.Connection):
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            traceback: object,
-        ) -> bool:
-            if exc_type is not None:
-                raise sqlite3.OperationalError("forced rollback failure")
-            return super().__exit__(exc_type, exc_value, traceback)
+        def rollback(self) -> None:
+            raise sqlite3.OperationalError("forced rollback failure")
 
     def connect_with_rollback_failure(
         *args: object, **kwargs: object
@@ -882,7 +896,7 @@ def test_store_normalizes_rollback_error(
         return real_connect(*args, **kwargs)
 
     monkeypatch.setattr(
-        task_settings_module.sqlite3,
+        task_database_module.sqlite3,
         "connect",
         connect_with_rollback_failure,
     )

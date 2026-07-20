@@ -256,6 +256,15 @@ case "$PLUGIN_LIST" in
   *) echo "[verify] infinity-forge plugin is not enabled" >&2; exit 1 ;;
 esac
 
+TOOLSET_PROFILE_ARGS=(
+  --worker-home "$HOME/.hermes/profiles/builder"
+  --worker-home "$HOME/.hermes/profiles/reviewer"
+  --worker-home "$HOME/.hermes/profiles/deep_checker"
+  --worker-home "$HOME/.hermes/profiles/fix"
+)
+PYTHONPATH="$REPO_DIR" "$HERMES_PY" -m forge.ops.hermes_toolsets \
+  verify --main-home "$HOME/.hermes" "${TOOLSET_PROFILE_ARGS[@]}"
+
 CHOOSER_EXPECTED_COMMIT="$EXPECTED_COMMIT"
 CHOOSER_HERMES_ROOT="$HERMES_ROOT"
 CHOOSER_EXPECTED_REPOSITORY="$REPOSITORY"
@@ -362,6 +371,7 @@ for MarkerFile in \
   gateway/run.py; do
   grep -Fq "INFINITY_FORGE_PRE_USER_TURN_V1" "$HERMES_ROOT/$MarkerFile"
 done
+grep -Fq "INFINITY_FORGE_SUBSCRIPTION_WORKER_V1" "$HERMES_ROOT/hermes_cli/kanban_db.py"
 
 for Profile in builder reviewer deep_checker fix; do
   test -d "$HOME/.hermes/profiles/$Profile"

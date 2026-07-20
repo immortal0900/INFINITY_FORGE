@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -11,6 +12,11 @@ WORKFLOW = ROOT / ".github" / "workflows" / "capability-eval.yml"
 DEPLOY = ROOT / "forge" / "scripts" / "deploy-vps.sh"
 LOCAL_DEPLOY = ROOT / "forge" / "scripts" / "deploy.ps1"
 WINDOWS_DEPLOY = ROOT / "forge" / "scripts" / "deploy-windows.ps1"
+HERMES_INSTALLER = ROOT / "forge" / "hermes_change" / "installer.py"
+HERMES_TARGETS = ROOT / "forge" / "hermes_change" / "targets.json"
+HERMES_PLUGIN_MANIFEST = (
+    ROOT / "forge" / "hermes_plugin" / "infinity_forge" / "plugin.yaml"
+)
 
 
 def test_eval_is_the_single_stable_ruleset_context() -> None:
@@ -19,6 +25,15 @@ def test_eval_is_the_single_stable_ruleset_context() -> None:
     assert re.findall(r"(?m)^  eval:\s*$", workflow) == ["  eval:"]
     assert "ruleset required status context" in workflow
     assert "private/free" not in workflow
+
+
+def test_infinity_forge_manifest_declares_only_the_four_main_task_tools() -> None:
+    manifest = HERMES_PLUGIN_MANIFEST.read_text(encoding="utf-8")
+
+    assert "kind: backend" in manifest
+    assert manifest.count("provides_tools:") == 1
+    declared = re.findall(r"(?m)^  - (list_tasks|task_status|send_to_task|stop_task)$", manifest)
+    assert declared == ["list_tasks", "task_status", "send_to_task", "stop_task"]
 
 
 def test_eval_runs_pytest_through_the_configured_python() -> None:
@@ -307,6 +322,33 @@ def test_both_server_deploy_layers_run_the_same_actual_chooser_smoke() -> None:
     assert 'rm -rf -- "$CHOOSER_SMOKE_CWD"' not in server_smoke
 
 
+def test_deployable_hermes_change_carries_the_classic_cli_chooser() -> None:
+    installer = HERMES_INSTALLER.read_text(encoding="utf-8")
+    server_deploy = DEPLOY.read_text(encoding="utf-8")
+    windows_deploy = WINDOWS_DEPLOY.read_text(encoding="utf-8")
+
+    assert '"cli.py": change_cli_source' in installer
+    assert "_prompt_choice_modal" in installer
+    assert 'install-hermes-change.py" build' in server_deploy
+    assert '--hermes-root "$HERMES_SOURCE_TEMP"' in server_deploy
+    assert '"cli.py"' in windows_deploy
+
+
+def test_all_deployments_use_the_exact_hermes_change_target_manifest() -> None:
+    targets = json.loads(HERMES_TARGETS.read_text(encoding="utf-8"))
+    installer = HERMES_INSTALLER.read_text(encoding="utf-8")
+    server_deploy = DEPLOY.read_text(encoding="utf-8")
+    windows_deploy = WINDOWS_DEPLOY.read_text(encoding="utf-8")
+
+    assert len(targets) == 24
+    assert len(targets) == len(set(targets))
+    assert all("\\" not in target and not Path(target).is_absolute() for target in targets)
+    assert "_load_change_targets" in installer
+    assert 'forge/hermes_change/targets.json' in windows_deploy
+    assert '"$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" install' in server_deploy
+    assert '"$HERMES_PY" "$REPO_DIR/forge/scripts/install-hermes-change.py" verify' in server_deploy
+
+
 def test_hermes_change_package_is_version_bound_and_committed_atomically() -> None:
     deploy = DEPLOY.read_text(encoding="utf-8")
 
@@ -503,3 +545,26 @@ def test_local_deploy_verifies_complete_runtime_and_smokes_workers() -> None:
         assert contract in deploy
     assert 'REPOSITORY="$(cd "$REPO_DIR" && "$GH_BIN" repo view' in deploy
     assert "repo view --repo" not in deploy
+
+
+def test_every_deploy_layer_applies_and_reads_back_hermes_tool_visibility() -> None:
+    linux = DEPLOY.read_text(encoding="utf-8")
+    windows = WINDOWS_DEPLOY.read_text(encoding="utf-8")
+    coordinator = LOCAL_DEPLOY.read_text(encoding="utf-8")
+
+    for script in (linux, windows, coordinator):
+        assert "forge.ops.hermes_toolsets" in script
+        assert "verify" in script
+        for profile in ("builder", "reviewer", "deep_checker", "fix"):
+            assert profile in script
+    for action in ("backup", "apply", "restore", "verify"):
+        assert f" {action}" in linux
+    for action in ("Backup", "Apply", "Restore", "Verify"):
+        assert f"Toolset{action}" in windows
+
+
+def test_deploy_verification_includes_subscription_worker_patch() -> None:
+    deploy = WINDOWS_DEPLOY.read_text(encoding="utf-8")
+
+    assert "hermes_cli\\kanban_db.py" in deploy
+    assert "INFINITY_FORGE_SUBSCRIPTION_WORKER_V1" in deploy

@@ -16,6 +16,7 @@ from .safe_files import (
 from .task_options import MergeMode
 from .task_flow import TaskFlowState, TaskFlowStatus, required_steps
 from .task_settings import TaskSettings, TaskSettingsStatus
+from .task_settings_v2 import TaskSettingsV2
 
 
 AUTO_MERGE_ALLOWED = "AUTO_MERGE_ALLOWED"
@@ -83,6 +84,94 @@ class MergeDecision:
     reason: str
     tested_commit: str | None = None
     already_merged: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectMergeProof:
+    """One Project's immutable result before the parent merge barrier opens."""
+
+    project_id: str
+    repository: str
+    decision: str
+    expected_head_commit: str
+    already_merged: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectGroupDecision:
+    """Parent-level decision containing only a confirmed full-auto order."""
+
+    code: str
+    reason: str
+    ordered_project_ids: tuple[str, ...] = ()
+
+
+def decide_project_group(
+    settings: TaskSettingsV2,
+    proofs: tuple[ProjectMergeProof, ...],
+) -> ProjectGroupDecision:
+    """Open a multi-Project barrier only after every exact proof is current."""
+
+    if not isinstance(settings, TaskSettingsV2):
+        return ProjectGroupDecision(CHECK_ERROR, "v2 Task settings are invalid")
+    if not isinstance(proofs, tuple) or any(
+        not isinstance(proof, ProjectMergeProof) for proof in proofs
+    ):
+        return ProjectGroupDecision(CHECK_ERROR, "Project proofs must be a tuple")
+    expected = {project.project_id: project for project in settings.projects}
+    if len(proofs) != len(expected) or {proof.project_id for proof in proofs} != set(
+        expected
+    ):
+        return ProjectGroupDecision(
+            WAIT,
+            "every Project must have one current merge proof",
+        )
+    if len({proof.project_id for proof in proofs}) != len(proofs):
+        return ProjectGroupDecision(CHECK_ERROR, "Project merge proofs are duplicated")
+    for proof in proofs:
+        project = expected[proof.project_id]
+        if (
+            proof.repository != project.repository
+            or _COMMIT_PATTERN.fullmatch(proof.expected_head_commit) is None
+            or type(proof.already_merged) is not bool
+        ):
+            return ProjectGroupDecision(
+                CHECK_ERROR,
+                "Project merge proof does not match exact settings",
+            )
+    if settings.merge_mode is MergeMode.MANUAL:
+        return ProjectGroupDecision(
+            MANUAL_MERGE_REQUIRED,
+            "this Task requires a person to merge every Project",
+        )
+    if len(settings.projects) > 1 and settings.merge_mode is MergeMode.SAFE_AUTO:
+        return ProjectGroupDecision(
+            MANUAL_MERGE_REQUIRED,
+            "multi-Project safe_auto requires a person to merge",
+        )
+    blocked = tuple(proof for proof in proofs if proof.decision != AUTO_MERGE_ALLOWED)
+    if blocked:
+        return ProjectGroupDecision(
+            WAIT,
+            "every Project must pass current merge checks before any merge",
+        )
+    if len(settings.projects) == 1:
+        return ProjectGroupDecision(
+            AUTO_MERGE_ALLOWED,
+            "the Project passed every current merge check",
+            (settings.projects[0].project_id,),
+        )
+    order = settings.merge_order
+    if order is None or set(order) != set(expected) or len(order) != len(expected):
+        return ProjectGroupDecision(
+            MANUAL_MERGE_REQUIRED,
+            "multi-Project full_auto has no exact confirmed merge order",
+        )
+    return ProjectGroupDecision(
+        AUTO_MERGE_ALLOWED,
+        "every Project passed; use the confirmed dependency order",
+        order,
+    )
 
 
 def _decision(

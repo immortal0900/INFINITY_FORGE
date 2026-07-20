@@ -7,7 +7,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Iterator, Mapping
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -15,11 +15,14 @@ from pathlib import Path
 from typing import Never
 from uuid import UUID
 
+from forge.ops.task_database import (
+    TaskDatabase,
+    TaskDatabaseError,
+)
 from forge.ops.task_options import MergeMode, Mode, TaskFlow
 
 
 TASK_SETTINGS_FORMAT = "forge-task-settings/v1"
-TASK_SETTINGS_SCHEMA_VERSION = 1
 MAX_AUTO_MERGE_DURATION = timedelta(hours=12)
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -29,115 +32,6 @@ _PULL_REQUEST_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<repository>[^/\s]+/[^/\s]+)/pull/[1-9][0-9]*$"
 )
 _AUTO_EXPIRY_UNSET = object()
-
-_TASK_SETTINGS_TABLE_SQL = """
-CREATE TABLE task_settings (
-    request_id TEXT PRIMARY KEY,
-    format_version TEXT NOT NULL
-        CHECK (format_version = 'forge-task-settings/v1'),
-    repository TEXT NOT NULL,
-    mode TEXT NOT NULL CHECK (mode = 'task'),
-    task_content_hash TEXT NOT NULL,
-    task_flow TEXT NOT NULL CHECK (
-        task_flow IN (
-            'build',
-            'build_review',
-            'build_review_deep_check'
-        )
-    ),
-    merge_mode TEXT NOT NULL CHECK (
-        merge_mode IN ('manual', 'safe_auto', 'full_auto')
-    ),
-    confirmed_by TEXT NOT NULL,
-    confirmed_at TEXT NOT NULL,
-    auto_merge_expires_at TEXT
-)
-"""
-
-_TASK_SETTINGS_EVENTS_TABLE_SQL = """
-CREATE TABLE task_settings_events (
-    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_id TEXT NOT NULL
-        REFERENCES task_settings(request_id),
-    event_type TEXT NOT NULL CHECK (
-        event_type IN (
-            'prepared',
-            'issue_bound',
-            'active',
-            'cancelled',
-            'expired',
-            'merged'
-        )
-    ),
-    occurred_at TEXT NOT NULL,
-    issue_number INTEGER,
-    task_settings_hash TEXT,
-    UNIQUE (request_id, event_type),
-    CHECK (
-        (
-            event_type = 'issue_bound'
-            AND issue_number IS NOT NULL
-            AND task_settings_hash IS NOT NULL
-        )
-        OR
-        (
-            event_type <> 'issue_bound'
-            AND issue_number IS NULL
-            AND task_settings_hash IS NULL
-        )
-    )
-)
-"""
-
-_BRANCH_REFRESH_INTENTS_TABLE_SQL = """
-CREATE TABLE task_branch_refresh_intents (
-    request_id TEXT NOT NULL
-        REFERENCES task_settings(request_id),
-    refresh_number INTEGER NOT NULL
-        CHECK (refresh_number BETWEEN 1 AND 3),
-    pr_url TEXT NOT NULL,
-    expected_base_commit TEXT NOT NULL,
-    expected_head_commit TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    current_base_commit TEXT,
-    current_head_commit TEXT,
-    completed_at TEXT,
-    PRIMARY KEY (request_id, refresh_number),
-    UNIQUE (request_id, expected_base_commit, expected_head_commit),
-    CHECK (
-        (
-            current_base_commit IS NULL
-            AND current_head_commit IS NULL
-            AND completed_at IS NULL
-        )
-        OR
-        (
-            current_base_commit IS NOT NULL
-            AND current_head_commit IS NOT NULL
-            AND completed_at IS NOT NULL
-        )
-    ),
-    CHECK (
-        current_base_commit IS NULL
-        OR current_base_commit <> expected_base_commit
-        OR current_head_commit <> expected_head_commit
-    )
-)
-"""
-
-_TERMINAL_EVENT_INDEX_SQL = """
-CREATE UNIQUE INDEX task_settings_one_terminal_event
-    ON task_settings_events (request_id)
-    WHERE event_type IN ('cancelled', 'expired', 'merged')
-"""
-
-_EXPECTED_SCHEMA_OBJECTS = {
-    ("table", "task_settings"): _TASK_SETTINGS_TABLE_SQL,
-    ("table", "task_settings_events"): _TASK_SETTINGS_EVENTS_TABLE_SQL,
-    ("table", "task_branch_refresh_intents"): _BRANCH_REFRESH_INTENTS_TABLE_SQL,
-    ("index", "task_settings_one_terminal_event"): _TERMINAL_EVENT_INDEX_SQL,
-}
-
 
 class TaskSettingsError(ValueError):
     """Raised when Task settings are invalid or an immutable value would change."""
@@ -588,52 +482,11 @@ class TaskSettingsStore:
     """Persist immutable settings plus append-only lifecycle events."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = _prepare_database_path(database_path)
-        self._initialize()
-
-    def _connect(self) -> sqlite3.Connection:
         try:
-            connection = sqlite3.connect(self.database_path, timeout=5)
-        except sqlite3.Error as error:
-            raise TaskSettingsError(
-                "database path could not be opened safely"
-            ) from error
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
-
-    def _initialize(self) -> None:
-        with (
-            _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
-        ):
-            # RISK(breaking/data-loss): schema v1 is a clean break. Any other
-            # version or object shape must stop before settings are read or written.
-            _begin_write(connection)
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            schema_objects = _load_schema_objects(connection)
-            if not schema_objects:
-                if version != 0:
-                    raise TaskSettingsError(
-                        "Task settings schema version "
-                        f"{version} is not supported; expected "
-                        f"{TASK_SETTINGS_SCHEMA_VERSION}"
-                    )
-                connection.execute(_TASK_SETTINGS_TABLE_SQL)
-                connection.execute(_TASK_SETTINGS_EVENTS_TABLE_SQL)
-                connection.execute(_BRANCH_REFRESH_INTENTS_TABLE_SQL)
-                connection.execute(_TERMINAL_EVENT_INDEX_SQL)
-                connection.execute(
-                    f"PRAGMA user_version = {TASK_SETTINGS_SCHEMA_VERSION}"
-                )
-            elif version != TASK_SETTINGS_SCHEMA_VERSION:
-                raise TaskSettingsError(
-                    "Task settings schema version "
-                    f"{version} is not supported; expected "
-                    f"{TASK_SETTINGS_SCHEMA_VERSION}"
-                )
-            _validate_schema(connection)
+            self._database = TaskDatabase(database_path)
+        except TaskDatabaseError as error:
+            raise TaskSettingsError(str(error)) from error
+        self.database_path = self._database.database_path
 
     def prepare(self, settings: TaskSettings) -> TaskSettings:
         if not isinstance(settings, TaskSettings):
@@ -646,10 +499,8 @@ class TaskSettingsStore:
 
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.transaction() as connection,
         ):
-            _begin_write(connection)
             cursor = connection.execute(
                 """
                 INSERT INTO task_settings (
@@ -700,10 +551,8 @@ class TaskSettingsStore:
         event_time = _event_time(occurred_at)
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.transaction() as connection,
         ):
-            _begin_write(connection)
             current = self._load_settings(connection, request_id)
             if current.issue_number is not None:
                 if current.issue_number != issue_number:
@@ -742,10 +591,8 @@ class TaskSettingsStore:
         event_time = _event_time(occurred_at)
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.transaction() as connection,
         ):
-            _begin_write(connection)
             current = self._load_settings(connection, request_id)
             if current.status is TaskSettingsStatus.ACTIVE:
                 return current
@@ -787,10 +634,8 @@ class TaskSettingsStore:
         event_time = _event_time(occurred_at)
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.transaction() as connection,
         ):
-            _begin_write(connection)
             current = self._load_settings(connection, request_id)
             if current.status is status:
                 return current
@@ -817,8 +662,7 @@ class TaskSettingsStore:
     def get_active(self, request_id: str) -> TaskSettings | None:
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.read() as connection,
         ):
             exists = connection.execute(
                 "SELECT 1 FROM task_settings WHERE request_id = ?",
@@ -839,26 +683,19 @@ class TaskSettingsStore:
             raise TaskSettingsError("expected Task settings must be active")
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
+            self._database.transaction() as connection,
         ):
-            try:
-                _begin_write(connection)
-                current = self._load_settings(connection, expected.request_id)
-                if current.status is not TaskSettingsStatus.ACTIVE:
-                    raise TaskSettingsError("Task settings are no longer active")
-                if current != expected:
-                    raise TaskSettingsError("Task settings changed before external write")
-                yield ActiveTaskGuard(self, connection, current)
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+            current = self._load_settings(connection, expected.request_id)
+            if current.status is not TaskSettingsStatus.ACTIVE:
+                raise TaskSettingsError("Task settings are no longer active")
+            if current != expected:
+                raise TaskSettingsError("Task settings changed before external write")
+            yield ActiveTaskGuard(self, connection, current)
 
     def list_events(self, request_id: str) -> tuple[TaskSettingsEvent, ...]:
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.read() as connection,
         ):
             self._load_settings(connection, request_id)
             return self._load_events(connection, request_id)
@@ -880,10 +717,8 @@ class TaskSettingsStore:
         event_time = _event_time(occurred_at)
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.transaction() as connection,
         ):
-            _begin_write(connection)
             settings = self._load_settings(connection, request_id)
             _require_active_refresh_settings(settings, pr_url)
             intents = self._load_branch_refresh_intents(connection, request_id)
@@ -947,8 +782,7 @@ class TaskSettingsStore:
             raise TaskSettingsError("applied branch refresh count is invalid")
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.read() as connection,
         ):
             settings = self._load_settings(connection, request_id)
             if settings.status is not TaskSettingsStatus.ACTIVE:
@@ -968,10 +802,8 @@ class TaskSettingsStore:
 
         with (
             _normalize_database_errors(),
-            closing(self._connect()) as connection,
-            connection,
+            self._database.transaction() as connection,
         ):
-            _begin_write(connection)
             return self._complete_branch_refresh_on_connection(
                 connection,
                 intent,
@@ -1280,87 +1112,13 @@ def _event_time(value: datetime | None) -> datetime:
     )
 
 
-def _prepare_database_path(database_path: str | Path) -> Path:
-    try:
-        candidate = Path(database_path).expanduser()
-        if candidate.exists() and candidate.is_symlink():
-            raise TaskSettingsError("database_path must not be a symbolic link")
-        resolved = candidate.resolve(strict=False)
-    except TaskSettingsError:
-        raise
-    except (OSError, TypeError, ValueError) as error:
-        raise TaskSettingsError(
-            "database_path must be a valid filesystem path"
-        ) from error
-
-    parent = resolved.parent
-    try:
-        parent.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise TaskSettingsError(
-            "database parent directory could not be created safely"
-        ) from error
-    if not parent.is_dir():
-        raise TaskSettingsError("database parent directory must be a directory")
-    if resolved.exists() and (resolved.is_symlink() or not resolved.is_file()):
-        raise TaskSettingsError("database_path must be a regular file")
-    return resolved
-
-
-def _begin_write(connection: sqlite3.Connection) -> None:
-    # RISK(race): the lock must be acquired before reading lifecycle state, or two
-    # writers can both validate the same old state and append conflicting events.
-    connection.execute("BEGIN IMMEDIATE")
-
-
 @contextmanager
 def _normalize_database_errors() -> Iterator[None]:
     try:
         yield
     except TaskSettingsError:
         raise
+    except TaskDatabaseError as error:
+        raise TaskSettingsError(str(error)) from error
     except sqlite3.Error as error:
         raise TaskSettingsError("Task settings database operation failed") from error
-
-
-def _normalize_schema_sql(value: str) -> str:
-    return " ".join(value.strip().rstrip(";").split()).casefold()
-
-
-def _load_schema_objects(
-    connection: sqlite3.Connection,
-) -> dict[tuple[str, str], str]:
-    rows = connection.execute(
-        """
-        SELECT type, name, sql
-        FROM sqlite_master
-        WHERE type IN ('table', 'index', 'trigger', 'view')
-          AND name NOT LIKE 'sqlite_%'
-        ORDER BY type, name
-        """
-    ).fetchall()
-    return {
-        (row["type"], row["name"]): row["sql"] for row in rows if row["sql"] is not None
-    }
-
-
-def _validate_schema(connection: sqlite3.Connection) -> None:
-    version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version != TASK_SETTINGS_SCHEMA_VERSION:
-        raise TaskSettingsError(
-            "Task settings schema version "
-            f"{version} is not supported; expected {TASK_SETTINGS_SCHEMA_VERSION}"
-        )
-
-    actual = {
-        key: _normalize_schema_sql(value)
-        for key, value in _load_schema_objects(connection).items()
-    }
-    expected = {
-        key: _normalize_schema_sql(value)
-        for key, value in _EXPECTED_SCHEMA_OBJECTS.items()
-    }
-    if actual != expected:
-        raise TaskSettingsError(
-            "Task settings database schema does not match the clean-break format"
-        )

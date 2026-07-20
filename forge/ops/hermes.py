@@ -13,7 +13,7 @@ from enum import Enum
 from pathlib import Path
 
 from .contracts import RunRecord, TaskRecord
-from .task_flow import TaskCardSpec, TaskStep
+from .task_flow import TaskCardSpec, TaskStep, role_for_step
 from .task_options import TaskRole
 
 
@@ -35,6 +35,52 @@ class TaskCardIdentity:
     issue_number: int
     hash_prefix: str
     step: TaskStep | None = None
+
+
+@dataclass(frozen=True)
+class ProjectTaskCardIdentity:
+    """Parsed v2 identity bound to one request, Project, and flow step."""
+
+    request_id: str
+    project_id: str
+    step: TaskStep
+    hash_prefix: str | None = None
+
+
+@dataclass(frozen=True)
+class ProjectTaskCardSpec:
+    """Exact Hermes card data for one selected Project worktree."""
+
+    step: TaskStep
+    title: str
+    body: str
+    idempotency_key: str
+    parent_id: str | None
+    skill: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.step, TaskStep):
+            raise GateError("Project card step must be a TaskStep")
+        for field in ("title", "body", "idempotency_key", "skill"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.strip():
+                raise GateError(f"{field} must be a non-empty string")
+        if self.parent_id is not None and (
+            not isinstance(self.parent_id, str) or not self.parent_id.strip()
+        ):
+            raise GateError("parent_id must be null or non-empty text")
+        identity = parse_project_task_card_key(self.idempotency_key)
+        if identity.step is not self.step:
+            raise GateError("Project card key step does not match spec")
+        if self.step is TaskStep.BUILD and identity.hash_prefix is None:
+            if self.parent_id is not None:
+                raise GateError("Project root Build card must not have a parent")
+        elif self.parent_id is None:
+            raise GateError("Project step card must have a parent")
+
+    @property
+    def role(self) -> TaskRole:
+        return role_for_step(self.step)
 
 
 @dataclass(frozen=True)
@@ -83,6 +129,15 @@ _TASK_KEY_RE = re.compile(
 _STEP_KEY_RE = re.compile(
     r"^forge-step:(?P<repository>[^/#:\s]+/[^/#:\s]+)#"
     r"(?P<issue>[1-9][0-9]*):"
+    r"(?P<step>build|review|deep_check|fix):(?P<hash>[0-9a-f]{16})$"
+)
+_PROJECT_TASK_KEY_RE = re.compile(
+    r"^forge-task-v2:(?P<request_id>[0-9a-f-]{36}):"
+    r"(?P<project_id>[0-9a-f]{64}):build$"
+)
+_PROJECT_STEP_KEY_RE = re.compile(
+    r"^forge-step-v2:(?P<request_id>[0-9a-f-]{36}):"
+    r"(?P<project_id>[0-9a-f]{64}):"
     r"(?P<step>build|review|deep_check|fix):(?P<hash>[0-9a-f]{16})$"
 )
 _REPOSITORY_RE = re.compile(r"^[^/#:\s]+/[^/#:\s]+$")
@@ -169,6 +224,77 @@ def parse_task_card_key(key: str) -> TaskCardIdentity:
             step=TaskStep(step_match.group("step")),
         )
     raise GateError("idempotency key must use the new forge-task or forge-step format")
+
+
+def _require_request_id(request_id: str) -> str:
+    from uuid import UUID
+
+    if not isinstance(request_id, str):
+        raise GateError("request_id must be a canonical UUID")
+    try:
+        parsed = UUID(request_id)
+    except ValueError as error:
+        raise GateError("request_id must be a canonical UUID") from error
+    if str(parsed) != request_id:
+        raise GateError("request_id must be a canonical UUID")
+    return request_id
+
+
+def _require_project_id(project_id: str) -> str:
+    _require_full_hash(project_id, "project_id")
+    return project_id
+
+
+def project_task_card_key(request_id: str, project_id: str) -> str:
+    """Return the Task 8/9 root key for one selected Project Build."""
+
+    return (
+        f"forge-task-v2:{_require_request_id(request_id)}:"
+        f"{_require_project_id(project_id)}:build"
+    )
+
+
+def project_step_card_key(
+    request_id: str,
+    project_id: str,
+    step: TaskStep,
+    source_result_hash: str,
+) -> str:
+    """Return a v2 child key bound to request, Project, step, and proof."""
+
+    _require_request_id(request_id)
+    _require_project_id(project_id)
+    if not isinstance(step, TaskStep):
+        raise GateError("step must be build, review, deep_check, or fix")
+    _require_full_hash(source_result_hash, "source_result_hash")
+    return (
+        f"forge-step-v2:{request_id}:{project_id}:{step.value}:"
+        f"{source_result_hash[:16]}"
+    )
+
+
+def parse_project_task_card_key(key: str) -> ProjectTaskCardIdentity:
+    """Parse only the separate v2 Project card namespace."""
+
+    key = _require_text(key, "idempotency key")
+    match = _PROJECT_TASK_KEY_RE.fullmatch(key)
+    if match is not None:
+        request_id = _require_request_id(match.group("request_id"))
+        return ProjectTaskCardIdentity(
+            request_id=request_id,
+            project_id=_require_project_id(match.group("project_id")),
+            step=TaskStep.BUILD,
+        )
+    match = _PROJECT_STEP_KEY_RE.fullmatch(key)
+    if match is not None:
+        request_id = _require_request_id(match.group("request_id"))
+        return ProjectTaskCardIdentity(
+            request_id=request_id,
+            project_id=_require_project_id(match.group("project_id")),
+            step=TaskStep(match.group("step")),
+            hash_prefix=match.group("hash"),
+        )
+    raise GateError("idempotency key must use forge-task-v2 or forge-step-v2")
 
 
 def _parse_json_object(value: object, label: str) -> Mapping[str, object]:
@@ -362,6 +488,76 @@ class HermesStore:
             )
         return tuple(result)
 
+    def list_project_runtime_cards(self) -> tuple[HermesTaskCard, ...]:
+        """Read only v2 Project cards from their separate key namespace."""
+
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        t.id, t.title, t.status, t.body, t.idempotency_key,
+                        t.assignee, t.skills, l.parent_id
+                    FROM tasks AS t
+                    LEFT JOIN task_links AS l ON l.child_id = t.id
+                    WHERE t.idempotency_key LIKE 'forge-task-v2:%'
+                       OR t.idempotency_key LIKE 'forge-step-v2:%'
+                    ORDER BY t.id
+                    """
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise GateError("Hermes Project runtime card query failed") from error
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault(_require_text(row["id"], "task id"), []).append(row)
+        result: list[HermesTaskCard] = []
+        seen_keys: dict[str, str] = {}
+        for task_id in sorted(grouped):
+            task_rows = grouped[task_id]
+            first = task_rows[0]
+            key = _require_text(first["idempotency_key"], "idempotency key")
+            parse_project_task_card_key(key)
+            if key in seen_keys and seen_keys[key] != task_id:
+                raise GateError(f"duplicate Project card idempotency key: {key}")
+            seen_keys[key] = task_id
+            parents = {
+                _require_text(row["parent_id"], "parent id")
+                for row in task_rows
+                if row["parent_id"] is not None
+            }
+            if len(parents) > 1:
+                raise GateError(f"Project card has multiple parents: {task_id}")
+            body = first["body"]
+            if not isinstance(body, str) or not body:
+                raise GateError("Hermes Project card body must be non-empty text")
+            raw_skills = first["skills"]
+            if not isinstance(raw_skills, str):
+                raise GateError("Hermes Project card skills must be JSON text")
+            try:
+                skills = json.loads(raw_skills)
+            except json.JSONDecodeError as error:
+                raise GateError("Hermes Project card skills are invalid JSON") from error
+            if (
+                not isinstance(skills, list)
+                or not skills
+                or any(not isinstance(skill, str) or not skill.strip() for skill in skills)
+                or len(skills) != len(set(skills))
+            ):
+                raise GateError("Hermes Project card skills are invalid")
+            result.append(
+                HermesTaskCard(
+                    task_id=task_id,
+                    title=_require_text(first["title"], "task title"),
+                    status=_require_text(first["status"], "task status"),
+                    body=body,
+                    parent_id=next(iter(parents), None),
+                    idempotency_key=key,
+                    assignee=_require_text(first["assignee"], "task assignee"),
+                    skills=tuple(skills),
+                )
+            )
+        return tuple(result)
+
     def completed_runs(self, task_id: str) -> tuple[RunRecord, ...]:
         """Return every successful completed run in stable order."""
 
@@ -410,6 +606,22 @@ class HermesStore:
             raise GateError("Hermes idempotency query failed") from error
         if count > 1:
             raise GateError(f"duplicate Task card idempotency key: {key}")
+        return count == 1
+
+    def has_project_idempotency_key(self, key: str) -> bool:
+        """Check a v2 Project card without accepting it as a v1 identity."""
+
+        parse_project_task_card_key(key)
+        try:
+            with closing(self._connect()) as connection:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
+                    (key,),
+                ).fetchone()[0]
+        except sqlite3.Error as error:
+            raise GateError("Hermes Project card idempotency query failed") from error
+        if count > 1:
+            raise GateError(f"duplicate Project card idempotency key: {key}")
         return count == 1
 
     def latest_completed_run(self, task_id: str) -> RunRecord:
@@ -517,6 +729,47 @@ def build_root_create_argv(
         "--goal-max-turns",
         "20",
     )
+
+
+def build_project_create_argv(
+    spec: ProjectTaskCardSpec,
+    worktree: str | Path,
+) -> tuple[str, ...]:
+    """Build a v2 Hermes command scoped to the Project's isolated worktree."""
+
+    if not isinstance(spec, ProjectTaskCardSpec):
+        raise TypeError("spec must be a ProjectTaskCardSpec")
+    path = Path(worktree)
+    path_text = path.as_posix()
+    if not path_text or path_text == ".":
+        raise ValueError("worktree must be a non-empty path")
+    argv = [
+        "kanban",
+        "create",
+        spec.title,
+        "--body",
+        spec.body,
+        "--assignee",
+        spec.role.value,
+    ]
+    if spec.parent_id is not None:
+        argv.extend(("--parent", spec.parent_id))
+    argv.extend(
+        (
+            "--workspace",
+            f"dir:{path_text}",
+            "--idempotency-key",
+            spec.idempotency_key,
+            "--max-retries",
+            "4",
+            "--skill",
+            spec.skill,
+            "--goal",
+            "--goal-max-turns",
+            "20",
+        )
+    )
+    return tuple(argv)
 
 
 class HermesCreateCommand:

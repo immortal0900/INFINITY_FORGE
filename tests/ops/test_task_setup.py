@@ -2,18 +2,73 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from threading import Barrier, Lock
+from functools import partial
+from pathlib import Path
+from threading import Barrier, Event, Lock
 from time import sleep
 
 import pytest
 
+import forge.ops.task_setup as task_setup_module
+from forge.ops.project_discovery import ProjectPathProbe, ProjectRemote
 from forge.ops.task_options import MergeMode, Mode, TaskFlow
-from forge.ops.task_setup import SetupStep, TaskSetup, TurnResult, begin_task_setup
+from forge.ops.choice_prompt import ChoiceSubmission
+from forge.ops.task_projects import TaskProject
+from forge.ops.task_setup import (
+    SETUP_TIMEOUT,
+    SetupStep,
+    TaskSetup,
+    TaskSetupContext,
+    TurnResult,
+    begin_task_setup,
+)
+from forge.ops.task_settings import MAX_AUTO_MERGE_DURATION
+from forge.ops.task_settings_v2 import TaskRequestV2, task_request_v2_hash
 
 
 NOW = datetime(2026, 7, 16, 9, 0, tzinfo=timezone.utc)
 REPOSITORY = "owner/repo"
 REQUEST_ID = "12345678-1234-4123-8123-123456789abc"
+OWNER_HOST = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+MANAGEMENT_REPOSITORY = "management/forge"
+
+
+def _task_project(
+    root: Path,
+    repository: str,
+    *,
+    remote_name: str = "origin",
+    commit: str = "a" * 40,
+) -> TaskProject:
+    root.mkdir(parents=True, exist_ok=True)
+    return TaskProject.create(
+        repository=repository,
+        workspace=str(root.resolve()),
+        remote_name=remote_name,
+        base_branch="main",
+        base_commit=commit,
+        host_id=OWNER_HOST,
+    )
+
+
+def _task_context(
+    projects: tuple[TaskProject, ...],
+    *,
+    working_directory: str | None = None,
+    discover=None,
+    validate=None,
+    probe=None,
+    bind=None,
+) -> TaskSetupContext:
+    return TaskSetupContext(
+        working_directory=working_directory,
+        management_repository=MANAGEMENT_REPOSITORY,
+        task_owner_host=OWNER_HOST,
+        discover_projects=discover or (lambda _working: projects),
+        validate_projects=validate or (lambda selected: selected),
+        probe_project_path=probe,
+        bind_project=bind,
+    )
 
 
 def test_chooser_shows_plain_human_readable_english_options() -> None:
@@ -22,9 +77,9 @@ def test_chooser_shows_plain_human_readable_english_options() -> None:
     setup = TaskSetup()
 
     mode = setup.handle("s1", "u1", "첫 입력", NOW)
-    flow = setup.handle("s1", "u1", "Task", NOW + timedelta(seconds=1))
+    flow = setup.handle("s1", "u1", "task", NOW + timedelta(seconds=1))
     merge = setup.handle(
-        "s1", "u1", "Build + Review", NOW + timedelta(seconds=2)
+        "s1", "u1", "build_review", NOW + timedelta(seconds=2)
     )
 
     assert [choice["label"] for choice in _hook_result(mode)["choices"]] == [
@@ -86,6 +141,27 @@ def test_chat_replays_first_message_exactly_once_without_external_writes() -> No
     assert chooser.next_step is SetupStep.MODE
     assert replay == TurnResult.replace(first_input)
     assert following_turn == TurnResult.continue_original()
+
+
+def test_chat_recovery_uses_stashed_first_input_not_failed_choice_text() -> None:
+    setup = TaskSetup()
+    setup.handle("recover", "u1", "원래 구현 요청", NOW)
+
+    recovered = setup.recover_in_chat(
+        "recover",
+        "u1",
+        fallback_text="ignored selection text",
+        now=NOW + timedelta(seconds=1),
+    )
+    next_turn = setup.handle(
+        "recover",
+        "u1",
+        "다음 질문",
+        NOW + timedelta(seconds=2),
+    )
+
+    assert recovered == TurnResult.replace("원래 구현 요청")
+    assert next_turn.action == "continue"
 
 
 def test_task_requires_flow_then_merge_mode_and_uses_stashed_input() -> None:
@@ -202,6 +278,116 @@ def test_invalid_choice_stays_on_the_same_required_step() -> None:
     assert result.action == "handled"
     assert result.next_step is SetupStep.TASK_FLOW
     assert result.choices == tuple(flow.value for flow in TaskFlow)
+
+
+def test_structured_submission_applies_only_the_current_prompt_and_keeps_invalid_prompt_unchanged() -> None:
+    setup = TaskSetup()
+    mode = setup.handle("s1", "u1", "first request", NOW)
+
+    assert mode.choice_prompt is not None
+    assert mode.choice_prompt.expires_at == NOW + SETUP_TIMEOUT
+    invalid = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("missing",)),
+        NOW + timedelta(seconds=1),
+    )
+    assert invalid.action == "handled"
+    assert invalid.choice_prompt == mode.choice_prompt
+
+    flow = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("task",)),
+        NOW + timedelta(seconds=2),
+    )
+    assert flow.action == "handled"
+    assert flow.next_step is SetupStep.TASK_FLOW
+    assert flow.choice_prompt is not None
+    assert flow.choice_prompt.choice_prompt_id != mode.choice_prompt.choice_prompt_id
+
+    stale = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("chat",)),
+        NOW + timedelta(seconds=3),
+    )
+    assert stale.action == "handled"
+    assert stale.choice_prompt == flow.choice_prompt
+
+
+def test_structured_submission_does_not_refresh_or_apply_an_expired_prompt() -> None:
+    setup = TaskSetup()
+    mode = setup.handle("s1", "u1", "first request", NOW)
+
+    assert mode.choice_prompt is not None
+    expired = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("task",)),
+        NOW + timedelta(minutes=30),
+    )
+
+    assert expired.action == "handled"
+    assert expired.choice_prompt == mode.choice_prompt
+
+
+def test_pending_choice_prompt_peeks_expired_prompt_without_discarding_it() -> None:
+    setup = TaskSetup()
+    mode = setup.handle("s1", "u1", "first request", NOW)
+
+    assert mode.choice_prompt is not None
+    peeked = setup.pending_choice_prompt(
+        "s1", "u1", NOW + SETUP_TIMEOUT
+    )
+    expired = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("task",)),
+        NOW + SETUP_TIMEOUT,
+    )
+
+    assert peeked == mode.choice_prompt
+    assert expired.choice_prompt == mode.choice_prompt
+    assert "expired" in str(expired.text)
+
+
+def test_new_session_discards_stale_structured_submission_before_it_can_apply() -> None:
+    setup = TaskSetup()
+    mode = setup.handle("s1", "u1", "first request", NOW)
+
+    assert mode.choice_prompt is not None
+    stale = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("task",)),
+        NOW + timedelta(seconds=1),
+        is_new_session=True,
+    )
+    fresh = setup.handle("s1", "u1", "new request", NOW + timedelta(seconds=2))
+
+    assert stale.action == "handled"
+    assert stale.choice_prompt is None
+    assert fresh.next_step is SetupStep.MODE
+
+
+def test_text_only_choice_accepts_stable_ids_not_visible_labels() -> None:
+    setup = TaskSetup()
+    setup.handle("s1", "u1", "first request", NOW)
+
+    rejected_mode = setup.handle("s1", "u1", "Task", NOW + timedelta(seconds=1))
+    flow = setup.handle("s1", "u1", "task", NOW + timedelta(seconds=2))
+    rejected_flow = setup.handle(
+        "s1", "u1", "Build + Review", NOW + timedelta(seconds=3)
+    )
+    merge = setup.handle(
+        "s1", "u1", "build_review", NOW + timedelta(seconds=4)
+    )
+
+    assert rejected_mode.next_step is SetupStep.MODE
+    assert flow.next_step is SetupStep.TASK_FLOW
+    assert rejected_flow.next_step is SetupStep.TASK_FLOW
+    assert merge.next_step is SetupStep.MERGE_MODE
 
 
 def test_inactive_task_draft_expires_after_thirty_minutes() -> None:
@@ -450,3 +636,1113 @@ def test_session_state_is_bounded_by_oldest_activity() -> None:
     )
 
     assert evicted.next_step is SetupStep.MODE
+
+
+def test_v2_task_selects_projects_and_builds_exact_repeated_merge_order(
+    tmp_path: Path,
+) -> None:
+    alpha = _task_project(tmp_path / "alpha", "owner/alpha", commit="a" * 40)
+    beta = _task_project(tmp_path / "beta", "owner/beta", commit="b" * 40)
+    validated: list[TaskProject] = []
+    context = _task_context(
+        (alpha, beta),
+        working_directory=str(tmp_path),
+        validate=lambda selected: validated.extend(selected) or selected,
+    )
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+
+    mode = setup.handle("s1", "alice", "두 저장소를 수정", NOW, context=context)
+    projects = setup.handle(
+        "s1", "alice", "task", NOW + timedelta(seconds=1), context=context
+    )
+    assert mode.next_step is SetupStep.MODE
+    assert projects.next_step is SetupStep.PROJECTS
+    assert projects.choice_prompt is not None
+    assert projects.choice_prompt.choice_mode.value == "multiple"
+    assert projects.choice_prompt.min_choices == 1
+    assert projects.choice_prompt.max_choices is None
+    assert tuple(choice.id for choice in projects.choice_prompt.choices) == (
+        alpha.project_id,
+        beta.project_id,
+        "add_project",
+    )
+
+    flow = setup.handle_submission(
+        "s1",
+        "alice",
+        ChoiceSubmission(
+            projects.choice_prompt.choice_prompt_id,
+            (alpha.project_id, beta.project_id),
+        ),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    merge = setup.handle(
+        "s1", "alice", "build_review", NOW + timedelta(seconds=3), context=context
+    )
+    first_order = setup.handle(
+        "s1", "alice", "full_auto", NOW + timedelta(seconds=4), context=context
+    )
+    assert flow.next_step is SetupStep.TASK_FLOW
+    assert merge.next_step is SetupStep.MERGE_MODE
+    assert first_order.next_step is SetupStep.MERGE_ORDER
+    assert first_order.choice_prompt is not None
+    assert first_order.choice_prompt.choice_mode.value == "single"
+
+    second_order = setup.handle_submission(
+        "s1",
+        "alice",
+        ChoiceSubmission(
+            first_order.choice_prompt.choice_prompt_id,
+            (beta.project_id,),
+        ),
+        NOW + timedelta(seconds=5),
+        context=context,
+    )
+    assert second_order.next_step is SetupStep.MERGE_ORDER
+    assert second_order.choice_prompt is not None
+    assert tuple(choice.id for choice in second_order.choice_prompt.choices) == (
+        alpha.project_id,
+    )
+
+    preview = setup.handle_submission(
+        "s1",
+        "alice",
+        ChoiceSubmission(
+            second_order.choice_prompt.choice_prompt_id,
+            (alpha.project_id,),
+        ),
+        NOW + timedelta(seconds=6),
+        context=context,
+    )
+    assert preview.next_step is SetupStep.CONFIRM
+    assert preview.task_request_v2 is None
+    assert preview.task_request is None
+    assert "Management: management/forge" in (preview.text or "")
+    assert "Project 1: owner/alpha" in (preview.text or "")
+    assert f"Workspace: {alpha.workspace}" in (preview.text or "")
+    assert "Remote: origin" in (preview.text or "")
+    assert "Base branch: main" in (preview.text or "")
+    assert f"Base commit: {alpha.base_commit}" in (preview.text or "")
+
+    prepared = setup.handle(
+        "s1", "alice", "confirm", NOW + timedelta(seconds=7), context=context
+    )
+    assert prepared.action == "handled"
+    assert prepared.next_step is SetupStep.CONFIRM
+    assert isinstance(prepared.task_request_v2, TaskRequestV2)
+    assert prepared.task_request_v2.management_repository == MANAGEMENT_REPOSITORY
+    assert prepared.task_request_v2.projects == (alpha, beta)
+    assert prepared.task_request_v2.merge_order == (
+        beta.project_id,
+        alpha.project_id,
+    )
+    assert prepared.task_request is None
+    assert validated == [alpha, beta]
+    assert setup.pending_choice_prompt("s1", "alice") == preview.choice_prompt
+    assert prepared.choice_prompt_paused is True
+
+
+def test_direct_project_add_requires_path_remote_and_branch_before_confirm(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "current"
+    current.mkdir()
+    discovered = _task_project(tmp_path / "known", "owner/known")
+    direct = _task_project(
+        tmp_path / "direct",
+        "owner/direct",
+        remote_name="upstream",
+        commit="b" * 40,
+    )
+    probed_paths: list[str] = []
+    bound: list[tuple[str, str]] = []
+    validated: list[tuple[TaskProject, ...]] = []
+    probe = ProjectPathProbe(
+        workspace=direct.workspace,
+        remotes=(
+            ProjectRemote("origin", "owner/fork", "main"),
+            ProjectRemote("upstream", "owner/direct", "trunk"),
+        ),
+    )
+
+    def probe_path(raw_path: str) -> ProjectPathProbe:
+        probed_paths.append(raw_path)
+        return probe
+
+    def bind_project(
+        selected_probe: ProjectPathProbe,
+        remote_name: str,
+        branch: str,
+    ) -> TaskProject:
+        assert selected_probe is probe
+        bound.append((remote_name, branch))
+        return direct
+
+    context = _task_context(
+        (discovered,),
+        working_directory=str(current.resolve()),
+        probe=probe_path,
+        bind=bind_project,
+        validate=lambda selected: validated.append(selected) or selected,
+    )
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+
+    setup.handle("direct", "u1", "직접 프로젝트 수정", NOW, context=context)
+    projects = setup.handle(
+        "direct", "u1", "task", NOW + timedelta(seconds=1), context=context
+    )
+    assert projects.choice_prompt is not None
+    assert [choice.id for choice in projects.choice_prompt.choices][-1] == "add_project"
+
+    path = setup.handle_submission(
+        "direct",
+        "u1",
+        ChoiceSubmission(projects.choice_prompt.choice_prompt_id, ("add_project",)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    assert path.next_step is SetupStep.PROJECT_PATH
+    assert path.choice_prompt is None
+
+    remotes = setup.handle(
+        "direct",
+        "u1",
+        "../direct",
+        NOW + timedelta(seconds=3),
+        context=context,
+    )
+    assert probed_paths == ["../direct"]
+    assert remotes.next_step is SetupStep.PROJECT_REMOTE
+    assert remotes.choice_prompt is not None
+    assert [choice.id for choice in remotes.choice_prompt.choices] == [
+        "origin",
+        "upstream",
+    ]
+
+    branches = setup.handle_submission(
+        "direct",
+        "u1",
+        ChoiceSubmission(remotes.choice_prompt.choice_prompt_id, ("upstream",)),
+        NOW + timedelta(seconds=4),
+        context=context,
+    )
+    assert branches.next_step is SetupStep.PROJECT_BRANCH
+    assert branches.choice_prompt is not None
+    assert [choice.id for choice in branches.choice_prompt.choices] == [
+        "default_branch",
+        "other_branch",
+    ]
+    assert "trunk" in branches.choice_prompt.choices[0].label
+
+    branch_name = setup.handle_submission(
+        "direct",
+        "u1",
+        ChoiceSubmission(branches.choice_prompt.choice_prompt_id, ("other_branch",)),
+        NOW + timedelta(seconds=5),
+        context=context,
+    )
+    assert branch_name.next_step is SetupStep.PROJECT_BRANCH_NAME
+
+    updated_projects = setup.handle(
+        "direct",
+        "u1",
+        "release/stable",
+        NOW + timedelta(seconds=6),
+        context=context,
+    )
+    assert bound == [("upstream", "release/stable")]
+    assert updated_projects.next_step is SetupStep.PROJECTS
+    assert updated_projects.choice_prompt is not None
+    assert direct.project_id in {
+        choice.id for choice in updated_projects.choice_prompt.choices
+    }
+
+    flow = setup.handle_submission(
+        "direct",
+        "u1",
+        ChoiceSubmission(
+            updated_projects.choice_prompt.choice_prompt_id,
+            (direct.project_id,),
+        ),
+        NOW + timedelta(seconds=7),
+        context=context,
+    )
+    merge = setup.handle(
+        "direct", "u1", "build", NOW + timedelta(seconds=8), context=context
+    )
+    preview = setup.handle(
+        "direct", "u1", "manual", NOW + timedelta(seconds=9), context=context
+    )
+    prepared = setup.handle(
+        "direct", "u1", "confirm", NOW + timedelta(seconds=10), context=context
+    )
+
+    assert flow.next_step is SetupStep.TASK_FLOW
+    assert merge.next_step is SetupStep.MERGE_MODE
+    assert preview.next_step is SetupStep.CONFIRM
+    assert prepared.task_request_v2 is not None
+    assert prepared.task_request_v2.projects == (direct,)
+    assert validated == [(direct,)]
+
+
+def test_project_aliases_for_same_repository_cannot_be_selected_together(
+    tmp_path: Path,
+) -> None:
+    origin = _task_project(tmp_path / "repo", "owner/repo", remote_name="origin")
+    upstream = _task_project(tmp_path / "repo", "owner/repo", remote_name="upstream")
+    context = _task_context((origin, upstream))
+    setup = TaskSetup()
+    setup.handle("s1", "u1", "요청", NOW, context=context)
+    prompt = setup.handle(
+        "s1", "u1", "task", NOW + timedelta(seconds=1), context=context
+    )
+    assert prompt.choice_prompt is not None
+
+    rejected = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(
+            prompt.choice_prompt.choice_prompt_id,
+            (origin.project_id, upstream.project_id),
+        ),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+
+    assert rejected.next_step is SetupStep.PROJECTS
+    assert "same repository" in (rejected.text or "").lower()
+    assert rejected.choice_prompt == prompt.choice_prompt
+    assert {choice.id for choice in rejected.choice_prompt.choices} == {
+        origin.project_id,
+        upstream.project_id,
+        "add_project",
+    }
+
+
+def test_empty_project_discovery_stays_at_projects_without_loading_old_values() -> None:
+    discoveries = 0
+
+    def discover(_working_directory: str | None) -> tuple[TaskProject, ...]:
+        nonlocal discoveries
+        discoveries += 1
+        return ()
+
+    context = _task_context((), discover=discover)
+    setup = TaskSetup()
+    setup.handle("s1", "u1", "요청", NOW, context=context)
+
+    empty = setup.handle(
+        "s1", "u1", "task", NOW + timedelta(seconds=1), context=context
+    )
+    assert empty.next_step is SetupStep.PROJECTS
+    assert empty.choice_prompt is not None
+    assert [choice.id for choice in empty.choice_prompt.choices] == [
+        "retry",
+        "add_project",
+        "cancel",
+    ]
+    assert "no projects" in (empty.text or "").lower()
+
+    retried = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(empty.choice_prompt.choice_prompt_id, ("retry",)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    assert retried.next_step is SetupStep.PROJECTS
+    assert discoveries == 2
+
+
+def test_empty_discovery_keeps_trusted_context_for_direct_project_add(
+    tmp_path: Path,
+) -> None:
+    target = _task_project(tmp_path / "target", "owner/target")
+    probe = ProjectPathProbe(
+        workspace=target.workspace,
+        remotes=(ProjectRemote("origin", "owner/target", "main"),),
+    )
+    context = _task_context(
+        (),
+        working_directory=str(tmp_path.resolve()),
+        probe=lambda _path: probe,
+        bind=lambda _probe, _remote, _branch: target,
+    )
+    setup = TaskSetup()
+    setup.handle("empty-add", "u1", "요청", NOW, context=context)
+    projects = setup.handle(
+        "empty-add",
+        "u1",
+        "task",
+        NOW + timedelta(seconds=1),
+        context=context,
+    )
+    assert projects.choice_prompt is not None
+
+    path = setup.handle_submission(
+        "empty-add",
+        "u1",
+        ChoiceSubmission(projects.choice_prompt.choice_prompt_id, ("add_project",)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+
+    assert path.next_step is SetupStep.PROJECT_PATH
+
+
+def test_failed_confirm_revalidation_rediscovers_and_resets_downstream_choices(
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / "repo", "owner/repo")
+    discoveries = 0
+
+    def discover(_working_directory: str | None) -> tuple[TaskProject, ...]:
+        nonlocal discoveries
+        discoveries += 1
+        return (project,)
+
+    def reject(_projects: tuple[TaskProject, ...]) -> tuple[TaskProject, ...]:
+        raise RuntimeError("binding changed")
+
+    context = _task_context((project,), discover=discover, validate=reject)
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+    setup.handle("s1", "u1", "고칠 내용", NOW, context=context)
+    projects = setup.handle(
+        "s1", "u1", "task", NOW + timedelta(seconds=1), context=context
+    )
+    assert projects.choice_prompt is not None
+    setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(projects.choice_prompt.choice_prompt_id, (project.project_id,)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    setup.handle("s1", "u1", "build", NOW + timedelta(seconds=3), context=context)
+    preview = setup.handle(
+        "s1", "u1", "manual", NOW + timedelta(seconds=4), context=context
+    )
+    assert preview.next_step is SetupStep.CONFIRM
+
+    failed = setup.handle(
+        "s1", "u1", "confirm", NOW + timedelta(seconds=5), context=context
+    )
+
+    assert failed.next_step is SetupStep.PROJECTS
+    assert failed.task_request is None
+    assert failed.task_request_v2 is None
+    assert failed.choice_prompt is not None
+    assert [choice.id for choice in failed.choice_prompt.choices] == [
+        "retry",
+        "add_project",
+        "cancel",
+    ]
+    assert discoveries == 1
+    rediscovered = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(failed.choice_prompt.choice_prompt_id, ("retry",)),
+        NOW + timedelta(seconds=6),
+        context=context,
+    )
+    assert rediscovered.next_step is SetupStep.PROJECTS
+    assert rediscovered.choice_prompt is not None
+    assert discoveries == 2
+    restarted = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(
+            rediscovered.choice_prompt.choice_prompt_id,
+            (project.project_id,),
+        ),
+        NOW + timedelta(seconds=7),
+        context=context,
+    )
+    assert restarted.next_step is SetupStep.TASK_FLOW
+    invalid_old_merge = setup.handle(
+        "s1", "u1", "manual", NOW + timedelta(seconds=8), context=context
+    )
+    assert invalid_old_merge.next_step is SetupStep.TASK_FLOW
+
+
+def test_blocked_discovery_does_not_hold_lock_and_stale_result_cannot_revive_session(
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / "repo", "owner/repo")
+    started = Event()
+    release = Event()
+
+    def discover(_working_directory: str | None) -> tuple[TaskProject, ...]:
+        started.set()
+        assert release.wait(timeout=2)
+        return (project,)
+
+    context = _task_context((project,), discover=discover)
+    setup = TaskSetup()
+    setup.handle("blocked", "u1", "원래 요청", NOW, context=context)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        discovery = pool.submit(
+            setup.handle,
+            "blocked",
+            "u1",
+            "task",
+            NOW + timedelta(seconds=1),
+            context=context,
+        )
+        assert started.wait(timeout=1)
+        try:
+            unrelated = pool.submit(
+                setup.handle,
+                "other",
+                "u2",
+                "다른 요청",
+                NOW + timedelta(seconds=2),
+                context=context,
+            ).result(timeout=0.5)
+            cancelled = pool.submit(
+                setup.handle,
+                "blocked",
+                "u1",
+                "/cancel",
+                NOW + timedelta(seconds=2),
+                context=context,
+            ).result(timeout=0.5)
+        finally:
+            release.set()
+        stale = discovery.result(timeout=1)
+
+    assert unrelated.next_step is SetupStep.MODE
+    assert cancelled.action == "handled"
+    assert stale.action == "handled"
+    assert stale.next_step is None
+    assert setup.handle(
+        "blocked",
+        "u1",
+        "대화 계속",
+        NOW + timedelta(seconds=3),
+        context=context,
+    ).action == "continue"
+
+
+def test_blocked_confirm_validation_does_not_hold_lock_or_restore_cancelled_preview(
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / "repo", "owner/repo")
+    started = Event()
+    release = Event()
+
+    def validate(
+        selected: tuple[TaskProject, ...],
+    ) -> tuple[TaskProject, ...]:
+        started.set()
+        assert release.wait(timeout=2)
+        return selected
+
+    context = _task_context((project,), validate=validate)
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+    setup.handle("blocked", "u1", "고칠 내용", NOW, context=context)
+    projects = setup.handle(
+        "blocked", "u1", "task", NOW + timedelta(seconds=1), context=context
+    )
+    assert projects.choice_prompt is not None
+    setup.handle_submission(
+        "blocked",
+        "u1",
+        ChoiceSubmission(projects.choice_prompt.choice_prompt_id, (project.project_id,)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    setup.handle(
+        "blocked", "u1", "build", NOW + timedelta(seconds=3), context=context
+    )
+    setup.handle(
+        "blocked", "u1", "manual", NOW + timedelta(seconds=4), context=context
+    )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        confirmation = pool.submit(
+            setup.handle,
+            "blocked",
+            "u1",
+            "confirm",
+            NOW + timedelta(seconds=5),
+            context=context,
+        )
+        assert started.wait(timeout=1)
+        try:
+            unrelated = pool.submit(
+                setup.handle,
+                "other",
+                "u2",
+                "다른 요청",
+                NOW + timedelta(seconds=6),
+                context=context,
+            ).result(timeout=0.5)
+            cancelled = pool.submit(
+                setup.handle,
+                "blocked",
+                "u1",
+                "/cancel",
+                NOW + timedelta(seconds=6),
+                context=context,
+            ).result(timeout=0.5)
+        finally:
+            release.set()
+        stale = confirmation.result(timeout=1)
+
+    assert unrelated.next_step is SetupStep.MODE
+    assert cancelled.action == "handled"
+    assert stale.action == "handled"
+    assert stale.task_request_v2 is None
+    assert setup.handle(
+        "blocked",
+        "u1",
+        "대화 계속",
+        NOW + timedelta(seconds=7),
+        context=context,
+    ).action == "continue"
+
+
+def test_context_rejects_relative_working_directory() -> None:
+    with pytest.raises(ValueError, match="canonical absolute"):
+        _task_context((), working_directory="relative/project")
+
+
+def test_project_display_escapes_terminal_controls_and_keeps_korean(
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / "한글 폴더", "owner/repo")
+    spoofed_workspace = f"{project.workspace}\n\x1b[2J"
+    object.__setattr__(project, "workspace", spoofed_workspace)
+    context = _task_context((project,))
+    setup = TaskSetup()
+    setup.handle("safe-display", "u1", "요청", NOW, context=context)
+
+    prompt = setup.handle(
+        "safe-display",
+        "u1",
+        "task",
+        NOW + timedelta(seconds=1),
+        context=context,
+    )
+
+    assert "한글 폴더" in (prompt.text or "")
+    assert "\\n\\u001b[2J" in (prompt.text or "")
+    assert "\x1b" not in (prompt.text or "")
+    assert prompt.choice_prompt is not None
+    assert "\\n\\u001b[2J" in prompt.choice_prompt.choices[0].description
+    assert task_setup_module._safe_display_text("정상 한글") == "정상 한글"
+
+
+@pytest.mark.parametrize(
+    ("management_repository", "task_owner_host", "message"),
+    [
+        ("https://github.com/management/forge", OWNER_HOST, "OWNER/REPO"),
+        (MANAGEMENT_REPOSITORY, "hostname-derived", "canonical UUID"),
+    ],
+)
+def test_context_rejects_noncanonical_management_or_host(
+    management_repository: str,
+    task_owner_host: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        TaskSetupContext(
+            working_directory=None,
+            management_repository=management_repository,
+            task_owner_host=task_owner_host,
+            discover_projects=lambda _working: (),
+            validate_projects=lambda selected: selected,
+        )
+
+
+def test_discovery_completion_after_expiry_is_not_applied(
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / "repo", "owner/repo")
+    current_time = [NOW]
+    started = Event()
+    release = Event()
+
+    def discover(_working_directory: str | None) -> tuple[TaskProject, ...]:
+        started.set()
+        assert release.wait(timeout=2)
+        return (project,)
+
+    context = _task_context((project,), discover=discover)
+    setup = TaskSetup(clock=lambda: current_time[0])
+    setup.handle("s1", "u1", "요청", context=context)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(setup.handle, "s1", "u1", "task", context=context)
+        assert started.wait(timeout=1)
+        current_time[0] = NOW + SETUP_TIMEOUT + timedelta(seconds=1)
+        release.set()
+        stale = pending.result(timeout=1)
+
+    assert stale.next_step is None
+    assert "stale" in (stale.text or "").lower()
+    restarted = setup.handle("s1", "u1", "새 요청", context=context)
+    assert restarted.next_step is SetupStep.MODE
+
+
+@pytest.mark.parametrize("callback_name", ["discovery", "probe", "bind", "validation"])
+def test_explicit_event_time_cannot_keep_a_late_callback_alive(
+    callback_name: str,
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / callback_name, f"owner/{callback_name}")
+    current_time = [NOW]
+    started = Event()
+    release = Event()
+    probe_value = ProjectPathProbe(
+        workspace=project.workspace,
+        remotes=(ProjectRemote("origin", project.repository, "main"),),
+    )
+
+    def wait_then(value):
+        started.set()
+        assert release.wait(timeout=2)
+        return value
+
+    context = _task_context(
+        () if callback_name in {"probe", "bind"} else (project,),
+        discover=(
+            (lambda _working: wait_then((project,)))
+            if callback_name == "discovery"
+            else None
+        ),
+        probe=(
+            (lambda _path: wait_then(probe_value))
+            if callback_name == "probe"
+            else (lambda _path: probe_value)
+        )
+        if callback_name in {"probe", "bind"}
+        else None,
+        bind=(
+            (lambda _probe, _remote, _branch: wait_then(project))
+            if callback_name == "bind"
+            else (lambda _probe, _remote, _branch: project)
+        )
+        if callback_name in {"probe", "bind"}
+        else None,
+        validate=(
+            (lambda selected: wait_then(selected))
+            if callback_name == "validation"
+            else None
+        ),
+    )
+    setup = TaskSetup(clock=lambda: current_time[0])
+    setup.handle("late", "u1", "요청", NOW, context=context)
+
+    if callback_name == "discovery":
+        operation = partial(
+            setup.handle,
+            "late",
+            "u1",
+            "task",
+            NOW + timedelta(seconds=1),
+            context=context,
+        )
+    else:
+        projects = setup.handle(
+            "late",
+            "u1",
+            "task",
+            NOW + timedelta(seconds=1),
+            context=context,
+        )
+        assert projects.choice_prompt is not None
+        if callback_name in {"probe", "bind"}:
+            setup.handle_submission(
+                "late",
+                "u1",
+                ChoiceSubmission(
+                    projects.choice_prompt.choice_prompt_id,
+                    ("add_project",),
+                ),
+                NOW + timedelta(seconds=2),
+                context=context,
+            )
+            if callback_name == "probe":
+                operation = partial(
+                    setup.handle,
+                    "late",
+                    "u1",
+                    project.workspace,
+                    NOW + timedelta(seconds=3),
+                    context=context,
+                )
+            else:
+                remotes = setup.handle(
+                    "late",
+                    "u1",
+                    project.workspace,
+                    NOW + timedelta(seconds=3),
+                    context=context,
+                )
+                assert remotes.choice_prompt is not None
+                branches = setup.handle_submission(
+                    "late",
+                    "u1",
+                    ChoiceSubmission(
+                        remotes.choice_prompt.choice_prompt_id,
+                        ("origin",),
+                    ),
+                    NOW + timedelta(seconds=4),
+                    context=context,
+                )
+                assert branches.choice_prompt is not None
+                operation = partial(
+                    setup.handle_submission,
+                    "late",
+                    "u1",
+                    ChoiceSubmission(
+                        branches.choice_prompt.choice_prompt_id,
+                        ("default_branch",),
+                    ),
+                    NOW + timedelta(seconds=5),
+                    context=context,
+                )
+        else:
+            setup.handle_submission(
+                "late",
+                "u1",
+                ChoiceSubmission(
+                    projects.choice_prompt.choice_prompt_id,
+                    (project.project_id,),
+                ),
+                NOW + timedelta(seconds=2),
+                context=context,
+            )
+            setup.handle(
+                "late",
+                "u1",
+                "build",
+                NOW + timedelta(seconds=3),
+                context=context,
+            )
+            setup.handle(
+                "late",
+                "u1",
+                "manual",
+                NOW + timedelta(seconds=4),
+                context=context,
+            )
+            operation = partial(
+                setup.handle,
+                "late",
+                "u1",
+                "confirm",
+                NOW + timedelta(seconds=5),
+                context=context,
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(operation)
+        assert started.wait(timeout=1)
+        current_time[0] = NOW + SETUP_TIMEOUT + timedelta(seconds=1)
+        release.set()
+        stale = pending.result(timeout=1)
+
+    assert stale.next_step is None
+    assert "stale" in (stale.text or "").lower()
+
+
+def test_duplicate_confirm_during_live_validation_runs_one_callback(
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / "repo", "owner/repo")
+    started = Event()
+    release = Event()
+    calls = 0
+    calls_lock = Lock()
+
+    def validate(
+        selected: tuple[TaskProject, ...],
+    ) -> tuple[TaskProject, ...]:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            started.set()
+            assert release.wait(timeout=2)
+        return selected
+
+    context = _task_context((project,), validate=validate)
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+    setup.handle("s1", "u1", "고칠 내용", NOW, context=context)
+    projects = setup.handle(
+        "s1", "u1", "task", NOW + timedelta(seconds=1), context=context
+    )
+    assert projects.choice_prompt is not None
+    setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(projects.choice_prompt.choice_prompt_id, (project.project_id,)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    setup.handle("s1", "u1", "build", NOW + timedelta(seconds=3), context=context)
+    preview = setup.handle(
+        "s1", "u1", "manual", NOW + timedelta(seconds=4), context=context
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(
+            setup.handle,
+            "s1",
+            "u1",
+            "confirm",
+            NOW + timedelta(seconds=5),
+            context=context,
+        )
+        assert started.wait(timeout=1)
+        duplicate = setup.handle(
+            "s1",
+            "u1",
+            "confirm",
+            NOW + timedelta(seconds=6),
+            context=context,
+        )
+        release.set()
+        completed = first.result(timeout=1)
+
+    assert calls == 1
+    assert duplicate.next_step is SetupStep.CONFIRM
+    assert duplicate.choice_prompt == preview.choice_prompt
+    assert "in progress" in (duplicate.text or "").lower()
+    assert preview.task_request_v2 is None
+    assert completed.task_request_v2 is not None
+
+
+def test_stale_merge_rank_submission_cannot_skip_a_rank(tmp_path: Path) -> None:
+    alpha = _task_project(tmp_path / "alpha", "owner/alpha", commit="a" * 40)
+    beta = _task_project(tmp_path / "beta", "owner/beta", commit="b" * 40)
+    context = _task_context((alpha, beta))
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+    setup.handle("s1", "u1", "내용", NOW, context=context)
+    projects = setup.handle(
+        "s1", "u1", "task", NOW + timedelta(seconds=1), context=context
+    )
+    assert projects.choice_prompt is not None
+    setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(
+            projects.choice_prompt.choice_prompt_id,
+            (alpha.project_id, beta.project_id),
+        ),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    setup.handle(
+        "s1", "u1", "build", NOW + timedelta(seconds=3), context=context
+    )
+    first_rank = setup.handle(
+        "s1", "u1", "full_auto", NOW + timedelta(seconds=4), context=context
+    )
+    assert first_rank.choice_prompt is not None
+    second_rank = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(first_rank.choice_prompt.choice_prompt_id, (beta.project_id,)),
+        NOW + timedelta(seconds=5),
+        context=context,
+    )
+    assert second_rank.choice_prompt is not None
+
+    stale = setup.handle_submission(
+        "s1",
+        "u1",
+        ChoiceSubmission(first_rank.choice_prompt.choice_prompt_id, (alpha.project_id,)),
+        NOW + timedelta(seconds=6),
+        context=context,
+    )
+
+    assert stale.next_step is SetupStep.MERGE_ORDER
+    assert stale.choice_prompt == second_rank.choice_prompt
+    assert tuple(choice.id for choice in stale.choice_prompt.choices) == (
+        alpha.project_id,
+    )
+
+
+def test_maximum_256_project_flow_reaches_confirm_on_submission_261(
+    tmp_path: Path,
+) -> None:
+    projects = tuple(
+        _task_project(
+            tmp_path / f"p{index:03d}",
+            f"owner/p{index:03d}",
+            commit=f"{index:040x}",
+        )
+        for index in range(256)
+    )
+    context = _task_context(projects)
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+    mode = setup.handle("max", "u1", "전체 수정", NOW, context=context)
+    assert mode.choice_prompt is not None
+    project_prompt = setup.handle_submission(
+        "max",
+        "u1",
+        ChoiceSubmission(mode.choice_prompt.choice_prompt_id, ("task",)),
+        NOW + timedelta(seconds=1),
+        context=context,
+    )
+    assert project_prompt.choice_prompt is not None
+    assert len(project_prompt.choice_prompt.choices) == 256
+    assert "add_project" not in {
+        choice.id for choice in project_prompt.choice_prompt.choices
+    }
+    flow = setup.handle_submission(
+        "max",
+        "u1",
+        ChoiceSubmission(
+            project_prompt.choice_prompt.choice_prompt_id,
+            tuple(project.project_id for project in projects),
+        ),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    assert flow.choice_prompt is not None
+    merge = setup.handle_submission(
+        "max",
+        "u1",
+        ChoiceSubmission(flow.choice_prompt.choice_prompt_id, ("build",)),
+        NOW + timedelta(seconds=3),
+        context=context,
+    )
+    assert merge.choice_prompt is not None
+    rank = setup.handle_submission(
+        "max",
+        "u1",
+        ChoiceSubmission(merge.choice_prompt.choice_prompt_id, ("full_auto",)),
+        NOW + timedelta(seconds=4),
+        context=context,
+    )
+
+    rank_prompt_ids: set[str] = set()
+    ordered_ids = tuple(project.project_id for project in reversed(projects))
+    for offset, project_id in enumerate(ordered_ids, start=5):
+        assert rank.choice_prompt is not None
+        rank_prompt_ids.add(rank.choice_prompt.choice_prompt_id)
+        rank = setup.handle_submission(
+            "max",
+            "u1",
+            ChoiceSubmission(rank.choice_prompt.choice_prompt_id, (project_id,)),
+            NOW + timedelta(seconds=offset),
+            context=context,
+        )
+
+    assert len(rank_prompt_ids) == 256
+    assert rank.next_step is SetupStep.CONFIRM
+    assert rank.choice_prompt is not None
+    assert rank.task_request_v2 is None
+    prepared = setup.handle_submission(
+        "max",
+        "u1",
+        ChoiceSubmission(rank.choice_prompt.choice_prompt_id, ("confirm",)),
+        NOW + timedelta(seconds=261),
+        context=context,
+    )
+    assert prepared.next_step is SetupStep.CONFIRM
+    assert prepared.task_request_v2 is not None
+    assert prepared.task_request_v2.merge_order == ordered_ids
+
+
+def test_confirm_click_time_survives_validation_and_other_input_keeps_operation_live(
+    tmp_path: Path,
+) -> None:
+    project = _task_project(tmp_path / "project", "owner/project")
+    validation_started = Event()
+    release_validation = Event()
+
+    def validate(selected: tuple[TaskProject, ...]) -> tuple[TaskProject, ...]:
+        validation_started.set()
+        assert release_validation.wait(timeout=2)
+        return selected
+
+    context = _task_context((project,), validate=validate)
+    setup = TaskSetup(request_id_factory=lambda: REQUEST_ID)
+    setup.handle("click-time", "u1", "구현 요청", NOW, context=context)
+    projects = setup.handle(
+        "click-time",
+        "u1",
+        "task",
+        NOW + timedelta(seconds=1),
+        context=context,
+    )
+    assert projects.choice_prompt is not None
+    setup.handle_submission(
+        "click-time",
+        "u1",
+        ChoiceSubmission(projects.choice_prompt.choice_prompt_id, (project.project_id,)),
+        NOW + timedelta(seconds=2),
+        context=context,
+    )
+    setup.handle(
+        "click-time",
+        "u1",
+        "build",
+        NOW + timedelta(seconds=3),
+        context=context,
+    )
+    preview = setup.handle(
+        "click-time",
+        "u1",
+        "safe_auto",
+        NOW + timedelta(seconds=4),
+        context=context,
+    )
+    assert preview.task_request_v2 is None
+    assert "set when Confirm Task is selected" in (preview.text or "")
+    assert preview.choice_prompt is not None
+    clicked_at = NOW + timedelta(minutes=5)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        confirmation = pool.submit(
+            setup.handle,
+            "click-time",
+            "u1",
+            "confirm",
+            clicked_at,
+            context=context,
+        )
+        assert validation_started.wait(timeout=1)
+        unrelated_input = setup.handle(
+            "click-time",
+            "u1",
+            "상태가 어떻게 돼?",
+            clicked_at + timedelta(seconds=1),
+            context=context,
+        )
+        assert unrelated_input.choice_prompt == preview.choice_prompt
+        assert "in progress" in (unrelated_input.text or "").lower()
+        release_validation.set()
+        prepared = confirmation.result(timeout=1)
+
+    assert prepared.task_request_v2 is not None
+    assert prepared.task_request_v2.confirmed_at == clicked_at
+    assert prepared.task_request_v2.auto_merge_expires_at == (
+        clicked_at + MAX_AUTO_MERGE_DURATION
+    )
+    preview_time_request = TaskRequestV2.create(
+        request_id=prepared.task_request_v2.request_id,
+        management_repository=prepared.task_request_v2.management_repository,
+        task_content=prepared.task_request_v2.task_content,
+        task_flow=prepared.task_request_v2.task_flow,
+        merge_mode=prepared.task_request_v2.merge_mode,
+        merge_order=prepared.task_request_v2.merge_order,
+        projects=prepared.task_request_v2.projects,
+        task_owner_host=prepared.task_request_v2.task_owner_host,
+        confirmed_by=prepared.task_request_v2.confirmed_by,
+        confirmed_at=NOW + timedelta(seconds=4),
+    )
+    assert prepared.task_request_v2.request_hash == task_request_v2_hash(
+        prepared.task_request_v2
+    )
+    assert prepared.task_request_v2.request_hash != preview_time_request.request_hash
+    assert prepared.choice_prompt == preview.choice_prompt

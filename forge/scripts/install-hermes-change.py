@@ -18,13 +18,14 @@ from forge.hermes_change.installer import (  # noqa: E402
     build_change_package,
     install_change,
     restore_change,
+    verify_change,
 )
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("build", "install", "restore"):
+    for action in ("build", "install", "restore", "verify"):
         command = commands.add_parser(action)
         command.add_argument("--hermes-root", type=Path, required=True)
         command.add_argument("--package", type=Path, required=True)
@@ -44,8 +45,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.action == "install":
             manifest = install_change(args.hermes_root, args.package)
-        else:
+        elif args.action == "restore":
             manifest = restore_change(args.hermes_root, args.package)
+        else:
+            manifest = verify_change(args.hermes_root, args.package)
     except InstallError as error:
         print(
             json.dumps(
