@@ -47,6 +47,19 @@ def test_linux_installs_exact_claude_and_authenticates_before_runtime_mutation()
     assert deploy.index(auth_probe) < deploy.index('mkdir -p "$TASK_DATA_DIR"')
 
 
+def test_linux_resolves_a_working_codex_binary_before_runtime_mutation() -> None:
+    deploy = _text(LINUX_DEPLOY)
+    first_stop = deploy.index('systemctl --user stop "forge-$T.timer"')
+
+    assert "resolve_codex_bin()" in deploy
+    assert 'CODEX_BIN="$(resolve_codex_bin)"' in deploy
+    assert '"$candidate" --version' in deploy
+    assert "codex-linux-x64" in deploy
+    assert "codex-linux-arm64" in deploy
+    assert deploy.count('--codex-bin "$CODEX_BIN"') == 2
+    assert deploy.index('CODEX_BIN="$(resolve_codex_bin)"') < first_stop
+
+
 def test_linux_installs_stable_runner_skills_and_profile_auth_links_safely() -> None:
     deploy = _text(LINUX_DEPLOY)
 
@@ -100,6 +113,7 @@ def test_linux_applies_and_verifies_before_restart_and_rolls_back_on_failure() -
 
     assert apply < verify < restart
     assert deploy.count('--claude-bin "$CLAUDE_BIN"') == 2
+    assert deploy.count('--codex-bin "$CODEX_BIN"') == 2
     for path in (
         '"$HOME/.hermes/config.yaml"',
         '"$HOME/.codex/config.toml"',
