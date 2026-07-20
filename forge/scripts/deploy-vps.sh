@@ -91,6 +91,35 @@ GH_BIN="${INFINITY_FORGE_GH_PATH:-/usr/bin/gh}"
 [ -x "$HERMES_BIN" ] || { echo "[deploy] Hermes command is missing" >&2; exit 1; }
 [ -x "$GH_BIN" ] || { echo "[deploy] GitHub command is missing" >&2; exit 1; }
 
+resolve_codex_bin() {
+  local candidate
+  candidate="$(command -v codex 2>/dev/null || true)"
+  if [ -n "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  local package=""
+  case "$(uname -m)" in
+    x86_64) package="codex-linux-x64" ;;
+    aarch64|arm64) package="codex-linux-arm64" ;;
+  esac
+  [ -n "$package" ] || return 0
+
+  local native_pattern="$HOME/.local/lib/node_modules/@openai/codex/node_modules/@openai/$package/vendor/*/bin/codex"
+  local native_candidates=()
+  while IFS= read -r candidate; do
+    if [ -x "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
+      native_candidates+=("$candidate")
+    fi
+  done < <(compgen -G "$native_pattern" || true)
+  if [ "${#native_candidates[@]}" -eq 1 ]; then
+    printf '%s\n' "${native_candidates[0]}"
+  fi
+}
+CODEX_BIN="$(resolve_codex_bin)"
+[ -n "$CODEX_BIN" ] || { echo "[deploy] a working Codex command is required" >&2; exit 78; }
+
 CLAUDE_VERSION="2.1.215"
 CLAUDE_NATIVE_BIN="$HOME/.local/bin/claude"
 resolve_claude_bin() {
@@ -998,9 +1027,11 @@ backup_managed_path "$HOME/.hermes/config.yaml"
 backup_managed_path "$HOME/.codex/config.toml"
 backup_managed_path "$TASK_DATA_DIR/subscription-runtime"
 "$HERMES_PY" "$CONFIGURE_SCRIPT" apply --forge-root "$REPO_DIR" \
-  --hermes-root "$HOME/.hermes" --claude-bin "$CLAUDE_BIN"
+  --hermes-root "$HOME/.hermes" --claude-bin "$CLAUDE_BIN" \
+  --codex-bin "$CODEX_BIN"
 "$HERMES_PY" "$CONFIGURE_SCRIPT" verify --forge-root "$REPO_DIR" \
-  --hermes-root "$HOME/.hermes" --claude-bin "$CLAUDE_BIN"
+  --hermes-root "$HOME/.hermes" --claude-bin "$CLAUDE_BIN" \
+  --codex-bin "$CODEX_BIN"
 systemctl --user daemon-reload
 cleanup_deploy_temporaries
 systemctl --user restart hermes-gateway
